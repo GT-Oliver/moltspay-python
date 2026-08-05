@@ -2,7 +2,7 @@
 
 from typing import Any, Callable, Awaitable, Optional, List, Dict, Literal, Union
 from dataclasses import dataclass, field
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 # Type alias for skill handlers
@@ -26,11 +26,8 @@ class ServiceConfig(BaseModel):
     currency: str = "USDC"
     acceptedCurrencies: Optional[List[str]] = None
     function: str
-    input: Dict[str, ServiceInput] = Field(default_factory=dict)
-    output: Dict[str, Any] = Field(default_factory=dict)
-    alipay: Optional[Dict[str, Any]] = None
-    wechat: Optional[Dict[str, Any]] = None
-    balance: Optional[Dict[str, Any]] = None
+    input: Dict[str, ServiceInput] = {}
+    output: Dict[str, Any] = {}
 
     @property
     def accepted_currencies(self) -> List[str]:
@@ -42,7 +39,7 @@ class ChainConfig(BaseModel):
     """Chain configuration for multi-chain support."""
     chain: str  # "base", "polygon", "base_sepolia", "bnb", "tempo_moderato", etc.
     network: Optional[str] = None  # Auto-mapped from chain if not specified
-    tokens: List[str] = Field(default_factory=lambda: ["USDC"])  # ["USDC", "USDT"]
+    tokens: List[str] = ["USDC"]  # ["USDC", "USDT"]
     wallet: Optional[str] = None  # Optional per-chain wallet override
 
 
@@ -54,9 +51,6 @@ class ProviderConfig(BaseModel):
     solana_wallet: Optional[str] = None  # Solana wallet address
     chain: str = "base"  # deprecated, for backward compat
     chains: Optional[List[Any]] = None  # multi-chain support (strings or ChainConfig)
-    alipay: Optional[Dict[str, Any]] = None
-    wechat: Optional[Dict[str, Any]] = None
-    balance: Optional[Dict[str, Any]] = None
     
     def get_chains(self) -> List[ChainConfig]:
         """

@@ -1,12 +1,10 @@
 """Chain configurations for MoltsPay multi-chain support."""
 
-from typing import TypedDict, Optional, Dict, List
+from typing import TypedDict, Optional, Dict
 
-class TokenConfig(TypedDict, total=False):
+class TokenConfig(TypedDict):
     address: str
     decimals: int
-    eip712Name: str
-    eip712Version: str
 
 class ChainConfig(TypedDict):
     name: str
@@ -28,8 +26,7 @@ CHAINS: Dict[str, ChainConfig] = {
         "type": "evm",
         "protocol": "x402",
         "tokens": {
-            "USDC": {"address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "decimals": 6, "eip712Name": "USD Coin", "eip712Version": "2"},
-            "USDT": {"address": "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2", "decimals": 6, "eip712Name": "Tether USD", "eip712Version": "2"},
+            "USDC": {"address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "decimals": 6},
         }
     },
     "polygon": {
@@ -40,8 +37,7 @@ CHAINS: Dict[str, ChainConfig] = {
         "type": "evm",
         "protocol": "x402",
         "tokens": {
-            "USDC": {"address": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", "decimals": 6, "eip712Name": "USD Coin", "eip712Version": "2"},
-            "USDT": {"address": "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", "decimals": 6, "eip712Name": "(PoS) Tether USD", "eip712Version": "2"},
+            "USDC": {"address": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", "decimals": 6},
         }
     },
     
@@ -54,8 +50,7 @@ CHAINS: Dict[str, ChainConfig] = {
         "type": "evm",
         "protocol": "x402",
         "tokens": {
-            "USDC": {"address": "0x036CbD53842c5426634e7929541eC2318f3dCF7e", "decimals": 6, "eip712Name": "USDC", "eip712Version": "2"},
-            "USDT": {"address": "0x036CbD53842c5426634e7929541eC2318f3dCF7e", "decimals": 6, "eip712Name": "USDC", "eip712Version": "2"},
+            "USDC": {"address": "0x036CbD53842c5426634e7929541eC2318f3dCF7e", "decimals": 6},
         }
     },
     
@@ -145,23 +140,3 @@ def get_protocol(chain: str) -> str:
     """Get protocol for chain (x402, mpp, bnb, solana)."""
     config = CHAINS.get(chain)
     return config["protocol"] if config else "x402"
-
-
-def list_chains() -> List[str]:
-    return list(CHAINS)
-
-
-def get_chain_family(chain: str) -> str:
-    if chain in ("solana", "solana_devnet"):
-        return "svm"
-    if chain in ("alipay", "wechat", "balance"):
-        return "fiat"
-    return "evm"
-
-
-def is_solana_chain(chain: str) -> bool:
-    return get_chain_family(chain) == "svm"
-
-
-def is_evm_chain(chain: str) -> bool:
-    return get_chain_family(chain) == "evm"

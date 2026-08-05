@@ -579,13 +579,6 @@ python -c "from moltspay import MoltsPay; print(MoltsPay().address)"
 - **npm (Node.js):** https://www.npmjs.com/package/moltspay
 - **GitHub:** https://github.com/Yaqing2023/moltspay-python
 
-## Node.js 2.4 compatibility
-
-The Python SDK includes Balance, WeChat Native, Alipay AI Pay, MCP, payment
-verification, transfers, secure/permit wallets, invoices, audit logs, and
-Node-compatible encrypted wallets. See [docs/NODE-PARITY.md](docs/NODE-PARITY.md)
-for APIs, input/output contracts, configuration, and the browser-only exclusions.
-
 ## License
 
 MIT

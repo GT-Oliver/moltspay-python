@@ -2,14 +2,12 @@
 
 from typing import Any, Optional, List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
-from pathlib import Path
 import httpx
 
 from .wallet import Wallet
 from .x402 import X402Client, AsyncX402Client
-from .models import Service, Balance, Limits, PaymentResult, TokenSymbol, FundingResult, FaucetResult, TransferResult, ServicesResponse
-from .exceptions import InsufficientFunds, LimitExceeded, PaymentError, UnsupportedRail
+from .models import Service, Balance, Limits, PaymentResult, TokenSymbol, FundingResult, FaucetResult
+from .exceptions import InsufficientFunds, LimitExceeded, PaymentError
 from .chains import CHAINS, get_protocol
 
 # ERC20 ABI for balanceOf and allowance
@@ -85,9 +83,6 @@ class MoltsPay:
         chain: str = "base",
         timeout: float = None,
         solana_wallet_path: Optional[str] = None,
-        config_dir: Optional[str] = None,
-        rail_preference: Optional[List[str]] = None,
-        buyer_id: Optional[str] = None,
     ):
         """
         Initialize MoltsPay client.
@@ -107,14 +102,6 @@ class MoltsPay:
         self._x402 = X402Client(timeout=timeout)
         self._chain = chain
         self._timeout = timeout
-        self._config_dir = Path(config_dir).expanduser() if config_dir else self._wallet._wallet_path.parent
-        self._config_path = self._config_dir / "config.json"
-        stored = self._load_config()
-        self._rail_preference = rail_preference or stored.get("railPreference", [])
-        self._buyer_id = buyer_id or stored.get("buyerId")
-        self._balance_client = None
-        self._wechat_client = None
-        self._alipay_client = None
         
         # Solana wallet (lazy loaded)
         self._solana_wallet = None
@@ -167,152 +154,6 @@ class MoltsPay:
             List of available services
         """
         return self._x402.discover_services(service_url)
-
-    def get_services(self, service_url: str) -> ServicesResponse:
-        """Node-compatible service discovery response."""
-        return self._x402.get_services(service_url)
-
-    def _load_config(self) -> Dict[str, Any]:
-        try:
-            return json.loads(self._config_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-
-    def get_config(self) -> Dict[str, Any]:
-        return {
-            "chain": self._chain,
-            "limits": {"maxPerTx": self.limits().max_per_tx, "maxPerDay": self.limits().max_per_day},
-            "railPreference": list(self._rail_preference),
-            "buyerId": self._buyer_id,
-        }
-
-    def update_config(
-        self,
-        *,
-        max_per_tx: Optional[float] = None,
-        max_per_day: Optional[float] = None,
-        rail_preference: Optional[List[str]] = None,
-        buyer_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        if max_per_tx is not None or max_per_day is not None:
-            self.set_limits(max_per_tx=max_per_tx, max_per_day=max_per_day)
-        if rail_preference is not None:
-            self._rail_preference = list(rail_preference)
-        if buyer_id is not None:
-            self._buyer_id = buyer_id
-        data = self.get_config()
-        self._config_dir.mkdir(parents=True, exist_ok=True)
-        self._config_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        return data
-
-    def set_buyer_id(self, buyer_id: str) -> None:
-        self.update_config(buyer_id=buyer_id)
-
-    def _get_balance_client(self):
-        if self._balance_client is None:
-            from .balance import BalanceClient
-            self._balance_client = BalanceClient(self._buyer_id, timeout=self._timeout, account=self._wallet._account)
-        self._balance_client.buyer_id = self._buyer_id
-        return self._balance_client
-
-    def get_buyer_balance(self, server_url: str, buyer_id: str = None):
-        return self._get_balance_client().get_balance(server_url, buyer_id)
-
-    def list_balance_transactions(self, server_url: str, buyer_id: str = None, limit: int = 20, offset: int = 0):
-        return self._get_balance_client().list_transactions(server_url, buyer_id, limit, offset)
-
-    def _get_wechat_client(self):
-        if self._wechat_client is None:
-            from .wechat import WechatClient
-            self._wechat_client = WechatClient(config_dir=str(self._config_dir), timeout=self._timeout)
-        return self._wechat_client
-
-    def _rail_challenge(self, service_url: str, service_id: str, params: Dict[str, Any], rail: str):
-        from .x402 import parse_402_response
-        url = f"{service_url.rstrip('/')}/execute"
-        body = {"service": service_id, "params": params, "rail": rail}
-        response = httpx.post(
-            url, json=body, headers={"Accept-Payment-Rail": rail},
-            timeout=self._timeout,
-        )
-        if response.status_code != 402:
-            if response.is_success:
-                return url, body, None, response
-            raise PaymentError(f"Service error: {response.status_code} {response.text}")
-        parsed = parse_402_response(response, service_id)
-        aliases = {"wechat": {"wechatpay-native", "wechat"}, "alipay": {"alipay-aipay", "alipay"}}
-        requirement = next((item for item in parsed.accepts if item.get("scheme") in aliases.get(rail, {rail}) or item.get("network") == rail), None)
-        if not requirement:
-            raise UnsupportedRail(f"Server does not offer payment rail: {rail}")
-        return url, body, requirement, response
-
-    def start_wechat_payment(
-        self,
-        service_url: str,
-        service_id: str,
-        params: Optional[Dict[str, Any]] = None,
-        **options: Any,
-    ):
-        url, body, requirement, response = self._rail_challenge(service_url, service_id, params or {}, "wechat")
-        if requirement is None:
-            raise PaymentError("Service completed without requiring a WeChat payment")
-        return self._get_wechat_client().start_402(
-            resource_url=url, requirement=requirement, data=json.dumps(body),
-            context={"server_url": service_url, "service_id": service_id}, **options,
-        )
-
-    def get_wechat_payment_status(self, identifier: str):
-        return self._get_wechat_client().status(identifier)
-
-    def fulfill_wechat_payment(self, identifier: str):
-        return self._get_wechat_client().fulfill(identifier)
-
-    def cancel_wechat_payment(self, identifier: str):
-        return self._get_wechat_client().cancel(identifier)
-
-    def list_wechat_payment_sessions(self):
-        return self._get_wechat_client().list_sessions()
-
-    def _pay_wechat(self, service_url: str, service_id: str, params: Dict[str, Any], amount: float, **options: Any) -> PaymentResult:
-        session = self.start_wechat_payment(service_url, service_id, params, **{k: v for k, v in options.items() if k in {"timeout", "on_payment_pending"}})
-        completed = self._get_wechat_client().poll_session(
-            session.payment_session_id,
-            poll_interval=float(options.get("poll_interval", 3.0)),
-            timeout=float(options.get("timeout", 300.0)),
-        )
-        if completed.status != "completed":
-            raise PaymentError(completed.last_error or f"WeChat payment ended with {completed.status}")
-        try:
-            result = json.loads(completed.result_body or "{}")
-        except json.JSONDecodeError:
-            result = completed.result_body
-        return PaymentResult(
-            success=True, amount=amount, token="CNY", service_id=service_id,
-            result=result.get("result", result) if isinstance(result, dict) else result,
-            facilitator="wechat", network="wechat",
-            payment={"out_trade_no": completed.out_trade_no, "session_id": completed.payment_session_id},
-        )
-
-    def _pay_alipay(self, service_url: str, service_id: str, params: Dict[str, Any], amount: float, **options: Any) -> PaymentResult:
-        url, body, requirement, response = self._rail_challenge(service_url, service_id, params, "alipay")
-        if requirement is None:
-            data = response.json()
-            return PaymentResult(success=True, amount=amount, token="CNY", service_id=service_id, result=data.get("result", data))
-        if self._alipay_client is None:
-            from .alipay import AlipayClient
-            self._alipay_client = AlipayClient(config_dir=str(self._config_dir))
-        result = self._alipay_client.pay_402(
-            resource_url=url, requirement=requirement, data=json.dumps(body),
-            intent_summary=options.get("intent_summary"), timeout=options.get("timeout"),
-            poll_interval=float(options.get("poll_interval", 3.0)),
-            on_payment_pending=options.get("on_payment_pending"),
-        )
-        payment = result["payment"]
-        return PaymentResult(
-            success=True, amount=amount, token="CNY", service_id=service_id,
-            result=result["body"], facilitator="alipay", network="alipay",
-            tx_hash=f"alipay:{payment['trade_no']}", payment=payment,
-        )
     
     def balance(self, chain: str = None) -> Balance:
         """
@@ -561,10 +402,6 @@ class MoltsPay:
             max_per_day: Maximum daily spending
         """
         self._wallet.set_limits(max_per_tx=max_per_tx, max_per_day=max_per_day)
-
-    def transfer(self, to: str, amount: Any, token: str = "USDC", chain: str = None) -> TransferResult:
-        """Transfer USDC/USDT to an EVM address."""
-        return self._wallet.transfer(to=to, amount=amount, token=token, chain=chain or self._chain)
     
     def fund(self, amount: float, chain: str = None) -> FundingResult:
         """
@@ -766,9 +603,6 @@ class MoltsPay:
         service_id: str,
         token: str = "USDC",
         chain: str = None,
-        rail: str = None,
-        payment_params: Optional[Dict[str, Any]] = None,
-        rail_options: Optional[Dict[str, Any]] = None,
         **params,
     ) -> PaymentResult:
         """
@@ -789,15 +623,8 @@ class MoltsPay:
             LimitExceeded: Transaction exceeds limits
             PaymentError: Payment or service failed
         """
-        if payment_params:
-            params = {**payment_params, **params}
-
         # Use provided chain or default
         chain = chain or self._chain
-
-        selected_rail = rail
-        if selected_rail is None and self._rail_preference:
-            selected_rail = self._rail_preference[0]
         
         # Normalize token
         token = token.upper()
@@ -822,15 +649,6 @@ class MoltsPay:
         
         if not service:
             raise PaymentError(f"Service not found: {service_id}")
-
-        if selected_rail == "balance":
-            return self._get_balance_client().pay(service_url, service_id, params, service.price)
-        if selected_rail == "wechat":
-            return self._pay_wechat(service_url, service_id, params, service.price, **(rail_options or {}))
-        if selected_rail == "alipay":
-            return self._pay_alipay(service_url, service_id, params, service.price, **(rail_options or {}))
-        if selected_rail and selected_rail not in CHAINS:
-            raise UnsupportedRail(f"Unsupported payment rail: {selected_rail}")
         
         # Check if token is accepted
         accepted = service.accepts
@@ -1001,9 +819,6 @@ class MoltsPay:
     def close(self):
         """Close the client."""
         self._x402.close()
-        for extra_client in (self._balance_client, self._wechat_client):
-            if extra_client is not None:
-                extra_client.close()
     
     def __enter__(self):
         return self
@@ -1038,9 +853,6 @@ class AsyncMoltsPay:
         private_key: Optional[str] = None,
         chain: str = "base",
         timeout: float = None,
-        config_dir: Optional[str] = None,
-        rail_preference: Optional[List[str]] = None,
-        buyer_id: Optional[str] = None,
     ):
         """Initialize async MoltsPay client. timeout=None means no timeout (like Node.js)."""
         self._wallet = Wallet(
@@ -1050,21 +862,6 @@ class AsyncMoltsPay:
         )
         self._x402 = AsyncX402Client(timeout=timeout)
         self._chain = chain
-        self._timeout = timeout
-        self._config_dir = config_dir
-        self._rail_preference = rail_preference
-        self._buyer_id = buyer_id
-        self._sync_client = None
-
-    def _get_sync_client(self) -> MoltsPay:
-        if self._sync_client is None:
-            private_key = self._wallet._account.key.hex()
-            self._sync_client = MoltsPay(
-                private_key=private_key, chain=self._chain, timeout=self._timeout,
-                config_dir=self._config_dir, rail_preference=self._rail_preference,
-                buyer_id=self._buyer_id,
-            )
-        return self._sync_client
     
     @property
     def address(self) -> str:
@@ -1097,10 +894,6 @@ class AsyncMoltsPay:
         service_url: str,
         service_id: str,
         token: str = "USDC",
-        chain: str = None,
-        rail: str = None,
-        payment_params: Optional[Dict[str, Any]] = None,
-        rail_options: Optional[Dict[str, Any]] = None,
         **params,
     ) -> PaymentResult:
         """
@@ -1112,16 +905,6 @@ class AsyncMoltsPay:
             token: Token to pay with ("USDC" or "USDT", default: "USDC")
             **params: Service parameters
         """
-        if payment_params:
-            params = {**payment_params, **params}
-        if rail:
-            import asyncio
-            return await asyncio.to_thread(
-                self._get_sync_client().pay,
-                service_url, service_id, token, chain or self._chain, rail,
-                params, rail_options,
-            )
-
         # Normalize token
         token = token.upper()
         if token not in ("USDC", "USDT"):
@@ -1129,7 +912,7 @@ class AsyncMoltsPay:
         
         # USDT requires gas for on-chain approval (no EIP-2612 support)
         if token == "USDT":
-            bal = self.balance()
+            bal = await self.balance()
             if bal.native < 0.0001:
                 raise PaymentError(
                     f"USDT requires ETH for gas (~$0.01 on Base). "
@@ -1164,7 +947,7 @@ class AsyncMoltsPay:
                 params,
                 self._wallet._account,
                 token=token,
-                chain=chain or self._chain,
+                chain=self._chain,
             )
             
             self._wallet.record_spend(service.price)
@@ -1173,9 +956,8 @@ class AsyncMoltsPay:
             # (not internal IDs like "moltspay:xxx")
             explorer_url = None
             if payment_response.tx_hash and not payment_response.tx_hash.startswith("moltspay:"):
-                chain_config = CHAINS.get(chain or self._chain, {})
-                if chain_config:
-                    explorer_url = f"{chain_config['explorer']}/tx/{payment_response.tx_hash}"
+                chain_config = self._wallet.chain_config
+                explorer_url = f"{chain_config['explorer']}{payment_response.tx_hash}"
             
             return PaymentResult(
                 success=True,
@@ -1186,6 +968,7 @@ class AsyncMoltsPay:
                 result=payment_response.result,
                 explorer_url=explorer_url,
             )
+            
         except PaymentError:
             raise
         except Exception as e:
@@ -1196,24 +979,10 @@ class AsyncMoltsPay:
                 service_id=service_id,
                 error=str(e),
             )
-
-    async def transfer(self, to: str, amount: Any, token: str = "USDC", chain: str = None) -> TransferResult:
-        import asyncio
-        return await asyncio.to_thread(self._get_sync_client().transfer, to, amount, token, chain or self._chain)
-
-    async def get_buyer_balance(self, server_url: str, buyer_id: str = None):
-        import asyncio
-        return await asyncio.to_thread(self._get_sync_client().get_buyer_balance, server_url, buyer_id)
-
-    async def list_balance_transactions(self, server_url: str, buyer_id: str = None, limit: int = 20, offset: int = 0):
-        import asyncio
-        return await asyncio.to_thread(self._get_sync_client().list_balance_transactions, server_url, buyer_id, limit, offset)
     
     async def close(self):
         """Close the client."""
         await self._x402.close()
-        if self._sync_client is not None:
-            self._sync_client.close()
     
     async def __aenter__(self):
         return self

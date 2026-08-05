@@ -34,9 +34,6 @@ NETWORK_TO_FACILITATOR: Dict[str, str] = {
     # Solana
     "solana:mainnet": "solana",
     "solana:devnet": "solana",
-    "balance": "balance",
-    "wechat": "wechat",
-    "alipay": "alipay",
 }
 
 
@@ -85,10 +82,6 @@ class FacilitatorRegistry:
     def get(self, name: str) -> Optional[BaseFacilitator]:
         """Get facilitator by name."""
         return self._facilitators.get(name)
-
-    def register(self, name: str, facilitator: BaseFacilitator) -> None:
-        """Register an optional facilitator configured by the provider."""
-        self._facilitators[name] = facilitator
     
     def get_for_network(self, network: str) -> Optional[BaseFacilitator]:
         """Get facilitator for a specific network."""

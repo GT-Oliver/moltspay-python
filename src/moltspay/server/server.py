@@ -40,10 +40,6 @@ from .types import (
 )
 from .facilitators import FacilitatorRegistry
 from .facilitators.cdp import load_env_file
-from .facilitators.balance import BalanceFacilitator
-from .facilitators.wechat import WechatFacilitator
-from .facilitators.alipay import AlipayFacilitator
-from ..balance import from_sat, to_sat
 
 
 class MoltsPayServer:
@@ -88,20 +84,6 @@ class MoltsPayServer:
         
         # Provider info (from first manifest)
         self.provider = self.manifests[0].provider if self.manifests else None
-
-        if self.provider and self.provider.balance:
-            balance_config = self.provider.balance
-            self.registry.register("balance", BalanceFacilitator(
-                db_path=balance_config["db_path"],
-                currency=balance_config.get("currency", "USD"),
-                single_limit=balance_config.get("single_limit", "5.00"),
-                daily_limit=balance_config.get("daily_limit", "10.00"),
-                auth_mode=balance_config.get("auth_mode", "off"),
-            ))
-        if self.provider and self.provider.wechat:
-            self.registry.register("wechat", WechatFacilitator(self.provider.wechat))
-        if self.provider and self.provider.alipay:
-            self.registry.register("alipay", AlipayFacilitator(self.provider.alipay))
         
         # Get configured chains
         self.chains = self._get_provider_chains()
@@ -128,10 +110,7 @@ class MoltsPayServer:
             result = []
             for c in chains:
                 # Determine network from chain name
-                if c.chain in ("balance", "alipay", "wechat"):
-                    network = c.network or c.chain
-                    wallet = c.wallet
-                elif c.chain.startswith("solana"):
+                if c.chain.startswith("solana"):
                     # Solana chains use different network format
                     network = c.network or SOLANA_CHAINS.get(c.chain, {}).get("network", "solana:devnet")
                     # Use solana_wallet if available
@@ -302,7 +281,6 @@ class MoltsPayServer:
                     client_chain: Client's requested chain (only adds MPP header if tempo_moderato)
                 """
                 accepts = []
-                payment_needed_header = None
                 
                 # Get BNB spender address if available
                 bnb_spender = server.registry.get_bnb_spender_address()
@@ -312,32 +290,6 @@ class MoltsPayServer:
                 
                 # Build accepts for ALL chains and ALL tokens
                 for chain_config in server.chains:
-                    if chain_config.network == "balance":
-                        balance = server.registry.get("balance")
-                        if isinstance(balance, BalanceFacilitator) and config.balance is not None:
-                            balance_price = str(config.balance.get("price", config.price))
-                            accepts.append(balance.create_requirements(balance_price, config.id))
-                        continue
-                    if chain_config.network == "wechat":
-                        wechat = server.registry.get("wechat")
-                        if isinstance(wechat, WechatFacilitator) and config.wechat:
-                            accepts.append(wechat.create_payment_requirements(
-                                price_cny=str(config.wechat["price_cny"]),
-                                description=str(config.wechat["description"]),
-                            ))
-                        continue
-                    if chain_config.network == "alipay":
-                        alipay = server.registry.get("alipay")
-                        if isinstance(alipay, AlipayFacilitator) and config.alipay:
-                            built = alipay.create_payment_requirements(
-                                service_id=str(config.alipay.get("service_id") or server.provider.alipay.get("service_id_default", "")),
-                                price_cny=str(config.alipay["price_cny"]),
-                                goods_name=str(config.alipay["goods_name"]),
-                                resource_id=f"/execute?service={config.id}",
-                            )
-                            accepts.append(built["requirement"])
-                            payment_needed_header = built["payment_needed_header"]
-                        continue
                     token_addresses = TOKEN_ADDRESSES.get(chain_config.network, {})
                     # Get decimals for this network (default 6, BNB uses 18)
                     decimals = TOKEN_DECIMALS.get(chain_config.network, 6)
@@ -391,8 +343,6 @@ class MoltsPayServer:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("X-Payment-Required", encoded)
-                if payment_needed_header:
-                    self.send_header("Payment-Needed", payment_needed_header)
                 
                 # Add MPP WWW-Authenticate header ONLY if client requested tempo_moderato
                 # This prevents MPP from overriding x402 on other chains
@@ -425,7 +375,7 @@ class MoltsPayServer:
                 self.send_response(204)
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Payment, Accept-Payment-Rail")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Payment")
                 self.end_headers()
             
             def do_GET(self):
@@ -438,10 +388,6 @@ class MoltsPayServer:
                     return self._handle_agent_services()
                 elif parsed.path == "/health":
                     return self._handle_health()
-                elif parsed.path == "/balance/query":
-                    return self._handle_balance_query(parsed)
-                elif parsed.path == "/balance/transactions":
-                    return self._handle_balance_transactions(parsed)
                 else:
                     self._send_json(404, {"error": "Not found"})
             
@@ -464,73 +410,8 @@ class MoltsPayServer:
                 
                 if parsed.path == "/execute":
                     return self._handle_execute(body, payment_header)
-                elif parsed.path == "/balance/topup":
-                    return self._handle_balance_topup(body)
-                elif parsed.path == "/balance/refund":
-                    return self._handle_balance_refund(body)
                 else:
                     self._send_json(404, {"error": "Not found"})
-
-            def _balance_facilitator(self):
-                facilitator = server.registry.get("balance")
-                return facilitator if isinstance(facilitator, BalanceFacilitator) else None
-
-            def _handle_balance_query(self, parsed):
-                facilitator = self._balance_facilitator()
-                if not facilitator:
-                    return self._send_json(404, {"error": "Balance rail not configured"})
-                buyer_id = (parse_qs(parsed.query).get("buyer_id") or [""])[0]
-                buyer = facilitator.ledger.get_buyer(buyer_id)
-                if not buyer:
-                    return self._send_json(404, {"error": "buyer_not_found"})
-                self._send_json(200, {
-                    "buyer_id": buyer_id, "currency": facilitator.currency,
-                    "balance": from_sat(buyer["balance_sat"]),
-                    "spent_today": from_sat(facilitator.ledger.spent_today_sat(buyer_id)),
-                    "single_limit": from_sat(buyer["single_limit_sat"]),
-                    "daily_limit": from_sat(buyer["daily_limit_sat"]),
-                    "status": buyer["status"],
-                })
-
-            def _handle_balance_transactions(self, parsed):
-                facilitator = self._balance_facilitator()
-                if not facilitator:
-                    return self._send_json(404, {"error": "Balance rail not configured"})
-                query = parse_qs(parsed.query)
-                buyer_id = (query.get("buyer_id") or [""])[0]
-                limit = int((query.get("limit") or [20])[0])
-                offset = int((query.get("offset") or [0])[0])
-                self._send_json(200, {"transactions": facilitator.ledger.list_transactions(buyer_id, limit, offset)})
-
-            def _handle_balance_topup(self, body):
-                facilitator = self._balance_facilitator()
-                if not facilitator:
-                    return self._send_json(404, {"error": "Balance rail not configured"})
-                if not self._balance_admin_authorized():
-                    return self._send_json(401, {"error": "Balance admin authorization required"})
-                try:
-                    result = facilitator.ledger.topup(
-                        buyer_id=body["buyer_id"], amount_sat=to_sat(body["amount"]),
-                        external_ref=body["external_ref"], description=body.get("description"),
-                    )
-                    self._send_json(200, {**result, "balance": from_sat(result["balance_sat"])})
-                except (KeyError, ValueError) as exc:
-                    self._send_json(400, {"error": str(exc)})
-
-            def _handle_balance_refund(self, body):
-                facilitator = self._balance_facilitator()
-                if not facilitator:
-                    return self._send_json(404, {"error": "Balance rail not configured"})
-                if not self._balance_admin_authorized():
-                    return self._send_json(401, {"error": "Balance admin authorization required"})
-                result = facilitator.refund(body.get("transaction", ""), body.get("reason"))
-                self._send_json(200 if result.get("success") else 400, result)
-
-            def _balance_admin_authorized(self):
-                expected = os.environ.get("MOLTSPAY_BALANCE_ADMIN_TOKEN")
-                if not expected:
-                    return False
-                return self.headers.get("Authorization", "") == f"Bearer {expected}"
             
             def _handle_get_services(self):
                 """GET /services - List available services."""
@@ -657,7 +538,7 @@ class MoltsPayServer:
                 scheme = payment.accepted.get("scheme") if payment.accepted else payment.scheme
                 network = payment.accepted.get("network") if payment.accepted else payment.network
                 
-                if scheme not in ("exact", "balance", "wechatpay-native", "alipay-aipay"):
+                if scheme != "exact":
                     return self._send_json(402, {"error": f"Unsupported scheme: {scheme}"})
                 
                 # Validate network is one of our supported chains
@@ -666,7 +547,7 @@ class MoltsPayServer:
                     return self._send_json(402, {"error": f"Network {network} not supported. Supported: {supported}"})
                 
                 # Detect payment token
-                payment_token = None if network in ("balance", "wechat", "alipay") else server._detect_payment_token(payment, network)
+                payment_token = server._detect_payment_token(payment, network)
                 if payment_token and payment_token not in skill.config.accepted_currencies:
                     accepted = skill.config.accepted_currencies
                     return self._send_json(402, {
@@ -674,36 +555,7 @@ class MoltsPayServer:
                     })
                 
                 # Build requirements
-                if network == "balance":
-                    facilitator = server.registry.get("balance")
-                    if not isinstance(facilitator, BalanceFacilitator) or skill.config.balance is None:
-                        return self._send_json(402, {"error": "Balance rail not enabled for this service"})
-                    req_data = facilitator.create_requirements(str(skill.config.balance.get("price", skill.config.price)), skill.config.id)
-                    requirements = X402PaymentRequirements(**req_data)
-                elif network == "wechat":
-                    if skill.config.wechat is None:
-                        return self._send_json(402, {"error": "WeChat rail not enabled for this service"})
-                    accepted = payment.accepted or {}
-                    requirements = X402PaymentRequirements(
-                        scheme="wechatpay-native", network="wechat", asset="CNY",
-                        amount=str(skill.config.wechat["price_cny"]),
-                        payTo=str(server.provider.wechat["mchid"]),
-                        maxTimeoutSeconds=int(accepted.get("maxTimeoutSeconds", 300)),
-                        extra=accepted.get("extra", {}),
-                    )
-                elif network == "alipay":
-                    if skill.config.alipay is None:
-                        return self._send_json(402, {"error": "Alipay rail not enabled for this service"})
-                    accepted = payment.accepted or {}
-                    requirements = X402PaymentRequirements(
-                        scheme="alipay-aipay", network="alipay", asset="CNY",
-                        amount=str(skill.config.alipay["price_cny"]),
-                        payTo=str(server.provider.alipay["seller_id"]),
-                        maxTimeoutSeconds=int(accepted.get("maxTimeoutSeconds", 1800)),
-                        extra=accepted.get("extra", {}),
-                    )
-                else:
-                    requirements = server._build_payment_requirements(skill.config, network=network, token=payment_token)
+                requirements = server._build_payment_requirements(skill.config, network=network, token=payment_token)
                 
                 # Verify payment using registry
                 print(f"[MoltsPay] Verifying payment on {network}...")
@@ -727,6 +579,10 @@ class MoltsPayServer:
                     "extra": requirements.extra,
                 }
                 
+                # Debug logging
+                print(f"[MoltsPay DEBUG] payment_dict: {json.dumps(payment_dict, indent=2)}")
+                print(f"[MoltsPay DEBUG] requirements_dict: {json.dumps(requirements_dict, indent=2)}")
+                
                 # Run async verify
                 verify_loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(verify_loop)
@@ -745,10 +601,9 @@ class MoltsPayServer:
                 
                 # Check if Solana - must settle BEFORE skill execution (blockhash expiry)
                 is_solana = network.startswith("solana:")
-                is_balance = network == "balance"
                 settlement = None
                 
-                if is_solana or is_balance:
+                if is_solana:
                     print(f"[MoltsPay] Solana detected - settling payment FIRST (blockhash expiry protection)")
                     settle_loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(settle_loop)
@@ -784,23 +639,19 @@ class MoltsPayServer:
                         loop.close()
                 except asyncio.TimeoutError:
                     print(f"[MoltsPay] Skill timeout after {timeout_seconds}s")
-                    if is_balance and settlement and settlement.success:
-                        server.registry.get("balance").refund(settlement.transaction, "skill timeout")
                     return self._send_json(500, {
                         "error": "Service execution failed",
                         "message": f"Timeout after {timeout_seconds}s",
                     })
                 except Exception as e:
                     print(f"[MoltsPay] Skill execution failed: {e}")
-                    if is_balance and settlement and settlement.success:
-                        server.registry.get("balance").refund(settlement.transaction, str(e))
                     return self._send_json(500, {
                         "error": "Service execution failed",
                         "message": str(e),
                     })
                 
                 # Settle payment (skip if already done for Solana)
-                if not is_solana and not is_balance:
+                if not is_solana:
                     print(f"[MoltsPay] Skill succeeded, settling payment...")
                     settle_loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(settle_loop)
