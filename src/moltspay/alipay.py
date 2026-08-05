@@ -19,8 +19,13 @@ from .exceptions import (
 
 ALIPAY_SCHEME = "alipay-aipay"
 ALIPAY_NETWORK = "alipay"
-TRADE_NO_RE = re.compile(r"(?:tradeNo|trade_no|trade-no)\s*[=:]\s*[\"']?([A-Za-z0-9_-]+)", re.I)
-URL_RE = re.compile(r"https?://[^\s\"']+")
+TRADE_NO_RE = re.compile(r"(?:tradeNo|trade_no|trade-no)\s*[=:]\s*[\"']?(\d{32})(?!\d)", re.I)
+TRADE_NO_BARE_RE = re.compile(r"\b(\d{32})\b")
+URL_RE = re.compile(r"(?:alipays?://|https?://)[^\s\"'\]`)>」]+", re.I)
+
+
+def _clean_url(value: str) -> str:
+    return value.rstrip(")]} `>")
 
 
 def parse_trade_no(lines: Sequence[str]) -> Optional[str]:
@@ -28,11 +33,12 @@ def parse_trade_no(lines: Sequence[str]) -> Optional[str]:
     try:
         data = json.loads(text)
         for key in ("tradeNo", "trade_no", "out_trade_no"):
-            if data.get(key):
-                return str(data[key])
+            value = str(data.get(key, ""))
+            if re.fullmatch(r"\d{32}", value):
+                return value
     except (json.JSONDecodeError, AttributeError):
         pass
-    match = TRADE_NO_RE.search(text)
+    match = TRADE_NO_RE.search(text) or TRADE_NO_BARE_RE.search(text)
     return match.group(1) if match else None
 
 
@@ -41,7 +47,7 @@ def parse_payment_url(lines: Sequence[str]) -> Optional[str]:
         if "url" in line.lower() or "http" in line.lower():
             match = URL_RE.search(line)
             if match:
-                return match.group(0)
+                return _clean_url(match.group(0))
     return None
 
 
@@ -52,12 +58,12 @@ def parse_status(lines: Sequence[str]) -> str:
         if isinstance(data, dict):
             if data.get("success") is True or data.get("code") == 200:
                 return "paid"
-            marker = f"{data.get('errorCode', '')} {data.get('message', '')} {data.get('reason', '')}".upper()
+            marker = (data["body"] if isinstance(data.get("body"), str) else f"{data.get('errorCode', '')} {data.get('message', '')} {data.get('reason', '')}").upper()
         else:
             marker = raw.upper()
     except json.JSONDecodeError:
         marker = raw.upper()
-    if re.search(r"TRADE_SUCCESS|TRADE_FINISHED|\"STATUS\"\s*:\s*\"FULFILLED\"", marker):
+    if re.search(r"TRADE_SUCCESS|TRADE_FINISHED|\"STATUS\"\s*:\s*\"FULFILLED\"|RESOURCE\s+RESPONSE\s+STATUS\s+200", marker):
         return "paid"
     if re.search(r"CLOSED|CANCEL|FAIL|REJECT|REFUSE|TIMEOUT|EXPIRE", marker):
         return "rejected"
@@ -99,8 +105,13 @@ class AlipayClient:
 
     def check_wallet(self) -> None:
         lines = self.runner(["check-wallet"])
-        text = "\n".join(lines).lower()
-        if not any(marker in text for marker in ("ready", "opened", "bound", "success", "已开通", "已绑定")):
+        text = "\n".join(lines).strip()
+        try:
+            data = json.loads(text)
+            ready = isinstance(data, dict) and ("code" not in data or int(data["code"]) == 200)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            ready = bool(re.search(r"READY|OPENED|BOUND|SUCCESS|已开通|已绑定", text, re.I))
+        if not ready:
             raise AlipayProtocolError("Alipay wallet is not opened; run `moltspay alipay apply` and `bind`")
 
     def pay_402(
@@ -153,11 +164,7 @@ class AlipayClient:
             time.sleep(max(0.05, poll_interval))
         else:
             raise AlipayPaymentTimeout(f"Alipay payment timed out: {trade_no}")
-        try:
-            body: Any = json.loads("\n".join(final_lines))
-            body = body.get("body", body) if isinstance(body, dict) else body
-        except json.JSONDecodeError:
-            body = "\n".join(final_lines)
+        body = self._extract_body(final_lines)
         try:
             self.runner(["402-buyer-fulfillment-ack", "-t", trade_no])
         except Exception:
@@ -166,3 +173,28 @@ class AlipayClient:
             "body": body,
             "payment": {"trade_no": trade_no, "out_trade_no": request_id, "payment_url": payment_url},
         }
+
+    @staticmethod
+    def _extract_body(lines: Sequence[str]) -> Any:
+        text = "\n".join(lines).strip()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+        if not isinstance(data, dict):
+            return data
+        resource = data.get("resourceResponse")
+        if resource is None and isinstance(data.get("body"), str):
+            report = data["body"]
+            match = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", report, re.S)
+            if not match:
+                return report
+            try:
+                resource = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return report
+        if resource is None:
+            resource = data.get("result", data.get("data", data.get("body", data)))
+        if isinstance(resource, dict):
+            resource = resource.get("result", resource.get("data", resource.get("body", resource)))
+        return resource

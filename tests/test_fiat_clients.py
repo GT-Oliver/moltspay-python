@@ -5,7 +5,7 @@ import json
 import httpx
 import pytest
 
-from moltspay.alipay import parse_payment_url, parse_status, parse_trade_no
+from moltspay.alipay import AlipayClient, parse_payment_url, parse_status, parse_trade_no
 from moltspay.wechat import WechatClient
 
 
@@ -71,8 +71,19 @@ def test_wechat_reads_node_session_files_for_all_session_commands(tmp_path):
 
 
 def test_alipay_cli_output_parsers():
-    assert parse_trade_no(['{"tradeNo":"20260805001"}']) == "20260805001"
+    assert parse_trade_no(['{"tradeNo":"20260805001234567890123456789012"}']) == "20260805001234567890123456789012"
+    assert parse_trade_no(['{"tradeNo":"20260805001"}']) is None
     assert parse_payment_url(["paymentUrl=https://example.com/pay/1"]) == "https://example.com/pay/1"
+    assert parse_payment_url(["url=alipays://platformapi/startapp?appId=1)`"]) == "alipays://platformapi/startapp?appId=1"
     assert parse_status(['{"success":false,"errorCode":"TRADE_STATUS_UNPAID"}']) == "pending"
     assert parse_status(['{"success":true}']) == "paid"
     assert parse_status(["TRADE_CLOSED"]) == "rejected"
+    assert parse_status(['{"body":"resource response status 200"}']) == "paid"
+
+
+def test_alipay_wallet_and_shape_c_result():
+    client = AlipayClient(runner=lambda args: ['{"code":200}'])
+    client.check_wallet()
+    assert AlipayClient._extract_body([
+        json.dumps({"body": "resource response: {\"result\": {\"url\": \"video.mp4\"}}"})
+    ]) == {"url": "video.mp4"}
