@@ -58,6 +58,9 @@ from .facilitators import (
     BNBFacilitator,
     TempoFacilitator,
     SolanaFacilitator,
+    BalanceFacilitator,
+    WechatFacilitator,
+    AlipayFacilitator,
 )
 from .types import (
     ServicesManifest,
@@ -79,6 +82,9 @@ __all__ = [
     "BNBFacilitator",
     "TempoFacilitator",
     "SolanaFacilitator",
+    "BalanceFacilitator",
+    "WechatFacilitator",
+    "AlipayFacilitator",
     "ServicesManifest",
     "ServiceConfig",
     "ProviderConfig",

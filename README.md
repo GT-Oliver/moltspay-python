@@ -8,6 +8,10 @@
 
 MoltsPay enables AI agents to pay each other for services using the [x402 protocol](https://www.x402.org/) - HTTP-native payments with USDC stablecoins. No gas fees for clients, no complex wallet management.
 
+CLI 命令参考：[`docs/CLI.md`](docs/CLI.md)
+
+> Architecture reference: [docs/DESIGN.md](docs/DESIGN.md)
+
 ## What is MoltsPay?
 
 MoltsPay is blockchain payment infrastructure designed for AI agents. It solves a fundamental problem: **how do autonomous AI agents pay for services?**
@@ -26,6 +30,9 @@ MoltsPay is blockchain payment infrastructure designed for AI agents. It solves 
 pip install moltspay
 ```
 
+The base package includes `qrcode`, which is required by the `fund` CLI
+command to render the funding QR code in the terminal.
+
 For Solana support:
 ```bash
 pip install moltspay[solana]
@@ -40,6 +47,16 @@ For everything:
 ```bash
 pip install moltspay[all]
 ```
+
+The `all` extra also includes the server dependencies. The optional groups are:
+
+| Extra | Includes | Use |
+|---|---|---|
+| *(base)* | `httpx`, `eth-account`, `pydantic`, `web3`, `cryptography`, `qrcode` | EVM SDK and CLI, including `fund` QR output |
+| `solana` | `solders`, `solana` | Solana wallet and payments |
+| `langchain` | `langchain-core` | LangChain integration |
+| `server` | `cdp-sdk` | Coinbase CDP server settlement |
+| `mcp` | `mcp` | MCP server |
 
 ## Quick Start
 
@@ -578,6 +595,13 @@ python -c "from moltspay import MoltsPay; print(MoltsPay().address)"
 - **PyPI:** https://pypi.org/project/moltspay/
 - **npm (Node.js):** https://www.npmjs.com/package/moltspay
 - **GitHub:** https://github.com/Yaqing2023/moltspay-python
+
+## Node.js 2.4 compatibility
+
+The Python SDK includes Balance, WeChat Native, Alipay AI Pay, MCP, payment
+verification, transfers, secure/permit wallets, invoices, audit logs, and
+Node-compatible encrypted wallets. See [docs/NODE-PARITY.md](docs/NODE-PARITY.md)
+for APIs, input/output contracts, configuration, and the browser-only exclusions.
 
 ## License
 

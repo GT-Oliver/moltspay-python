@@ -8,6 +8,8 @@ MoltsPay enables AI agents to pay for services using USDC. Gasless, multi-chain 
 pip install moltspay
 ```
 
+基础安装包含 `qrcode`，用于 `moltspay fund` 在终端显示充值二维码。
+
 ## Quick Start
 
 ```python

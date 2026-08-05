@@ -21,6 +21,9 @@ from .cdp import CDPFacilitator
 from .bnb import BNBFacilitator
 from .tempo import TempoFacilitator
 from .solana import SolanaFacilitator
+from .balance import BalanceFacilitator
+from .wechat import WechatFacilitator
+from .alipay import AlipayFacilitator
 from .registry import FacilitatorRegistry, NETWORK_TO_FACILITATOR
 
 __all__ = [
@@ -34,6 +37,9 @@ __all__ = [
     "BNBFacilitator",
     "TempoFacilitator",
     "SolanaFacilitator",
+    "BalanceFacilitator",
+    "WechatFacilitator",
+    "AlipayFacilitator",
     # Registry
     "FacilitatorRegistry",
     "NETWORK_TO_FACILITATOR",

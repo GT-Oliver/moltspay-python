@@ -1,7 +1,18 @@
 __pycache__/                                                                                                 
 *.py[cod]                                                                                                    
 .venv/                                                                                                       
-.env                                                                                                         
+.env
+.env.*
+!.env.example
+
+# Certificates and private keys
+cert/
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
 *.egg-info/                                                                                                  
 dist/                                                                                                        
 build/                                                                                                       
