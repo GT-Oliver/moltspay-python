@@ -8,6 +8,11 @@
 > not a roadmap. Historical implementation plans are kept separately and must
 > not be read as a list of currently missing features.
 
+Detailed module and payment-rail designs are indexed in
+[DESIGN-INDEX.md](DESIGN-INDEX.md). Node.js remains the protocol reference
+where wire compatibility is required; these documents describe the Python
+entry points, persistence, and optional-dependency boundaries.
+
 ## 1. Scope and design goals
 
 MoltsPay is a Python SDK and service runtime for agent-to-agent payments. The
@@ -165,7 +170,7 @@ regression test for both the success path and its most important failure path.
 - User-facing command behavior: `src/moltspay/cli.py` and `docs/CLI.md`.
 
 When adding a chain or rail, update the registry, routing logic, normalized
-result fields, tests, README support matrix, and this document in the same
-change. `docs/MULTI-CHAIN-PLAN.md` and `docs/TESTNET-SUPPORT-PLAN.md` describe
-earlier delivery stages and should be updated or archived when their remaining
-work is completed.
+result fields, tests, README support matrix, and the relevant design document
+in the same change. `docs/MULTI-CHAIN-PLAN.md` and
+`docs/TESTNET-SUPPORT-PLAN.md` describe earlier delivery stages; the current
+design is documented by the files indexed in `docs/DESIGN-INDEX.md`.

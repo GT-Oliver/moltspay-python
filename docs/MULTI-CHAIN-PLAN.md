@@ -1,6 +1,14 @@
-# moltspay-python Multi-Chain Implementation Plan
+# moltspay-python Multi-Chain Implementation Plan (Historical)
 
-## Current State
+> This document records the original delivery plan. The listed chains and
+> facilitators are now implemented. Read [MULTI-CHAIN-DESIGN.md](MULTI-CHAIN-DESIGN.md)
+> for the current architecture and [DESIGN-INDEX.md](DESIGN-INDEX.md) for the
+> complete Python design-document set.
+
+## Current State at the time of writing
+
+The following snapshot is historical and is intentionally retained to explain
+the phase order. It is not the current Python capability matrix.
 
 **Node.js SDK has:**
 - base, polygon, base_sepolia (x402)
@@ -12,7 +20,7 @@
 - base, polygon, base_sepolia (x402) ✅
 - faucet() for base_sepolia ✅
 
-**Python SDK missing:**
+**Python SDK missing at that time:**
 - tempo_moderato (MPP)
 - bnb, bnb_testnet
 - solana, solana_devnet
@@ -235,7 +243,9 @@ Key files to reference in `~/clawd/projects/payment-agent/`:
 
 ---
 
-## Future: MCP Server
+## Future at the time of writing: MCP Server
+
+The MCP track has since been implemented. See [MCP-SERVER-DESIGN.md](MCP-SERVER-DESIGN.md).
 
 **Goal:** Universal LLM access without framework lock-in
 
