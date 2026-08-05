@@ -11,7 +11,7 @@ import httpx
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
-from .models import Service
+from .models import Service, ServicesResponse, ProviderInfo
 from .exceptions import PaymentError
 
 
@@ -22,6 +22,20 @@ class PaymentRequired:
     accepts: List[dict]
     resource: dict
     raw: dict
+    service_id: str = ""
+
+    @property
+    def amount(self) -> float:
+        value = self.accepts[0].get("amount", 0) if self.accepts else 0
+        return float(value)
+
+    @property
+    def currency(self) -> str:
+        return str(self.accepts[0].get("currency", "USDC")) if self.accepts else "USDC"
+
+    @property
+    def pay_to(self) -> str:
+        return str(self.accepts[0].get("payTo", "")) if self.accepts else ""
 
 
 @dataclass
@@ -33,6 +47,26 @@ class PaymentResponse:
     network: Optional[str] = None
     facilitator: Optional[str] = None
     raw_payment_response: Optional[dict] = None
+
+    def __getitem__(self, key: str) -> Any:
+        """Backward-compatible access to the service result as a mapping."""
+        if isinstance(self.result, dict):
+            return self.result[key]
+        raise TypeError("payment result is not a mapping")
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.result.get(key, default) if isinstance(self.result, dict) else default
+
+
+def _service_from_dict(svc: dict) -> Service:
+    return Service(
+        id=svc.get("id", ""), name=svc.get("name"), description=svc.get("description"),
+        price=float(svc.get("price", 0)), currency=svc.get("currency", "USDC"),
+        accepted_currencies=svc.get("acceptedCurrencies", svc.get("accepted_currencies")),
+        chains=svc.get("chains"), parameters=svc.get("parameters", svc.get("input")),
+        input=svc.get("input", svc.get("parameters", {})), output=svc.get("output", {}),
+        available=svc.get("available", True), provider=svc.get("provider"), endpoint=svc.get("endpoint"),
+    )
 
 
 def parse_payment_response(response: httpx.Response) -> PaymentResponse:
@@ -85,34 +119,64 @@ def parse_payment_response(response: httpx.Response) -> PaymentResponse:
     )
 
 
-def parse_402_response(response: httpx.Response) -> PaymentRequired:
+def _decode_payment_required(value: Any) -> dict:
+    """Decode x402 v1/v2 data from a mapping, JSON string, or Base64 JSON."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        return {"x402Version": 1, "accepts": value}
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("empty payment requirement")
+    value = value.strip()
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        padding = "=" * (-len(value) % 4)
+        decoded = json.loads(base64.b64decode(value + padding).decode("utf-8"))
+    if isinstance(decoded, list):
+        return {"x402Version": 1, "accepts": decoded}
+    if not isinstance(decoded, dict):
+        raise ValueError("payment requirement must be an object or list")
+    return decoded
+
+
+def _normalize_payment_required(data: dict) -> PaymentRequired:
+    """Normalize legacy single-requirement and modern accepts[] formats."""
+    nested = data.get("x402")
+    if isinstance(nested, dict):
+        data = nested
+    accepts = data.get("accepts")
+    if not isinstance(accepts, list):
+        legacy_keys = {"amount", "currency", "payTo", "asset", "network", "scheme"}
+        accepts = [data] if legacy_keys.intersection(data) else []
+    return PaymentRequired(
+        x402_version=int(data.get("x402Version", 2)),
+        accepts=accepts,
+        resource=data.get("resource", {}) if isinstance(data.get("resource", {}), dict) else {},
+        raw=data,
+    )
+
+
+def parse_402_response(response: httpx.Response, service_id: str = "") -> PaymentRequired:
     """Parse 402 Payment Required response."""
     # Try X-Payment-Required header first (base64 encoded)
     header = response.headers.get("X-Payment-Required")
     if header:
         try:
-            data = json.loads(base64.b64decode(header))
-            return PaymentRequired(
-                x402_version=data.get("x402Version", 2),
-                accepts=data.get("accepts", []),
-                resource=data.get("resource", {}),
-                raw=data,
-            )
-        except (json.JSONDecodeError, Exception):
+            parsed = _normalize_payment_required(_decode_payment_required(header))
+            parsed.service_id = service_id
+            return parsed
+        except Exception:
             pass
     
     # Try response body
     try:
-        body = response.json()
-        data = body.get("x402", body)
-        return PaymentRequired(
-            x402_version=data.get("x402Version", 2),
-            accepts=data.get("accepts", []),
-            resource=data.get("resource", {}),
-            raw=data,
-        )
+        parsed = _normalize_payment_required(_decode_payment_required(response.json()))
+        parsed.service_id = service_id
+        return parsed
     except Exception:
-        raise PaymentError("Could not parse 402 response")
+        suffix = f" for service '{service_id}'" if service_id else ""
+        raise PaymentError(f"Could not parse 402 response{suffix}")
 
 
 def sign_eip3009_authorization(
@@ -201,11 +265,14 @@ def build_payment_payload(
     # Get target chain ID if specified
     target_chain_id = CHAIN_IDS.get(chain) if chain else None
     
+    if not payment_required.accepts:
+        raise PaymentError("402 response contains no accepted payment requirements")
+
     # Find the requirement matching the requested token AND chain
     req = None
     for accept in payment_required.accepts:
         # Check if asset matches token (USDC or USDT)
-        asset = accept.get("asset", "").lower()
+        asset = str(accept.get("asset", "")).lower()
         token_name = accept.get("extra", {}).get("name", "")
         
         token_matches = False
@@ -231,7 +298,49 @@ def build_payment_payload(
     if not req:
         req = payment_required.accepts[0]
     
-    chain_id = int(req["network"].split(":")[1])
+    # Legacy v1 responses did not include asset/network/domain. Preserve
+    # compatibility by delegating to their permit-signing callback.
+    if callable(account):
+        amount_decimal = float(req.get("amount", "0"))
+        permit = account(req.get("payTo", ""), amount_decimal)
+        payload = {
+            "x402Version": payment_required.x402_version,
+            "payload": permit,
+            "accepted": req,
+            "resource": payment_required.resource,
+        }
+        return base64.b64encode(json.dumps(payload).encode()).decode()
+
+    network = req.get("network")
+    asset = req.get("asset")
+    # MoltsPay <=0.5 emitted a compact requirement containing decimal amount,
+    # currency and payTo only. Hydrate it from the selected chain so the same
+    # wallet can still authorize those providers.
+    if (not network or not asset) and chain:
+        from .chains import CHAINS
+        chain_config = CHAINS.get(chain) or {}
+        token_config = (chain_config.get("tokens") or {}).get(token) or {}
+        if token_config:
+            network = f"eip155:{chain_config['chainId']}"
+            asset = token_config["address"]
+            decimals = int(token_config.get("decimals", 6))
+            decimal_amount = str(req.get("amount", "0"))
+            req = {
+                **req,
+                "scheme": req.get("scheme", "exact"),
+                "network": network,
+                "asset": asset,
+                "amount": str(int(float(decimal_amount) * (10 ** decimals))),
+                "extra": {
+                    "name": token_config.get("eip712Name", "USD Coin"),
+                    "version": token_config.get("eip712Version", "2"),
+                    **(req.get("extra") or {}),
+                },
+            }
+    if not network or not asset:
+        raise PaymentError("Payment requirement is missing network or asset")
+    chain_id = int(network.split(":")[1])
+    extra = req.get("extra") or {}
     
     payment = sign_eip3009_authorization(
         account=account,
@@ -239,8 +348,8 @@ def build_payment_payload(
         amount=req["amount"],
         asset=req["asset"],
         chain_id=chain_id,
-        token_name=req["extra"]["name"],
-        token_version=req["extra"]["version"],
+        token_name=extra.get("name", "USD Coin"),
+        token_version=extra.get("version", "2"),
         timeout_seconds=req.get("maxTimeoutSeconds", 300),
     )
     
@@ -274,28 +383,25 @@ class X402Client:
     
     def discover_services(self, base_url: str) -> List[Service]:
         """Discover available services from a provider."""
-        url = f"{base_url.rstrip('/')}/.well-known/agent-services.json"
-        
-        try:
-            response = self._client.get(url)
-            response.raise_for_status()
-            data = response.json()
-            
-            services = []
-            for svc in data.get("services", data if isinstance(data, list) else []):
-                services.append(Service(
-                    id=svc.get("id", ""),
-                    name=svc.get("name"),
-                    description=svc.get("description"),
-                    price=float(svc.get("price", 0)),
-                    currency=svc.get("currency", "USDC"),
-                    accepted_currencies=svc.get("acceptedCurrencies"),
-                    parameters=svc.get("parameters"),
-                ))
-            return services
-            
-        except httpx.HTTPError as e:
-            raise PaymentError(f"Failed to discover services: {e}")
+        return self.get_services(base_url).services
+
+    def get_services(self, base_url: str) -> ServicesResponse:
+        """Try all discovery endpoints supported by the Node client."""
+        normalized = base_url.rstrip("/")
+        for suffix in ("/.well-known/agent-services.json", "/services", "/api/services", "/registry/services"):
+            try:
+                response = self._client.get(normalized + suffix)
+                if response.status_code >= 400:
+                    continue
+                data = response.json()
+                raw_services = data.get("services", data if isinstance(data, list) else [])
+                services = [_service_from_dict(item) for item in raw_services]
+                provider_data = data.get("provider") if isinstance(data, dict) else None
+                provider = ProviderInfo(**provider_data) if provider_data else None
+                return ServicesResponse(provider=provider, services=services)
+            except (httpx.HTTPError, ValueError, TypeError):
+                continue
+        raise PaymentError(f"Failed to discover services at {base_url}")
     
     def call_service(
         self,
@@ -527,7 +633,12 @@ class AsyncX402Client:
                     price=float(svc.get("price", 0)),
                     currency=svc.get("currency", "USDC"),
                     accepted_currencies=svc.get("acceptedCurrencies"),
-                    parameters=svc.get("parameters"),
+                    parameters=svc.get("parameters", svc.get("input")),
+                    input=svc.get("input", svc.get("parameters", {})),
+                    output=svc.get("output", {}),
+                    available=svc.get("available", True),
+                    provider=svc.get("provider"),
+                    endpoint=svc.get("endpoint"),
                 ))
             return services
             

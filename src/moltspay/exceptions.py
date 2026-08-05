@@ -3,7 +3,30 @@
 
 class MoltsPayError(Exception):
     """Base exception for MoltsPay."""
-    pass
+    code = "MOLTSPAY_ERROR"
+
+    def __init__(self, message: str = ""):
+        super().__init__(message)
+
+
+class UnsupportedRail(MoltsPayError):
+    code = "UNSUPPORTED_RAIL"
+
+
+class AlipayCliNotFound(MoltsPayError):
+    code = "ALIPAY_CLI_NOT_FOUND"
+
+
+class AlipayPaymentTimeout(MoltsPayError):
+    code = "ALIPAY_PAYMENT_TIMEOUT"
+
+
+class AlipayPaymentRejected(MoltsPayError):
+    code = "ALIPAY_PAYMENT_REJECTED"
+
+
+class AlipayProtocolError(MoltsPayError):
+    code = "ALIPAY_PROTOCOL"
 
 
 class WalletError(MoltsPayError):

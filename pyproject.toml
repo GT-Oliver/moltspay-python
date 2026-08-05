@@ -1,6 +1,6 @@
 [project]
 name = "moltspay"
-version = "0.7.0"
+version = "2.4.0"
 description = "Python SDK for MoltsPay - Agent-to-Agent Payments. LangChain compatible."
 readme = "README.md"
 license = {text = "MIT"}
@@ -33,6 +33,7 @@ dependencies = [
     "eth-account>=0.9",
     "pydantic>=2.0",
     "web3>=6.0.0",
+    "cryptography>=41.0",
 ]
 
 [project.optional-dependencies]
@@ -46,18 +47,23 @@ solana = [
     "solders>=0.20.0",
     "solana>=0.30.0",
 ]
+fiat = []
+mcp = [
+    "mcp>=1.0",
+]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
 ]
 all = [
-    "moltspay[langchain,solana,dev]",
+    "moltspay[langchain,solana,fiat,mcp,dev]",
 ]
 
 [project.scripts]
 moltspay = "moltspay.cli:main"
 moltspay-server = "moltspay.server.__main__:main"
+moltspay-mcp = "moltspay.mcp.__main__:main"
 
 [project.urls]
 Homepage = "https://moltspay.com"
@@ -70,3 +76,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/moltspay"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_default_fixture_loop_scope = "function"

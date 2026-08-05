@@ -1,7 +1,7 @@
 """Pydantic models for MoltsPay."""
 
-from typing import Optional, Any, List, Literal
-from pydantic import BaseModel
+from typing import Optional, Any, List, Literal, Dict
+from pydantic import BaseModel, ConfigDict, Field
 
 # Supported token types
 TokenSymbol = Literal["USDC", "USDT"]
@@ -17,6 +17,13 @@ class Service(BaseModel):
     accepted_currencies: Optional[List[str]] = None  # ["USDC", "USDT"]
     chains: Optional[List[str]] = None  # ["base", "polygon", "base_sepolia"]
     parameters: Optional[dict] = None
+    input: Dict[str, Any] = Field(default_factory=dict)
+    output: Dict[str, Any] = Field(default_factory=dict)
+    available: bool = True
+    provider: Optional[Dict[str, Any]] = None
+    endpoint: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
     
     @property
     def accepts(self) -> List[str]:
@@ -31,6 +38,11 @@ class Balance(BaseModel):
     usdt: float = 0.0
     eth: float
     chain: str = "base"
+
+    @property
+    def native(self) -> float:
+        """Node-compatible name for the chain's native-token balance."""
+        return self.eth
 
 
 class Limits(BaseModel):
@@ -54,6 +66,102 @@ class PaymentResult(BaseModel):
     result: Optional[Any] = None
     error: Optional[str] = None
     explorer_url: Optional[str] = None
+    network: Optional[str] = None
+    facilitator: Optional[str] = None
+    payment: Optional[Dict[str, Any]] = None
+
+
+class TransferResult(BaseModel):
+    """Result of an ERC-20 or native-token transfer."""
+    success: bool
+    tx_hash: Optional[str] = None
+    from_address: Optional[str] = None
+    to_address: Optional[str] = None
+    amount: Optional[float] = None
+    token: str = "USDC"
+    chain: str = "base"
+    gas_used: Optional[int] = None
+    block_number: Optional[int] = None
+    explorer_url: Optional[str] = None
+    error: Optional[str] = None
+    permit_tx_hash: Optional[str] = None
+    transfer_tx_hash: Optional[str] = None
+    remaining_allowance: Optional[str] = None
+
+
+class VerifyPaymentResult(BaseModel):
+    """Normalized on-chain payment verification result."""
+    verified: bool
+    tx_hash: Optional[str] = None
+    amount: Optional[str] = None
+    token: Optional[str] = None
+    sender: Optional[str] = None
+    recipient: Optional[str] = None
+    block_number: Optional[int] = None
+    confirmations: Optional[int] = None
+    explorer_url: Optional[str] = None
+    pending: bool = False
+    error: Optional[str] = None
+
+
+class BuyerBalance(BaseModel):
+    """Balance-rail account snapshot."""
+    buyer_id: str
+    currency: str = "USD"
+    balance: str = "0.00"
+    spent_today: str = "0.00"
+    single_limit: Optional[str] = None
+    daily_limit: Optional[str] = None
+    status: str = "active"
+
+
+class ProviderInfo(BaseModel):
+    name: str
+    username: Optional[str] = None
+    description: Optional[str] = None
+    wallet: Optional[str] = None
+    chain: Optional[str] = None
+    chains: Optional[List[Any]] = None
+
+
+class ServicesResponse(BaseModel):
+    provider: Optional[ProviderInfo] = None
+    services: List[Service] = Field(default_factory=list)
+
+
+class SecurityLimits(BaseModel):
+    single_max: float = 10.0
+    daily_max: float = 100.0
+    require_whitelist: bool = False
+
+
+class PendingTransfer(BaseModel):
+    id: str
+    to: str
+    amount: float
+    token: str = "USDC"
+    reason: Optional[str] = None
+    requester: Optional[str] = None
+    created_at: str
+    status: Literal["pending", "approved", "rejected", "executed"] = "pending"
+
+
+class Invoice(BaseModel):
+    type: str = "payment_request"
+    version: str = "1.0"
+    order_id: str
+    service: str
+    description: Optional[str] = None
+    amount: str
+    token: str = "USDC"
+    chain: str
+    chain_id: int
+    recipient: str
+    memo: Optional[str] = None
+    expires_at: str
+    deep_link: Optional[str] = None
+    explorer_url: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class FundingResult(BaseModel):
