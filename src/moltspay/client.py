@@ -370,6 +370,15 @@ class MoltsPay:
     def list_wechat_payment_sessions(self):
         return self._get_wechat_client().list_sessions()
 
+    def check_alipay_wallet(self, executable: str = "alipay-bot") -> None:
+        """Check the locally installed Alipay wallet dependency."""
+        from .alipay import AlipayClient
+        client = self._alipay_client
+        if client is None or client.executable != executable:
+            client = AlipayClient(config_dir=str(self._config_dir), executable=executable)
+            self._alipay_client = client
+        return client.check_wallet()
+
     def _pay_wechat(self, service_url: str, service_id: str, params: Dict[str, Any], amount: float, **options: Any) -> PaymentResult:
         session = self.start_wechat_payment(service_url, service_id, params, **{k: v for k, v in options.items() if k in {"timeout", "on_payment_pending"}})
         completed = self._get_wechat_client().poll_session(
@@ -397,7 +406,12 @@ class MoltsPay:
             return PaymentResult(success=True, amount=amount, token="CNY", service_id=service_id, result=data.get("result", data))
         if self._alipay_client is None:
             from .alipay import AlipayClient
-            self._alipay_client = AlipayClient(config_dir=str(self._config_dir))
+            self._alipay_client = AlipayClient(
+                config_dir=str(self._config_dir),
+                framework=options.get("framework", "openclaw"),
+            )
+        elif options.get("framework"):
+            self._alipay_client.framework = options["framework"]
         result = self._alipay_client.pay_402(
             resource_url=url, requirement=requirement, data=json.dumps(body),
             intent_summary=options.get("intent_summary"), timeout=options.get("timeout"),

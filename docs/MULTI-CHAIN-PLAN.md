@@ -1,9 +1,8 @@
 # moltspay-python Multi-Chain Implementation Plan (Historical)
 
 > This document records the original delivery plan. The listed chains and
-> facilitators are now implemented. Read [MULTI-CHAIN-DESIGN.md](MULTI-CHAIN-DESIGN.md)
-> for the current architecture and [DESIGN-INDEX.md](DESIGN-INDEX.md) for the
-> complete Python design-document set.
+> facilitators are now implemented. Read [DESIGN.md](DESIGN.md) for the current
+> consolidated architecture and capability map.
 
 ## Current State at the time of writing
 
@@ -245,7 +244,7 @@ Key files to reference in `~/clawd/projects/payment-agent/`:
 
 ## Future at the time of writing: MCP Server
 
-The MCP track has since been implemented. See [MCP-SERVER-DESIGN.md](MCP-SERVER-DESIGN.md).
+The MCP track has since been implemented. See [DESIGN.md](DESIGN.md).
 
 **Goal:** Universal LLM access without framework lock-in
 

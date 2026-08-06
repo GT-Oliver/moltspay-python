@@ -14,11 +14,23 @@ def test_help_lists_all_supported_commands():
 
     for command in (
         "init", "status", "faucet", "pay", "approve", "services", "fund",
-        "transfer", "config", "limits", "balance", "wechat", "alipay",
+        "transfer", "config", "balance", "wechat", "alipay", "list", "validate", "server",
     ):
         assert command in help_text
 
-    assert "Read or update spending limits" in help_text
+    assert "limits" not in help_text
+
+
+def test_node_parity_options_are_present_and_python_only_options_are_hidden(capsys):
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["pay", "--help"])
+    pay_help = capsys.readouterr().out
+    for option in ("--prompt", "--image", "--data", "--buyer", "--pack", "--config-dir", "--json"):
+        assert option in pay_help
+    assert "--buyer-id" not in pay_help
+    assert "--topup-pack" not in pay_help
 
 
 def test_nested_help_describes_balance_and_wechat_commands(capsys):

@@ -8,10 +8,10 @@
 > not a roadmap. Historical implementation plans are kept separately and must
 > not be read as a list of currently missing features.
 
-Detailed module and payment-rail designs are indexed in
-[DESIGN-INDEX.md](DESIGN-INDEX.md). Node.js remains the protocol reference
-where wire compatibility is required; these documents describe the Python
-entry points, persistence, and optional-dependency boundaries.
+This is the single consolidated design document for the Python SDK. Node.js
+remains the protocol reference where wire compatibility is required; this
+document describes the Python entry points, persistence, optional-dependency
+boundaries, payment rails, and MCP adapter.
 
 ## 1. Scope and design goals
 
@@ -172,5 +172,143 @@ regression test for both the success path and its most important failure path.
 When adding a chain or rail, update the registry, routing logic, normalized
 result fields, tests, README support matrix, and the relevant design document
 in the same change. `docs/MULTI-CHAIN-PLAN.md` and
-`docs/TESTNET-SUPPORT-PLAN.md` describe earlier delivery stages; the current
-design is documented by the files indexed in `docs/DESIGN-INDEX.md`.
+`docs/TESTNET-SUPPORT-PLAN.md` describe earlier delivery stages and are not
+part of the current design reference.
+
+## 10. Module boundaries and extension rules
+
+`MoltsPay` is the synchronous facade and `AsyncMoltsPay` exposes the same
+workflow with async HTTP. `x402.py` owns discovery, 402 parsing,
+payment-header construction, retry, and response normalization; it does not
+own wallet persistence or provider business logic.
+
+`chains.py` is the registry for chain IDs, RPCs, explorers, tokens, protocol
+families, and testnet flags. `facilitators/` contains protocol-specific
+signing and settlement behavior. `server/` maps network identifiers to
+facilitators and loads provider skill manifests. `cli.py` and `mcp/` are
+adapters over public client APIs and must not duplicate payment logic.
+
+For a new module, define public models and errors first, keep network I/O
+behind the client/facilitator boundary, add focused success and failure tests,
+and document any optional dependency. For a new chain, update the registry,
+facilitator mapping, models, tests, README support matrix, and this document.
+
+## 11. Payment rail details
+
+### Balance rail
+
+The balance rail is selected explicitly with `rail="balance"`. `balance.py`
+stores monetary values as integer minor units and provides balance queries,
+top-ups, atomic deductions, refunds, and transaction history. Mutations are
+idempotent by `external_ref`, `request_id`, and deduction transaction ID.
+Optional `auth_mode="enforce"` requires an EIP-191 buyer signature and
+TOFU-binds the account to that signer. Operator mutations require the admin
+bearer token. The state flow is:
+
+```text
+top-up request -> pending -> settled | failed
+payment        -> reserved -> deducted | released
+service error  -> refund (idempotent)
+```
+
+### WeChat Native rail
+
+The `wechat` rail uses `wechatpay-native` and WeChat Pay v3 Native orders.
+The provider converts CNY to integer fen with `Decimal`, rejects negative or
+sub-cent amounts, creates `/v3/pay/transactions/native`, and returns
+`code_url` plus `out_trade_no`. Merchant requests use
+`WECHATPAY2-SHA256-RSA2048` authorization.
+
+`WechatClient` persists recoverable sessions under
+`~/.moltspay/wechat-sessions/<payment_session_id>.json`. A session stores the
+resource request, requirement, expiration, code URL, trade number, last
+status/error, and result body; both snake_case and Node-compatible camelCase
+fields are accepted. The lifecycle is `start_402 -> scan -> status poll ->
+fulfill`, with `pending`, `completed`, `expired`, `cancelled`, and `failed`
+states. A selected WeChat rail never silently falls back to crypto.
+
+The provider verifies `trade_state == SUCCESS`, checks that the paid amount is
+at least the required fen amount, and returns the WeChat transaction ID.
+Repeated status and fulfillment operations are safe and must not create a
+second order.
+
+### Alipay AI Pay rail
+
+The `alipay` rail uses scheme `alipay-aipay`. The buyer-side
+`AlipayClient` invokes the official `alipay-bot` CLI; the provider signs the
+challenge with RSA2 and calls the Alipay verify and fulfillment APIs. Amounts
+are CNY yuan. The signed field order is:
+
+```text
+amount, currency, goods_name, out_trade_no,
+pay_before, resource_id, seller_id, service_id
+```
+
+The buyer flow is `payment-intent -> check-wallet -> 402-buyer-pay ->
+402-query-payment-status -> 402-buyer-fulfillment-ack`. It accepts JSON and
+human-readable CLI output, requires a pure 32-digit `tradeNo`, preserves the
+cashier URL, and normalizes paid, pending, and rejected states. The challenge
+is persisted under `~/.moltspay/alipay/402_<request_id>.txt` for recovery.
+Missing CLI, unopened wallet, malformed trade number, rejected, and timeout
+conditions map to dedicated errors. A selected Alipay rail never silently
+falls back to crypto.
+
+## 12. Security and persistence
+
+The EVM wallet uses the Node-compatible scrypt plus AES-256-CBC format. Private
+keys must never be logged or placed in provider manifests. `SecureWallet`
+provides whitelist and approval workflow; `PermitWallet` and
+`AllowanceWallet` isolate delegated-spend operations; `AuditLog` writes
+hash-chained local records. Limits are checked before payment and spending is
+recorded only after a successful result.
+
+Security controls include matching chain/token requirements against the
+registry, nonces and request IDs for replay protection, explicit BNB spender
+and allowance checks, a separate Solana wallet file, MCP confirmation gates,
+and environment/config separation for credentials. Every new rail must
+document authentication, replay protection, amount precision, persistence,
+and failure recovery before `pay()` exposes it.
+
+## 13. MCP adapter and expanded fiat tools
+
+The MCP integration is a local stdio adapter around `MoltsPay`, installed via
+`moltspay[mcp]`. It never returns private keys or implements payment protocols
+itself. Existing tools are `moltspay_status`, `moltspay_services`,
+`moltspay_pay`, and `moltspay_config`; `--dry-run` never signs or sends a
+payment.
+
+The expanded design adds:
+
+| Tool group | Operations |
+|---|---|
+| Balance | query, transactions, set buyer, top-up order/confirm/status/list |
+| WeChat | start, status, fulfill, cancel, list |
+| Alipay | check wallet, pay |
+
+MCP inputs use camelCase and map to Python snake_case. Amounts are decimal
+strings, times are UTC ISO-8601, and responses are JSON-serializable. New
+operations should use the envelope `{ok, data, requestId, retried}` on success
+and `{ok: false, error: {code, message, retryable, retryAfterSeconds}}` on
+failure. Unknown network outcomes must return `status="unknown"` or
+`retryable=true` so callers query state instead of repeating a money movement.
+
+When `MOLTSPAY_MCP_REQUIRE_CONFIRM=1`, confirmation is required for payment,
+balance top-up, WeChat start/fulfill, and Alipay pay. Queries, lists, status,
+and reads do not require confirmation. Logs must redact code URLs, payment
+links, transaction identifiers, and all signature or credential material.
+
+## 14. Reliability and verification
+
+Pure parsing, signing payload construction, limits, wallet behavior, CLI
+behavior, balance idempotency, fiat session transitions, and MCP tool
+contracts belong in the test suite. On-chain, provider, and credential-backed
+tests remain opt-in. Network retries use bounded exponential backoff, respect
+`Retry-After`, never automatically retry non-idempotent POSTs, and never
+extend the original business deadline. Payment creation and fulfillment must
+use stable idempotency keys (`paymentSessionId`, `outTradeNo`, `tradeNo`, or
+server `externalRef`).
+
+Acceptance coverage must include missing optional dependencies, malformed 402
+responses, unsupported chains, insufficient funds, limits, duplicate
+mutations, 429/5xx polling, timeout recovery, dry-run behavior, and backward
+compatibility of the original four MCP tools.
