@@ -603,6 +603,23 @@ verification, transfers, secure/permit wallets, invoices, audit logs, and
 Node-compatible encrypted wallets. See [docs/NODE-PARITY.md](docs/NODE-PARITY.md)
 for APIs, input/output contracts, configuration, and the browser-only exclusions.
 
+### WeChat Pay v3 response verification
+
+For server-side WeChat polling, configure the WeChat platform public key so
+API responses are verified before `trade_state == SUCCESS` is accepted:
+
+```json
+{
+  "wechat": {
+    "platform_public_key_path": "./cert/wechat-platform.pem"
+  }
+}
+```
+
+`platform_public_key_pem` may be used instead of the file path. This verifies
+WeChat API responses; the asynchronous `/wechat/notify` webhook is not part of
+the current polling flow.
+
 ## License
 
 MIT

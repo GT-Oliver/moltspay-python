@@ -33,11 +33,41 @@ def generate_out_trade_no() -> str:
     return "WX" + secrets.token_hex(15)
 
 
+def verify_wechat_response_signature(
+    timestamp: str,
+    nonce: str,
+    body: str,
+    signature: str,
+    platform_public_key_pem: str,
+) -> bool:
+    """Verify a WeChat Pay v3 API response signature."""
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        key = serialization.load_pem_public_key(platform_public_key_pem.encode())
+        message = f"{timestamp}\n{nonce}\n{body}\n".encode("utf-8")
+        key.verify(
+            base64.b64decode(signature),
+            message,
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+        return True
+    except Exception:
+        return False
+
+
 class WechatFacilitator(BaseFacilitator):
     def __init__(self, config: Dict[str, Any]):
         self.config = dict(config)
         key_path = self.config.get("private_key_path")
         self.private_key_pem = self.config.get("private_key_pem") or (Path(key_path).read_text(encoding="utf-8") if key_path else "")
+        platform_key_path = self.config.get("platform_public_key_path")
+        self.platform_public_key_pem = self.config.get("platform_public_key_pem") or (
+            Path(platform_key_path).read_text(encoding="utf-8")
+            if platform_key_path else ""
+        )
         self.api_base = self.config.get("api_base", "https://api.mch.weixin.qq.com").rstrip("/")
 
     @property
@@ -78,9 +108,21 @@ class WechatFacilitator(BaseFacilitator):
             headers={"Authorization": authorization, "Accept": "application/json", "Content-Type": "application/json", "User-Agent": "moltspay-python"},
             timeout=30.0,
         )
+        raw_response = response.text
+        if self.platform_public_key_pem and raw_response:
+            timestamp = response.headers.get("Wechatpay-Timestamp")
+            nonce = response.headers.get("Wechatpay-Nonce")
+            response_signature = response.headers.get("Wechatpay-Signature")
+            if not timestamp or not nonce or not response_signature:
+                raise RuntimeError("WeChat API response is missing signature headers")
+            if not verify_wechat_response_signature(
+                timestamp, nonce, raw_response, response_signature,
+                self.platform_public_key_pem,
+            ):
+                raise RuntimeError("WeChat API response signature verification failed")
         if not response.is_success:
-            raise RuntimeError(f"WeChat API {response.status_code}: {response.text[:500]}")
-        return response.json()
+            raise RuntimeError(f"WeChat API {response.status_code}: {raw_response[:500]}")
+        return json.loads(raw_response) if raw_response else {}
 
     def create_payment_requirements(
         self, price_cny: str, description: str, out_trade_no: Optional[str] = None,
