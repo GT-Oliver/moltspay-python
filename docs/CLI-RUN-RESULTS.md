@@ -42,7 +42,6 @@
 | 27 | `moltspay init --help` | 0 | 成功，显示链、配置目录和强制覆盖参数 |
 | 28 | `moltspay pay --help` | 0 | 成功，显示支付、通道、充值和超时参数 |
 | 29 | `moltspay-server --help` | 0 | 成功，显示技能目录、端口和主机参数 |
-| 30 | `moltspay-mcp --help` | 0 | 成功，显示 `--dry-run` 和 `--config-dir` 参数 |
 
 ## 关键输出
 

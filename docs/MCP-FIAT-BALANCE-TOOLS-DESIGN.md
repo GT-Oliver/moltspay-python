@@ -1,294 +1,524 @@
-# MCP 微信、支付宝与余额能力扩展设计
+# MCP 工具与支付链路设计
 
-## 1. 目标与约束
+## 1. 定位
 
-当前 MCP 已有 `moltspay_status`、`moltspay_services`、`moltspay_pay` 和
-`moltspay_config`。其中 `moltspay_pay` 可以选择 `balance`、`wechat`、
-`alipay`，但缺少余额查询、充值订单和可恢复的法币支付会话工具。
+MCP 模块是 `MoltsPay` 公共 API 的适配层，不重新实现钱包、账本、支付协议、轮询或二维码编码。
 
-本设计只增加 MCP 适配层，不重复实现 SDK 已有的支付、账本、HTTP、轮询、
-二维码或 CLI 协议。MCP 负责参数校验、确认门禁、结构化序列化和错误映射。
-
-## 2. 目录与模块复用
-
-| 目录/文件 | 已有职责 | MCP 调用方式 | 禁止重复实现 |
-|---|---|---|---|
-| `src/moltspay/mcp/server.py` | MCP tool 注册、适配和序列化 | 增加薄包装函数 | HTTP、记账、支付轮询 |
-| `src/moltspay/client.py` | `MoltsPay` 公共门面、配置、充值会话、微信会话、统一支付 | MCP 只能通过此门面调用 | 不访问私有 client 或 wallet |
-| `src/moltspay/balance.py` | `BalanceClient` 查询、交易、充值确认 | 由 `MoltsPay` 转发 | 不新增 `mcp/balance.py` |
-| `src/moltspay/wechat.py` | `WechatClient` 会话文件、状态、履约、取消 | 由 `MoltsPay` 转发 | 不新增 MCP session 存储 |
-| `src/moltspay/alipay.py` | `AlipayClient`、`alipay-bot` 输出解析 | 由 `MoltsPay.pay(rail="alipay")` 复用 | 不在 MCP 解析 CLI |
-| `src/moltspay/models.py` | `BuyerBalance`、`BalanceTopupSession`、`PaymentResult`、`WechatPaymentSession` | `model_dump()` 后转 camelCase | 不定义平行业务模型 |
-| `src/moltspay/server/` | provider facilitator、余额账本和法币订单 | 只通过已有 HTTP API 访问 | 不复制 provider 逻辑 |
-| `tests/` | SDK、CLI、余额、法币和安全测试 | 增加 MCP adapter/mock 测试 | 不重复业务集成测试 |
-
-若 `MoltsPay` 尚未公开某个底层已有能力，先在 `client.py` 增加最小转发方法，
-再由 MCP 调用；不得直接访问 `_balance_client`、`_wechat_client` 或 `_wallet`。
-
-### 2.1 精确调用映射
-
-| MCP 工具 | `MoltsPay` 入口 | 实际底层实现 |
-|---|---|---|
-| `moltspay_status` | `get_all_balances()`、`get_config()`、`get_buyer_balance()` | 钱包 RPC、`balance.py` |
-| `moltspay_balance_query` | `get_buyer_balance()` | `BalanceClient.get_balance()` |
-| `moltspay_balance_transactions` | `list_balance_transactions()` | `BalanceClient.list_transactions()` |
-| `moltspay_balance_set_buyer` | `update_config(buyer_id=...)` | 本地配置持久化 |
-| `moltspay_balance_topup_order` | `create_balance_topup_order()` | `create_topup_order()` + `BalanceTopupSession` |
-| `moltspay_balance_topup_confirm` | `confirm_balance_topup()` | `confirm_topup()` |
-| `moltspay_balance_topup_status` | `get_balance_topup_session()` | 本地 `balance-topup-sessions` |
-| `moltspay_balance_topup_list` | `list_balance_topup_sessions()` | 本地会话目录 |
-| `moltspay_wechat_start` | `start_wechat_payment()` | `_rail_challenge()` + `WechatClient.start_402()` |
-| `moltspay_wechat_status` | `get_wechat_payment_status()` | `WechatClient.status()` |
-| `moltspay_wechat_fulfill` | `fulfill_wechat_payment()` | `WechatClient.fulfill()` |
-| `moltspay_wechat_cancel` | `cancel_wechat_payment()` | `WechatClient.cancel()` |
-| `moltspay_wechat_list` | `list_wechat_payment_sessions()` | `WechatClient.list_sessions()` |
-| `moltspay_alipay_check_wallet` | `AlipayClient.check_wallet()` 的公开转发 | `alipay.py` + CLI |
-| `moltspay_alipay_pay` | `pay(..., rail="alipay")` | `_pay_alipay()` + `AlipayClient.pay_402()` |
-
-## 3. 通用输入输出
-
-### 3.1 字段规范
-
-- MCP 输入输出使用 camelCase；SDK 调用时映射为 snake_case。
-- 金额使用十进制字符串，例如 `"20.00"`，禁止 MCP 重新计算金额。
-- 时间使用 UTC ISO-8601，例如 `2026-08-06T10:30:00Z`。
-- `serverUrl`、`buyerId`、`service` 等必填字段不得使用空字符串冒充缺省值。
-- `limit` 范围为 1–100，`offset` 不得小于 0。
-
-### 3.2 成功和错误包装
-
-```json
-{"ok": true, "data": {}, "requestId": "mcp-uuid", "retried": 0}
+```text
+MCP tool
+  -> 输入校验、确认门禁、错误映射、序列化
+  -> MoltsPay public method
+  -> x402 / BalanceClient / WechatClient / AlipayClient
+  -> Provider API、区块链或第三方支付平台
 ```
 
-```json
-{
-  "ok": false,
-  "error": {
-    "code": "payment_pending",
-    "message": "payment is waiting for user action",
-    "retryable": true,
-    "retryAfterSeconds": 3,
-    "details": {}
-  },
-  "requestId": "mcp-uuid",
-  "retried": 0
-}
-```
+每个 tool 必须明确：输入 schema、输出 schema、实际调用的 public method，以及最终支付链路。
+MCP 只能通过 `MoltsPay` 公共方法调用业务逻辑，不得直接访问 `_wallet`、`_balance_client`、
+`_wechat_client` 或实现平行的会话存储。
 
-统一错误码：`invalid_input`、`wallet_not_found`、`buyer_id_required`、
-`provider_unavailable`、`rate_limited`、`payment_pending`、`payment_expired`、
-`payment_rejected`、`insufficient_balance`、`duplicate_operation`、
-`dependency_missing`、`confirmation_required`、`wallet_not_ready`。
+## 2. 通用约定
 
-## 4. 工具契约
+- MCP 输入使用 camelCase；SDK 内部使用 snake_case。
+- 成功返回 `{ok, data, requestId, retried}`。
+- 失败返回 `{ok: false, error: {code, message, retryable, details}, requestId, retried}`。
+- 金额使用十进制字符串，避免 MCP 层自行进行金额换算。
+- `--dry-run` 只返回 intent，不创建订单、不签名、不发送支付请求。
+- 设置 `MOLTSPAY_MCP_REQUIRE_CONFIRM=1` 后，所有资金变动 tool 必须显式传入 `confirmed=true`。
+- MCP 不返回私钥、签名、认证凭证或完整敏感支付头。
 
-### 4.1 状态和余额
+## 3. Tool 契约与调用映射
 
-`moltspay_status` 输入：
+| Tool | 输入 | 输出重点 | 实际调用 | 链路 |
+|---|---|---|---|---|
+| `moltspay_status` | `serverUrl?`, `buyerId?` | 钱包地址、链上余额、限额、可选法币余额 | `get_all_balances()`、`get_config()`、`get_buyer_balance()` | 本地钱包/RPC + Provider 余额 |
+| `moltspay_balance_query` | `serverUrl`, `buyerId?` | `BuyerBalance` | `get_buyer_balance()` | Provider 余额 API |
+| `moltspay_balance_transactions` | `serverUrl`, `buyerId?`, `limit`, `offset` | 交易列表及分页 | `list_balance_transactions()` | Provider 账本 API |
+| `moltspay_balance_set_buyer` | `buyerId` | buyer 配置 | `update_config(buyer_id=...)` | 本地配置持久化 |
+| `moltspay_balance_topup_order` | `serverUrl`, `pack?`, `buyerId?`, `confirmed` | `outTradeNo`, `codeUrl`, `pack`, `expiresAt` | `create_balance_topup_order()` | Provider 创建充值订单 |
+| `moltspay_balance_topup_confirm` | `outTradeNo`, `serverUrl?`, `confirmed` | `credited`, `pending`, `balance`, `txId` | `confirm_balance_topup()` | 查询订单，已支付后入账 |
+| `moltspay_balance_topup_status` | `outTradeNo` | 本地充值会话 | `get_balance_topup_session()` | 本地恢复，不创建新订单 |
+| `moltspay_balance_topup_list` | `status?`, `limit` | 本地充值会话列表 | `list_balance_topup_sessions()` | 本地只读 |
+| `moltspay_wechat_start` | `serverUrl`, `service`, `params?`, `confirmed` | `paymentSessionId`, `codeUrl`, `qrCode`, `outTradeNo`, `expiresAt` | `start_wechat_payment()` + QR encoder | Provider 402 → 微信 Native 订单 → 保存会话 → 生成 PNG |
+| `moltspay_wechat_status` | `identifier` | 微信会话状态 | `get_wechat_payment_status()` | 查询会话/支付状态 |
+| `moltspay_wechat_fulfill` | `identifier`, `confirmed` | 完成后的会话和服务结果 | `fulfill_wechat_payment()` | 带支付凭证重试 Provider `/execute` |
+| `moltspay_wechat_cancel` | `identifier` | cancelled 会话 | `cancel_wechat_payment()` | 本地取消 |
+| `moltspay_wechat_list` | `status?`, `limit`, `includeExpired` | 微信会话列表 | `list_wechat_payment_sessions()` | 本地只读 |
+| `moltspay_alipay_check_wallet` | `executable?` | `ready`, `walletStatus` | `check_alipay_wallet()` | 检查 `alipay-bot` |
+| `moltspay_alipay_pay` | 服务地址、服务 ID、参数、超时、确认 | `PaymentResult` 及交易号/支付 URL | `pay(..., rail="alipay")` | 402 → alipay-bot → 轮询 → 重试服务 |
+| `moltspay_pay` | `url`, `service`, `params`, `chain?`, `token`, `rail?`, `confirmed` | `PaymentResult` | `client.pay()` | 按 rail 路由到链上、余额、微信或支付宝 |
+| `moltspay_config` | `maxPerTx?`, `maxPerDay?` | 当前配置 | `get_config()` / `update_config()` | 本地配置及消费限额 |
 
-```json
-{"serverUrl": "https://provider.example", "buyerId": "buyer-001"}
-```
+## 4. MCP registration contract
 
-两者可选；无 `serverUrl` 时跳过 CNY 查询。输出：
+The following definitions are the normative contract for `FastMCP` tool
+registration. The `description` values are intentionally written in English:
+they are exposed to the model by MCP and must explain both the action and its
+side effects.
+
+`moltspay_wechat_start` is deliberately a complete presentation boundary: the
+tool creates the payment session, generates a QR image from the returned
+WeChat `codeUrl`, and returns both values in the same response. A second
+model-visible QR tool is not required for WeChat payment.
+
+### 4.1 Shared schemas
 
 ```json
 {
-  "address": "0x...",
-  "defaultChain": "base",
-  "balances": {"base": {"usdc": 10.0}},
-  "limits": {"maxPerTx": 10.0, "maxPerDay": 100.0},
-  "buyerId": "buyer-001",
-  "fiatBalance": {
-    "buyerId": "buyer-001", "currency": "CNY", "balance": "84.00",
-    "spentToday": "0.01", "singleLimit": "20.00", "dailyLimit": "100.00",
-    "status": "active"
-  },
-  "warnings": []
+  "$defs": {
+    "ToolRequestId": {"type": "string", "description": "Unique request identifier. Generated by the server when omitted."},
+    "Error": {
+      "type": "object",
+      "required": ["code", "message", "retryable", "details"],
+      "properties": {
+        "code": {"type": "string"},
+        "message": {"type": "string"},
+        "retryable": {"type": "boolean"},
+        "retryAfterSeconds": {"type": "number", "minimum": 0},
+        "details": {"type": "object"}
+      }
+    },
+    "SuccessEnvelope": {
+      "type": "object",
+      "required": ["ok", "data", "requestId", "retried"],
+      "properties": {
+        "ok": {"const": true},
+        "data": {},
+        "requestId": {"$ref": "#/$defs/ToolRequestId"},
+        "retried": {"type": "integer", "minimum": 0}
+      }
+    },
+    "ErrorEnvelope": {
+      "type": "object",
+      "required": ["ok", "error", "requestId", "retried"],
+      "properties": {
+        "ok": {"const": false},
+        "error": {"$ref": "#/$defs/Error"},
+        "requestId": {"$ref": "#/$defs/ToolRequestId"},
+        "retried": {"type": "integer", "minimum": 0}
+      }
+    },
+    "Confirmed": {"type": "boolean", "default": false, "description": "Must be true when confirmation is enabled for a money-moving operation."},
+    "Params": {"type": "object", "additionalProperties": true}
+  }
 }
 ```
 
-链上状态成功但 CNY 查询失败时，保留链上数据，`fiatBalance=null`，追加
-warning，不把可选余额依赖故障误报成钱包故障。
+Unless a tool says otherwise, every invocation returns either
+`SuccessEnvelope` or `ErrorEnvelope`. The `data` property is the tool-specific
+success payload below.
 
-`moltspay_balance_query` 输入为 `serverUrl` 和可选 `buyerId`；输出直接复用
-`BuyerBalance`：`buyerId`、`currency`、`balance`、`spentToday`、
-`singleLimit`、`dailyLimit`、`status`。没有买方 ID 返回 `buyer_id_required`。
+### 4.2 Wallet and balance tools
 
-`moltspay_balance_transactions` 输入：
+#### `moltspay_status`
 
-```json
-{"serverUrl":"https://provider.example","buyerId":"buyer-001","limit":20,"offset":0}
-```
+Description:
 
-输出为 `{ "transactions": [...], "limit": 20, "offset": 0 }`。交易对象
-由服务端原样保留，MCP 不自行推导余额。
+> Return the local wallet address, configured chain, on-chain balances, spending limits, and optionally the buyer's provider fiat balance. This tool is read-only.
 
-`moltspay_balance_set_buyer` 输入 `{"buyerId":"buyer-001"}`，调用
-`update_config(buyer_id=...)`，输出 `{ "buyerId":"buyer-001", "config":{} }`。
-这是本地配置变更，不产生支付。
-
-### 4.2 余额充值
-
-`moltspay_balance_topup_order` 输入：
+Input:
 
 ```json
-{"serverUrl":"https://provider.example","pack":"20.00","buyerId":"buyer-001","confirmed":true}
+{
+  "type": "object",
+  "properties": {
+    "serverUrl": {"type": "string", "format": "uri", "description": "Optional provider URL used to query the fiat balance."},
+    "buyerId": {"type": "string", "description": "Optional provider buyer identifier."}
+  },
+  "additionalProperties": false
+}
 ```
 
-调用 `create_balance_topup_order()`，输出 `outTradeNo`、`codeUrl`、`pack`、
-`maxTimeoutSeconds`、`status="pending"`、`expiresAt`。此操作只创建订单，
-不得声称已经入账。
-
-`moltspay_balance_topup_confirm` 输入 `outTradeNo` 和可选 `serverUrl`，调用
-`confirm_balance_topup()`，输出：
+`data`:
 
 ```json
-{"credited":false,"pending":true,"balance":"64.00","txId":null,"reason":"not paid"}
+{
+  "type": "object",
+  "required": ["address", "defaultChain", "balances", "limits", "fiatBalance", "warnings"],
+  "properties": {
+    "address": {"type": "string"},
+    "defaultChain": {"type": "string"},
+    "balances": {"type": "object", "additionalProperties": true},
+    "limits": {"type": "object", "additionalProperties": true},
+    "buyerId": {"type": ["string", "null"]},
+    "fiatBalance": {"type": ["object", "null"], "additionalProperties": true},
+    "warnings": {"type": "array", "items": {"type": "object"}}
+  }
+}
 ```
 
-重复确认必须复用服务端幂等结果，不得重复加余额。
+Calls `get_config()`, `get_all_balances()`, and, when `serverUrl` is present,
+`get_buyer_balance()`.
 
-`moltspay_balance_topup_status` 输入 `outTradeNo`，调用
-`get_balance_topup_session()`；不存在返回 `invalid_input`/`not_found`，不能创建
-新订单。输出复用 `BalanceTopupSession`：`outTradeNo`、`buyerId`、`pack`、
-`serverUrl`、`codeUrl`、`status`（`pending|credited|expired`）、时间、`txId`、
-`balance` 和 `context`。
+#### `moltspay_balance_query`
 
-`moltspay_balance_topup_list` 只读本地会话目录，支持可选 `status` 和 `limit`，
-不调用服务端；损坏的单个会话跳过并放入 warnings，不影响其它会话。
+Description:
 
-### 4.3 微信
+> Query the provider-side fiat balance for a buyer. This tool is read-only and does not create or modify a payment.
 
-`moltspay_wechat_start` 输入：
+Input:
 
 ```json
-{"serverUrl":"https://provider.example","service":"service-uuid","params":{"prompt":"a cat"},"confirmed":true}
+{
+  "type": "object",
+  "required": ["serverUrl"],
+  "properties": {
+    "serverUrl": {"type": "string", "format": "uri"},
+    "buyerId": {"type": "string"}
+  },
+  "additionalProperties": false
+}
 ```
 
-调用 `start_wechat_payment()`，输出直接映射 `WechatPaymentSession`：
-`paymentSessionId`、`status`、`resourceUrl`、`method`、`data`、`requirement`、
-`codeUrl`、`outTradeNo`、`createdAt`、`updatedAt`、`expiresAt`、`context`、
-`lastHttpStatus`、`lastError`、`resultBody`。
+`data` is `BuyerBalance` serialized in camelCase: `buyerId`, `currency`,
+`balance`, `spentToday`, and provider-defined limit fields. Calls
+`get_buyer_balance()`.
 
-`moltspay_wechat_status`、`moltspay_wechat_fulfill`、
-`moltspay_wechat_cancel` 都只接受 `{"identifier":"mpay_..."}`，分别转发
-到对应 `MoltsPay` 方法。`moltspay_wechat_list` 支持 `status`、`limit`、
-`includeExpired`，调用 `list_wechat_payment_sessions()` 后在适配层过滤，
-不新增存储查询器。状态为 `pending|paid|completed|expired|cancelled|failed`。
+#### `moltspay_balance_transactions`
 
-边界：缺少 `codeUrl`/`outTradeNo`、过期会话、非 402/200 响应、未知会话、
-重复 fulfill 必须返回明确状态；不能回退到链上支付。
+Description:
 
-### 4.4 支付宝
+> List provider-side balance transactions for a buyer. This tool is read-only; use it to audit credits, debits, and refunds.
 
-`moltspay_alipay_check_wallet` 输入可选 `executable`，默认 `alipay-bot`；
-只调用 `AlipayClient.check_wallet()`。成功输出
-`{ "ready":true, "executable":"alipay-bot", "walletStatus":"opened_bound" }`。
-CLI 缺失返回 `dependency_missing`，钱包未打开返回 `wallet_not_ready`。
-
-`moltspay_alipay_pay` 输入：
+Input:
 
 ```json
-{"serverUrl":"https://provider.example","service":"service-uuid","params":{"prompt":"a cat"},"framework":"openclaw","timeoutSeconds":1800,"pollIntervalSeconds":3,"confirmed":true}
+{
+  "type": "object",
+  "required": ["serverUrl"],
+  "properties": {
+    "serverUrl": {"type": "string", "format": "uri"},
+    "buyerId": {"type": "string"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+    "offset": {"type": "integer", "minimum": 0, "default": 0}
+  },
+  "additionalProperties": false
+}
 ```
 
-调用 `MoltsPay.pay(..., rail="alipay")`，输出统一 `PaymentResult` 映射并补充
-`tradeNo`、`outTradeNo`、`paymentUrl`（若 CLI 提供）。MCP 不解析 CLI 文本；
-`AlipayClient` 负责 trade number、URL 和状态解析。
+`data` is `{ "transactions": [], "limit": 20, "offset": 0 }`. Calls
+`list_balance_transactions()`.
 
-## 5. 流程图
+#### `moltspay_balance_set_buyer`
 
-```mermaid
-flowchart TD
-    A[余额充值 order] --> B[MoltsPay.create_balance_topup_order]
-    B --> C[BalanceClient.create_topup_order]
-    C --> D[保存 BalanceTopupSession]
-    D --> E[返回 codeUrl]
-    E --> F[用户支付]
-    F --> G[MoltsPay.confirm_balance_topup]
-    G -->|pending| F
-    G -->|credited| H[返回 txId 和余额]
-    G -->|expired| I[结束，重新创建订单]
+Description:
+
+> Set the local default buyer identifier used by provider balance and top-up operations. This changes local configuration only.
+
+Input:
+
+```json
+{
+  "type": "object",
+  "required": ["buyerId"],
+  "properties": {"buyerId": {"type": "string", "minLength": 1}},
+  "additionalProperties": false
+}
 ```
 
-```mermaid
-flowchart TD
-    A[wechat_start] --> B[MoltsPay.start_wechat_payment]
-    B --> C[WechatClient.start_402]
-    C --> D[持久化 SDK 会话并返回二维码]
-    D --> E[wechat_status]
-    E -->|pending| E
-    E -->|completed| F[wechat_fulfill]
-    E -->|expired/failed| G[结束，不重复创建]
-    H[alipay_pay] --> I[MoltsPay.pay rail=alipay]
-    I --> J[AlipayClient.pay_402]
-    J --> K[CLI 轮询并确认履约]
-    K --> L[PaymentResult]
+`data` is `{ "buyerId": "...", "config": {} }`. Calls
+`update_config(buyer_id=...)`.
+
+#### `moltspay_balance_topup_order`
+
+Description:
+
+> Create and persist a recoverable provider balance top-up order. This creates a payment order and returns a code URL; it does not claim that the order has been paid.
+
+Input:
+
+```json
+{
+  "type": "object",
+  "required": ["serverUrl"],
+  "properties": {
+    "serverUrl": {"type": "string", "format": "uri"},
+    "pack": {"type": "string", "pattern": "^(?:0|[1-9]\\d*)(?:\\.\\d{1,2})?$", "description": "Positive decimal top-up amount or provider pack identifier."},
+    "buyerId": {"type": "string"},
+    "confirmed": {"$ref": "#/$defs/Confirmed"}
+  },
+  "additionalProperties": false
+}
 ```
 
-## 6. 重试、轮询和幂等
+`data` requires `outTradeNo`, `codeUrl`, `pack`, `maxTimeoutSeconds`, `status`
+(`pending`), and `expiresAt`. Calls `create_balance_topup_order()` and
+`get_balance_topup_session()`.
 
-### 6.1 重试归属
+#### `moltspay_balance_topup_confirm`
 
-优先复用 SDK 当前 timeout、`WechatClient.poll_session()`、
-`AlipayClient.pay_402()` 和 `topup_balance_pack()` 的行为。若需要统一重试，
-应在 `mcp/server.py` 增加一个通用的、仅包裹“只读查询”的 helper，不在每个
-工具中复制 retry loop。
+Description:
 
-只对连接错误、读取超时、408、429、500、502、503、504 重试，最多 3 次；
-退避为 `min(30, 2^attempt) + random(0, .25)`，优先使用 `Retry-After`。
+> Confirm an existing balance top-up order by querying its payment status. This operation is idempotent; do not create a new order when the result is pending or unknown.
 
-### 6.2 不可盲目重试
+Input:
 
-- 充值订单创建：超时后先查本地/服务端订单，不重复 POST；
-- 支付宝 `402-buyer-pay`：不得再次执行支付命令；
-- 微信 start：不得在未知结果时重新创建订单；
-- 确认充值和 fulfill 可以重试，因为已有 `outTradeNo` 或会话 ID 幂等键。
+```json
+{
+  "type": "object",
+  "required": ["outTradeNo"],
+  "properties": {
+    "outTradeNo": {"type": "string", "minLength": 1},
+    "serverUrl": {"type": "string", "format": "uri"},
+    "confirmed": {"$ref": "#/$defs/Confirmed"}
+  },
+  "additionalProperties": false
+}
+```
 
-### 6.3 轮询边界
+`data` is `{ "credited": true, "pending": false, "balance": "...", "txId": "...", "reason": null }`.
+Calls `confirm_balance_topup()`.
 
-| 场景 | SDK 已有入口 | 默认间隔 | 截止时间 |
-|---|---|---:|---:|
-| 微信状态 | `WechatClient.poll_session()` | 3 秒 | `expiresAt` 或 300 秒 |
-| 余额确认 | `confirm_balance_topup()` | 2 秒 | `maxTimeoutSeconds` 或 300 秒 |
-| 支付宝状态 | `AlipayClient.pay_402()` | 3 秒 | `timeoutSeconds`，默认 1800 秒 |
+#### `moltspay_balance_topup_status`
 
-轮询不得超过原始业务截止时间。未知网络结果返回 `status="unknown"` 和
-`retryable=true`，指导调用方查询状态而不是重新发起资金操作。
+Description:
 
-## 7. 确认、安全和 dry-run
+> Read a locally persisted balance top-up session without contacting the provider or creating a new order.
 
-`MOLTSPAY_MCP_REQUIRE_CONFIRM=1` 时，充值订单、微信 start/fulfill、支付宝
-支付以及 `moltspay_pay` 的法币/余额 rail 必须 `confirmed=true`。查询、列表、
-status 和配置读取无需确认。
+Input: `{ "type": "object", "required": ["outTradeNo"], "properties": { "outTradeNo": {"type": "string", "minLength": 1} }, "additionalProperties": false }`
 
-`--dry-run` 只能生成 intent，不创建充值订单、不调用 `start_402`、不调用
-`alipay-bot`、不写支付会话。MCP 不返回私钥、认证头、商户私钥或支付宝凭证。
+`data` is the serialized `BalanceTopupSession`, including `outTradeNo`,
+`buyerId`, `pack`, `codeUrl`, `status`, `expiresAt`, and optional credit fields.
+Calls `get_balance_topup_session()`.
 
-## 8. 边界情况矩阵
+#### `moltspay_balance_topup_list`
 
-| 情况 | 处理 |
-|---|---|
-| 钱包不存在 | 启动时沿用现有错误 `wallet_not_found` |
-| buyer ID 缺失 | 查询/充值前返回 `buyer_id_required` |
-| server URL 缺失 | 本地会话查询可用；远程查询返回 `invalid_input` |
-| 金额负数、超过两位小数或为零 | 不调用 SDK，返回 `invalid_input` |
-| 远程 404 | 保留 SDK 原错误；查询类返回 not found，支付类不得 fallback |
-| 429/5xx | 只按统一策略重试，可恢复时返回 `retryable=true` |
-| 会话文件损坏 | 单条跳过并 warning；指定 ID 查询返回 not found |
-| 订单已入账 | 返回原 `txId` 和余额，不能重复 credit |
-| 支付已过期 | 返回 `payment_expired`，要求新建订单 |
-| 支付已拒绝 | 返回 `payment_rejected`，不自动重试付款 |
-| `alipay-bot` 缺失 | `dependency_missing`，不调用 provider |
+Description:
 
-## 9. 实施和验收
+> List locally persisted balance top-up sessions. This tool is read-only and does not query or mutate provider payment state.
 
-1. 先在 `client.py` 补齐缺失的最小公开转发方法；
-2. 只在 `mcp/server.py` 增加薄工具和共用序列化/错误 helper；
-3. 使用已有模型字段，新增字段仅用于 MCP camelCase 映射；
-4. 在 `tests/` 增加 MCP 注册、参数、mock 门面和边界测试；
-5. 验收工具可通过 `tools/list` 发现，dry-run 无副作用，重复确认幂等，
-   重启后会话可恢复，并运行完整 Python 测试套件。
+Input: `{ "type": "object", "properties": { "status": {"type": "string", "enum": ["pending", "credited", "expired"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100} }, "additionalProperties": false }`
 
+`data` is `{ "sessions": [], "limit": 100, "warnings": [] }`. Calls
+`list_balance_topup_sessions()`.
+
+### 4.3 WeChat tools
+
+#### `moltspay_wechat_start`
+
+Description:
+
+> Start a WeChat Native payment session for a provider service. This creates a payment challenge, generates a QR image from the WeChat code URL, and returns both the URL and image for the user to scan; it does not complete the service request.
+
+Input:
+
+```json
+{
+  "type": "object",
+  "required": ["serverUrl", "service"],
+  "properties": {
+    "serverUrl": {"type": "string", "format": "uri"},
+    "service": {"type": "string", "minLength": 1},
+    "params": {"$ref": "#/$defs/Params"},
+    "confirmed": {"$ref": "#/$defs/Confirmed"}
+  },
+  "additionalProperties": false
+}
+```
+
+`data` requires `paymentSessionId`, `status` (`pending`), `codeUrl`, `qrCode`,
+`outTradeNo`, `createdAt`, `updatedAt`, and `expiresAt`. `qrCode` is:
+
+```json
+{
+  "type": "object",
+  "required": ["mimeType", "data", "alt"],
+  "properties": {
+    "mimeType": {"const": "image/png"},
+    "data": {"type": "string", "description": "Base64-encoded PNG image data."},
+    "alt": {"type": "string", "description": "Human-readable instruction for the user."}
+  }
+}
+```
+
+The MCP server generates `qrCode.data` from `codeUrl` using the bundled
+`qrcode` dependency. MCP hosts that support image content should display the
+PNG; hosts that do not support image content can display `codeUrl` as a
+fallback. Calls
+`start_wechat_payment()` → `_rail_challenge()` → `WechatClient.start_402()`.
+
+#### `moltspay_wechat_status`
+
+Description:
+
+> Query a persisted WeChat payment session and its current payment status. This tool is read-only and safe to retry.
+
+Input: `{ "type": "object", "required": ["identifier"], "properties": { "identifier": {"type": "string", "minLength": 1} }, "additionalProperties": false }`
+
+`data` is the serialized `WechatPaymentSession`, including `status`,
+`codeUrl`, `outTradeNo`, `expiresAt`, and error fields. Calls
+`get_wechat_payment_status()` → `WechatClient.status()`.
+
+#### `moltspay_wechat_fulfill`
+
+Description:
+
+> Fulfill a WeChat payment session after the user has paid. This sends the stored payment credential to the provider and may execute the paid service; explicit confirmation is required when enabled.
+
+Input: `{ "type": "object", "required": ["identifier"], "properties": { "identifier": {"type": "string", "minLength": 1}, "confirmed": {"$ref": "#/$defs/Confirmed"} }, "additionalProperties": false }`
+
+`data` is the updated `WechatPaymentSession` and provider result fields. Calls
+`fulfill_wechat_payment()` → `WechatClient.fulfill()`.
+
+#### `moltspay_wechat_cancel`
+
+Description:
+
+> Cancel a locally persisted pending WeChat payment session. This does not refund an already completed WeChat order.
+
+Input: same identifier schema as `moltspay_wechat_status`, with optional
+`confirmed` accepted for forward compatibility.
+
+`data` is the updated session with `status="cancelled"`. Calls
+`cancel_wechat_payment()`.
+
+#### `moltspay_wechat_list`
+
+Description:
+
+> List persisted WeChat payment sessions, optionally filtered by status and expiry. This tool is read-only.
+
+Input: `{ "type": "object", "properties": { "status": {"type": "string", "enum": ["pending", "paid", "completed", "expired", "cancelled", "failed"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}, "includeExpired": {"type": "boolean", "default": true} }, "additionalProperties": false }`
+
+`data` is `{ "sessions": [], "limit": 100 }`. Calls
+`list_wechat_payment_sessions()`.
+
+### 4.4 Alipay tools
+
+#### `moltspay_alipay_check_wallet`
+
+Description:
+
+> Check whether the local Alipay wallet dependency is installed, opened, and bound. This tool is read-only and never initiates a payment.
+
+Input: `{ "type": "object", "properties": { "executable": {"type": "string", "default": "alipay-bot"} }, "additionalProperties": false }`
+
+`data` is `{ "ready": true, "executable": "alipay-bot", "walletStatus": "opened_bound" }`.
+Calls `check_alipay_wallet()`.
+
+#### `moltspay_alipay_pay`
+
+Description:
+
+> Pay for and execute a provider service through the local Alipay AI Pay wallet. This may open the wallet, spend fiat funds, poll for confirmation, and retry the provider request.
+
+Input:
+
+```json
+{
+  "type": "object",
+  "required": ["serverUrl", "service"],
+  "properties": {
+    "serverUrl": {"type": "string", "format": "uri"},
+    "service": {"type": "string", "minLength": 1},
+    "params": {"$ref": "#/$defs/Params"},
+    "framework": {"type": "string", "default": "openclaw"},
+    "timeoutSeconds": {"type": "number", "exclusiveMinimum": 0, "default": 1800},
+    "pollIntervalSeconds": {"type": "number", "exclusiveMinimum": 0, "default": 3},
+    "confirmed": {"$ref": "#/$defs/Confirmed"}
+  },
+  "additionalProperties": false
+}
+```
+
+`data` is `PaymentResult` plus optional `tradeNo`, `outTradeNo`, and
+`paymentUrl`. Calls `client.pay(..., rail="alipay", rail_options=...)`.
+
+### 4.5 Unified payment and configuration
+
+#### `moltspay_pay`
+
+Description:
+
+> Pay for and execute a provider service using the selected payment rail. Omit rail for x402 crypto payment; use balance, wechat, or alipay for the corresponding fiat or provider rail. This operation may spend funds.
+
+Input:
+
+```json
+{
+  "type": "object",
+  "required": ["url", "service", "params"],
+  "properties": {
+    "url": {"type": "string", "format": "uri"},
+    "service": {"type": "string", "minLength": 1},
+    "params": {"$ref": "#/$defs/Params"},
+    "chain": {"type": "string"},
+    "token": {"type": "string", "default": "USDC"},
+    "rail": {"type": ["string", "null"], "enum": ["balance", "wechat", "alipay", null]},
+    "confirmed": {"$ref": "#/$defs/Confirmed"}
+  },
+  "additionalProperties": false
+}
+```
+
+`data` is `PaymentResult`: at minimum `success`, `amount`, `token`,
+`serviceId`, and either `result`/`txHash` on success or `error` on failure.
+Calls `client.pay()`.
+
+#### `moltspay_config`
+
+Description:
+
+> Read the local MoltsPay configuration, or update the maximum amount per transaction and per day. Updating limits changes local spending policy and does not make a payment.
+
+Input: `{ "type": "object", "properties": { "maxPerTx": {"type": ["number", "null"], "minimum": 0}, "maxPerDay": {"type": ["number", "null"], "minimum": 0} }, "additionalProperties": false }`
+
+If either limit is supplied, calls `update_config()`; otherwise calls
+`get_config()`. `data` is the complete normalized local configuration.
+
+## 5. `moltspay_pay` 的 rail 路由
+
+```text
+rail 未指定
+  -> x402 402 challenge
+  -> 构造并签名 payment payload
+  -> X-PAYMENT 重试服务
+
+rail=balance
+  -> Provider 余额扣款
+  -> 余额不足时按调用方策略返回充值所需信息
+
+rail=wechat
+  -> 请求 Provider 微信 402
+  -> 生成 QR PNG 并返回 codeUrl + qrCode
+  -> 用户扫码
+  -> 查询并 fulfill 会话
+
+rail=alipay
+  -> 调用 alipay-bot
+  -> 轮询支付结果
+  -> 带支付结果重试 Provider
+```
+
+`moltspay_pay` 的返回结构必须保留统一的 `PaymentResult` 字段，并在不同 rail 下通过
+`result` 或 `payment` 携带对应的 `codeUrl`、`outTradeNo`、`tradeNo` 和状态信息。
+
+## 6. 二维码边界
+
+微信支付 tool 同时返回二维码原始 URL 和二维码图片：
+
+- 微信支付返回 `data.codeUrl`，用于调试、兼容和必要时的文本 fallback。
+- 微信支付返回 `data.qrCode`，其中 `data` 是 Base64 编码的 PNG 图片。
+- 二维码生成属于 `moltspay_wechat_start` 的内部步骤，不单独暴露为第二个
+  model-visible tool。
+- 余额充值返回 Provider 的 `data.codeUrl`，同样由 Host/UI 渲染。
+- CLI 的 `moltspay wechat start` 可以直接把微信 URL 打印为终端 ASCII 二维码。
+- `fund_qr()` 是 Coinbase Onramp 的银行卡/Apple Pay 充值二维码，不属于微信支付链路。
+
+```text
+moltspay_wechat_start
+  -> Provider 402
+  -> WeChat Native codeUrl
+  -> persist payment session
+  -> generate PNG QR from codeUrl
+  -> return codeUrl + qrCode image
+```
+
+## 7. 生产验证与待补齐项
+
+- 增加 MCP tool 注册、输入校验、输出 envelope、确认门禁和 dry-run 测试。
+- 增加微信 `qrCode` 生成测试，验证 PNG MIME type、Base64 数据和二维码内容
+  与 `codeUrl` 一致。
+- 增加每个 tool 到 `MoltsPay` public method 的 mock 映射测试。
+- 对微信商户证书、平台公钥、Native 扫码、支付确认和 Provider `/execute` 做真实环境测试。
+- 明确未知网络结果必须返回 `retryable=true` 或 `status="unknown"`，调用方应查询状态，不能盲目重复扣款。
+- 当前代码若未注册 `moltspay_services`，文档不得将其描述为已实现；服务发现应新增独立 tool 后再纳入契约。

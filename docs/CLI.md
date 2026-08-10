@@ -93,4 +93,3 @@ moltspay pay --help
 | 命令 | 用途 |
 |---|---|
 | `moltspay-server` | 启动 MoltsPay 服务端 CLI；使用 `moltspay-server --help` 查看参数 |
-| `moltspay-mcp` | 启动 MoltsPay MCP 服务；使用 `moltspay-mcp --help` 查看参数 |

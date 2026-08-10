@@ -56,7 +56,6 @@ The `all` extra also includes the server dependencies. The optional groups are:
 | `solana` | `solders`, `solana` | Solana wallet and payments |
 | `langchain` | `langchain-core` | LangChain integration |
 | `server` | `cdp-sdk` | Coinbase CDP server settlement |
-| `mcp` | `mcp` | MCP server |
 
 ## Quick Start
 
@@ -598,7 +597,7 @@ python -c "from moltspay import MoltsPay; print(MoltsPay().address)"
 
 ## Node.js 2.4 compatibility
 
-The Python SDK includes Balance, WeChat Native, Alipay AI Pay, MCP, payment
+The Python SDK includes Balance, WeChat Native, Alipay AI Pay, payment
 verification, transfers, secure/permit wallets, invoices, audit logs, and
 Node-compatible encrypted wallets. See [docs/NODE-PARITY.md](docs/NODE-PARITY.md)
 for APIs, input/output contracts, configuration, and the browser-only exclusions.

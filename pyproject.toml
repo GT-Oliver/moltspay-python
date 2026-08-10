@@ -49,22 +49,18 @@ solana = [
     "solana>=0.30.0",
 ]
 fiat = []
-mcp = [
-    "mcp>=1.0",
-]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
 ]
 all = [
-    "moltspay[langchain,server,solana,fiat,mcp,dev]",
+    "moltspay[langchain,server,solana,fiat,dev]",
 ]
 
 [project.scripts]
 moltspay = "moltspay.cli:main"
 moltspay-server = "moltspay.server.__main__:main"
-moltspay-mcp = "moltspay.mcp.__main__:main"
 
 [project.urls]
 Homepage = "https://moltspay.com"

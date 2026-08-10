@@ -11,7 +11,7 @@
 This is the single consolidated design document for the Python SDK. Node.js
 remains the protocol reference where wire compatibility is required; this
 document describes the Python entry points, persistence, optional-dependency
-boundaries, payment rails, and MCP adapter.
+boundaries and payment rails.
 
 ## 1. Scope and design goals
 
@@ -45,13 +45,12 @@ MoltsPay / AsyncMoltsPay
         +-- wechat.py / alipay.py ---------- fiat rail clients
         |
         +-- cli.py ------------------------- command-line adapter
-        +-- mcp/server.py ------------------ MCP adapter
         +-- server/ ------------------------ provider runtime and facilitators
 ```
 
 `models.py` contains the public normalized data models. `exceptions.py` is the
-public error vocabulary. Integrations such as LangChain, CLI, and MCP call the
-same client APIs rather than implementing payment protocols themselves.
+public error vocabulary. Integrations such as LangChain and CLI call the same
+client APIs rather than implementing payment protocols themselves.
 
 ## 3. Network and protocol model
 
@@ -134,9 +133,9 @@ Security-related components are deliberately separate:
 
 The base installation supports EVM functionality. Solana modules are imported
 lazily and produce an actionable installation error when `moltspay[solana]` is
-not installed. LangChain and MCP integrations are similarly optional. A
-missing optional dependency must not prevent importing `moltspay` for users who
-only need EVM or non-MCP functionality.
+not installed. LangChain integration is similarly optional. A missing optional
+dependency must not prevent importing `moltspay` for users who only need EVM
+functionality.
 
 Network errors, malformed 402 responses, unsupported chains, insufficient
 balance, missing BNB allowance/gas, and exceeded limits are surfaced as
@@ -185,8 +184,8 @@ own wallet persistence or provider business logic.
 `chains.py` is the registry for chain IDs, RPCs, explorers, tokens, protocol
 families, and testnet flags. `facilitators/` contains protocol-specific
 signing and settlement behavior. `server/` maps network identifiers to
-facilitators and loads provider skill manifests. `cli.py` and `mcp/` are
-adapters over public client APIs and must not duplicate payment logic.
+facilitators and loads provider skill manifests. `cli.py` is an adapter over
+public client APIs and must not duplicate payment logic.
 
 For a new module, define public models and errors first, keep network I/O
 behind the client/facilitator boundary, add focused success and failure tests,
@@ -264,44 +263,37 @@ recorded only after a successful result.
 
 Security controls include matching chain/token requirements against the
 registry, nonces and request IDs for replay protection, explicit BNB spender
-and allowance checks, a separate Solana wallet file, MCP confirmation gates,
-and environment/config separation for credentials. Every new rail must
+and allowance checks, and environment/config separation for credentials. Every
+new rail must
 document authentication, replay protection, amount precision, persistence,
 and failure recovery before `pay()` exposes it.
 
-## 13. MCP adapter and expanded fiat tools
+## 13. MCP adapter and tool contracts
 
-The MCP integration is a local stdio adapter around `MoltsPay`, installed via
-`moltspay[mcp]`. It never returns private keys or implements payment protocols
-itself. Existing tools are `moltspay_status`, `moltspay_services`,
-`moltspay_pay`, and `moltspay_config`; `--dry-run` never signs or sends a
-payment.
+The MCP module is a thin stdio adapter over `MoltsPay` public methods. It owns
+tool schemas, input validation, confirmation gates, error envelopes, and
+serialization; it does not implement x402, ledger, WeChat, Alipay, polling, or
+QR encoding. The source of truth for the detailed mapping is
+[`MCP-FIAT-BALANCE-TOOLS-DESIGN.md`](MCP-FIAT-BALANCE-TOOLS-DESIGN.md).
 
-The expanded design adds:
+Every tool specification must document its inputs, outputs, delegated client
+method, and payment rail. `moltspay_wechat_start` returns both the WeChat
+`codeUrl` and a Base64-encoded PNG QR image generated inside the tool; a second
+QR tool is not required for WeChat payment. Balance top-up still returns its
+`codeUrl` for the host/UI to render. The CLI may render a terminal QR code. The
+MCP adapter does not return private keys, signatures, or payment credentials.
 
-| Tool group | Operations |
-|---|---|
-| Balance | query, transactions, set buyer, top-up order/confirm/status/list |
-| WeChat | start, status, fulfill, cancel, list |
-| Alipay | check wallet, pay |
-
-MCP inputs use camelCase and map to Python snake_case. Amounts are decimal
-strings, times are UTC ISO-8601, and responses are JSON-serializable. New
-operations should use the envelope `{ok, data, requestId, retried}` on success
-and `{ok: false, error: {code, message, retryable, retryAfterSeconds}}` on
-failure. Unknown network outcomes must return `status="unknown"` or
-`retryable=true` so callers query state instead of repeating a money movement.
-
-When `MOLTSPAY_MCP_REQUIRE_CONFIRM=1`, confirmation is required for payment,
-balance top-up, WeChat start/fulfill, and Alipay pay. Queries, lists, status,
-and reads do not require confirmation. Logs must redact code URLs, payment
-links, transaction identifiers, and all signature or credential material.
+The implemented tool groups are wallet/status, balance, WeChat Native,
+Alipay, unified payment, and configuration. A tool must not be documented as
+implemented unless it is registered by `mcp/server.py`; in particular,
+`moltspay_services` requires an explicit implementation before it can be part
+of the supported MCP contract.
 
 ## 14. Reliability and verification
 
 Pure parsing, signing payload construction, limits, wallet behavior, CLI
-behavior, balance idempotency, fiat session transitions, and MCP tool
-contracts belong in the test suite. On-chain, provider, and credential-backed
+behavior, balance idempotency, and fiat session transitions belong in the test
+suite. On-chain, provider, and credential-backed
 tests remain opt-in. Network retries use bounded exponential backoff, respect
 `Retry-After`, never automatically retry non-idempotent POSTs, and never
 extend the original business deadline. Payment creation and fulfillment must
@@ -310,5 +302,4 @@ server `externalRef`).
 
 Acceptance coverage must include missing optional dependencies, malformed 402
 responses, unsupported chains, insufficient funds, limits, duplicate
-mutations, 429/5xx polling, timeout recovery, dry-run behavior, and backward
-compatibility of the original four MCP tools.
+mutations, 429/5xx polling, and timeout recovery.

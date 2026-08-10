@@ -34,7 +34,7 @@ CLI 实际运行测试覆盖：
 - 消费限额配置与查询
 - 本地余额查询、交易记录和充值订单
 - 微信支付会话创建、查询、完成、取消和列表
-- `moltspay-server`、`moltspay-mcp` 及主要帮助命令
+- `moltspay-server` 及主要帮助命令
 
 ## 3. 自动化测试结果
 
@@ -98,7 +98,7 @@ CLI 结果复用 [CLI-RUN-RESULTS.md](CLI-RUN-RESULTS.md) 的 2026-08-05 实际�
 - `config` 和 `limits` 成功设置并读取每笔 `10`、每日 `100` 的限额。
 - 本地余额查询、交易记录、充值订单创建和充值状态查询成功。
 - 微信会话的创建、状态查询、完成、取消和列表操作成功。
-- `moltspay-server --help` 和 `moltspay-mcp --help` 正常运行。
+- `moltspay-server --help` 正常运行。
 
 ### 4.2 失败或未完成项说明
 

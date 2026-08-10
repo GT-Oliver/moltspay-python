@@ -57,18 +57,6 @@ Provider manifests can add `balance`, `wechat`, and `alipay` to `chains`, plus
 the corresponding provider and per-service configuration blocks used by the
 Node SDK.
 
-## MCP and CLI
-
-Install MCP support with `pip install moltspay[mcp]`, then run:
-
-```bash
-moltspay-mcp --dry-run
-```
-
-Tools: `moltspay_status`, `moltspay_services`, `moltspay_pay`, and
-`moltspay_config`. Set `MOLTSPAY_MCP_REQUIRE_CONFIRM=1` to require explicit
-confirmation before a payment.
-
 New CLI groups include `services`, `fund`, `transfer`, `config`, `balance`,
 `wechat`, and `alipay`.
 
