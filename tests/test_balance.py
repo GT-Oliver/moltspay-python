@@ -7,7 +7,7 @@ import time
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
-from moltspay.balance import BalanceLedger, build_deduct_message, from_sat, to_sat
+from moltspay.balance import BalanceClient, BalanceLedger, build_deduct_message, from_sat, to_sat
 from moltspay.server.facilitators.balance import BalanceFacilitator
 
 
@@ -16,32 +16,57 @@ def test_amount_conversion_is_exact():
     assert from_sat(399) == "3.99"
     with pytest.raises(ValueError):
         to_sat("0.001")
+    with pytest.raises(ValueError):
+        to_sat("not-a-number")
 
 
 def test_topup_deduct_replay_and_refund_are_idempotent():
-    ledger = BalanceLedger(":memory:", default_single_limit_sat=1000, default_daily_limit_sat=2000)
-    topup = ledger.topup("buyer-1", 1000, "external-1")
-    replayed_topup = ledger.topup("buyer-1", 1000, "external-1")
-    assert replayed_topup["replayed"] is True
-    assert ledger.get_buyer("buyer-1")["balance_sat"] == 1000
+    with BalanceLedger(":memory:", default_single_limit_sat=1000, default_daily_limit_sat=2000) as ledger:
+        topup = ledger.topup("buyer-1", 1000, "external-1")
+        replayed_topup = ledger.topup("buyer-1", 1000, "external-1")
+        assert topup["replayed"] is False
+        assert replayed_topup["replayed"] is True
+        assert ledger.get_buyer("buyer-1")["balance_sat"] == 1000
 
-    deduct = ledger.deduct("buyer-1", 250, request_id="request-1", service="demo")
-    replayed_deduct = ledger.deduct("buyer-1", 250, request_id="request-1", service="demo")
-    assert deduct["success"] and replayed_deduct["replayed"] is True
-    assert ledger.get_buyer("buyer-1")["balance_sat"] == 750
+        deduct = ledger.deduct("buyer-1", 250, request_id="request-1", service="demo")
+        replayed_deduct = ledger.deduct("buyer-1", 250, request_id="request-1", service="demo")
+        assert deduct["success"] and replayed_deduct["replayed"] is True
+        assert ledger.get_buyer("buyer-1")["balance_sat"] == 750
 
-    refund = ledger.refund(deduct["tx_id"], "skill failed")
-    replayed_refund = ledger.refund(deduct["tx_id"], "skill failed")
-    assert refund["success"] and replayed_refund["replayed"] is True
-    assert ledger.get_buyer("buyer-1")["balance_sat"] == 1000
+        refund = ledger.refund(deduct["tx_id"], "skill failed")
+        replayed_refund = ledger.refund(deduct["tx_id"], "skill failed")
+        assert refund["success"] and replayed_refund["replayed"] is True
+        assert ledger.get_buyer("buyer-1")["balance_sat"] == 1000
+        assert len(ledger.list_transactions("buyer-1")) == 3
+        assert ledger.integrity_ok() is True
 
 
 def test_limits_are_enforced():
-    ledger = BalanceLedger(":memory:", default_single_limit_sat=500, default_daily_limit_sat=600)
-    ledger.topup("buyer", 1000, "fund")
-    assert ledger.deduct("buyer", 501)["error"] == "exceeds_single_limit"
-    assert ledger.deduct("buyer", 400, request_id="one")["success"]
-    assert ledger.deduct("buyer", 300, request_id="two")["error"] == "exceeds_daily_limit"
+    with BalanceLedger(":memory:", default_single_limit_sat=500, default_daily_limit_sat=600) as ledger:
+        assert ledger.check_deduct("missing", 1)["error"] == "buyer_not_found"
+        ledger.topup("buyer", 1000, "fund")
+        assert ledger.deduct("buyer", 501)["error"] == "exceeds_single_limit"
+        assert ledger.deduct("buyer", 400, request_id="one")["success"]
+        assert ledger.deduct("buyer", 300, request_id="two")["error"] == "exceeds_daily_limit"
+        ledger.db.execute("UPDATE buyers SET status='disabled' WHERE buyer_id='buyer'")
+        assert ledger.check_deduct("buyer", 1)["error"] == "buyer_not_active"
+        with pytest.raises(ValueError):
+            ledger.deduct("buyer", 0)
+        with pytest.raises(ValueError):
+            ledger.topup("buyer", 0, "bad")
+        assert ledger.refund("missing")["error"] == "tx_not_found"
+        assert ledger.refund(ledger.list_transactions("buyer")[-1]["id"])["error"] == "not_a_deduct"
+
+
+def test_ledger_bindings_and_currency_guard(tmp_path):
+    path = tmp_path / "ledger.db"
+    with BalanceLedger(path) as ledger:
+        assert ledger.bind_signer("buyer", "0xABC")["bound"] is True
+        assert ledger.bind_signer("buyer", "0xDEF")["conflict"] is True
+        assert ledger.bind_openid("buyer", "openid-1")["bound"] is True
+        assert ledger.bind_openid("buyer", "openid-2")["conflict"] is True
+    with pytest.raises(ValueError, match="currency mismatch"):
+        BalanceLedger(path, currency="CNY")
 
 
 def test_balance_facilitator_contract():
@@ -54,6 +79,7 @@ def test_balance_facilitator_contract():
     assert verified.valid is True
     assert settled.success is True
     assert settled.status == "deducted"
+    facilitator.ledger.close()
 
 
 def test_balance_auth_enforce_binds_signer():
@@ -74,3 +100,67 @@ def test_balance_auth_enforce_binds_signer():
     rejected = asyncio.run(facilitator.verify(payment, requirements))
     assert rejected.valid is False
     assert "signer_mismatch" in rejected.error
+    facilitator.ledger.close()
+
+
+class FakeBalanceHttp:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+        self.closed = False
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return self.responses.pop(0)
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return self.responses.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+def http_response(status, body):
+    import httpx
+    return httpx.Response(status, json=body, request=httpx.Request("POST", "https://provider.test"))
+
+
+def test_balance_client_query_topup_confirm_and_transactions():
+    http = FakeBalanceHttp([
+        http_response(404, {}),
+        http_response(200, {"balance": "3.00", "spent_today": "1.00"}),
+        http_response(200, {"transactions": [{"id": "tx1"}]}),
+        http_response(200, {"out_trade_no": "WX1"}),
+        http_response(400, {"error": "not paid"}),
+        http_response(200, {"credited": True}),
+    ])
+    client = BalanceClient(buyer_id="buyer", http_client=http)
+    assert client.get_balance("https://provider.test/").balance == "3.00"
+    assert client.list_transactions("https://provider.test") == [{"id": "tx1"}]
+    assert client.create_topup_order("https://provider.test", pack="2.00")["out_trade_no"] == "WX1"
+    assert client.confirm_topup("https://provider.test", "WX1")["credited"] is False
+    assert client.confirm_topup("https://provider.test", "WX1")["credited"] is True
+    with pytest.raises(Exception, match="buyer_id"):
+        BalanceClient(http_client=http)._buyer(None)
+
+
+def test_balance_client_external_topup_and_payment_paths():
+    http = FakeBalanceHttp([
+        http_response(200, {"credited": True}),
+        http_response(400, {"error": "duplicate"}),
+        http_response(200, {"result": {"cached": True}}),
+        http_response(402, {"accepts": []}),
+        http_response(200, {"result": {"ok": True}, "transaction": "btx-1"}),
+        http_response(402, {}),
+        http_response(500, {"error": "failed"}),
+    ])
+    client = BalanceClient(buyer_id="buyer", http_client=http)
+    assert client.topup_balance("https://provider.test", "2.00", "wechat", out_trade_no="WX1")["credited"]
+    with pytest.raises(Exception, match="duplicate"):
+        client.topup_balance("https://provider.test", "2.00", "wechat", out_trade_no="WX1")
+    assert client.pay("https://provider.test", "svc", {}).success is True
+    paid = client.pay("https://provider.test", "svc", {"x": 1}, amount=1.5)
+    assert paid.success is True and paid.tx_hash == "btx-1"
+    with pytest.raises(Exception, match="Balance payment failed"):
+        client.pay("https://provider.test", "svc", {})

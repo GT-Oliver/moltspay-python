@@ -38,6 +38,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mcp = [
+    "mcp>=1.0,<1.20",
+    "starlette>=0.40,<0.42",
+]
 langchain = [
     "langchain-core>=0.1",
 ]
@@ -55,12 +59,13 @@ dev = [
     "pytest-cov>=4.0",
 ]
 all = [
-    "moltspay[langchain,server,solana,fiat,dev]",
+    "moltspay[langchain,mcp,server,solana,fiat,dev]",
 ]
 
 [project.scripts]
 moltspay = "moltspay.cli:main"
 moltspay-server = "moltspay.server.__main__:main"
+moltspay-mcp = "moltspay.mcp.server:main"
 
 [project.urls]
 Homepage = "https://moltspay.com"

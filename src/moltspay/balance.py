@@ -7,8 +7,6 @@ import json
 import sqlite3
 import time
 import uuid
-import uuid
-import time
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -65,9 +63,13 @@ class BalanceLedger:
         self.db = sqlite3.connect(self.db_path, isolation_level=None, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
-        if self.db_path != ":memory:":
-            self.db.execute("PRAGMA journal_mode = WAL")
-        self._init_schema()
+        try:
+            if self.db_path != ":memory:":
+                self.db.execute("PRAGMA journal_mode = WAL")
+            self._init_schema()
+        except Exception:
+            self.db.close()
+            raise
 
     def _init_schema(self) -> None:
         self.db.executescript("""
@@ -257,6 +259,12 @@ class BalanceLedger:
     def close(self) -> None:
         self.db.close()
 
+    def __enter__(self) -> "BalanceLedger":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
 
 class BalanceClient:
     """Buyer-side HTTP client for the custodial balance rail."""
@@ -299,9 +307,10 @@ class BalanceClient:
 
     def create_topup_order(
         self, server_url: str, pack: Optional[str] = None, context: Optional[Dict[str, Any]] = None,
+        buyer_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a recoverable WeChat top-up order (Node parity)."""
-        buyer = self._buyer(None)
+        buyer = self._buyer(buyer_id)
         body = {"buyer_id": buyer}
         if pack is not None:
             body["pack"] = pack

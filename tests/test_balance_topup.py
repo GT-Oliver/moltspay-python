@@ -8,8 +8,8 @@ class FakeBalanceClient:
         self.buyer_id = "buyer-1"
         self.calls = []
 
-    def create_topup_order(self, server_url, pack=None, context=None):
-        self.calls.append(("order", server_url, pack, context))
+    def create_topup_order(self, server_url, pack=None, context=None, buyer_id=None):
+        self.calls.append(("order", server_url, pack, context, buyer_id))
         return {
             "code_url": "weixin://pay",
             "out_trade_no": "WX-test-1",
@@ -34,8 +34,29 @@ def test_balance_topup_order_is_persisted_and_recovered(tmp_path: Path):
     assert session is not None
     assert session.server_url == "http://server.test"
     assert session.status == "pending"
+    assert order["expiresAt"] == session.expires_at
 
     result = client.confirm_balance_topup("WX-test-1")
     assert result["credited"] is True
     assert client.get_balance_topup_session("WX-test-1").status == "credited"
     assert [call[0] for call in fake.calls] == ["order", "confirm"]
+
+
+def test_balance_topup_explicit_buyer_is_forwarded(tmp_path: Path):
+    client = MoltsPay(private_key="0x" + "11" * 32, config_dir=str(tmp_path), buyer_id="default-buyer")
+    fake = FakeBalanceClient()
+    client._balance_client = fake
+
+    order = client.create_balance_topup_order("http://server.test", buyer_id="explicit-buyer")
+
+    assert fake.calls[0][-1] == "explicit-buyer"
+    assert order["buyerId"] == "explicit-buyer"
+    assert client.get_balance_topup_session(order["outTradeNo"]).buyer_id == "explicit-buyer"
+
+
+def test_balance_topup_rejects_unsafe_identifier(tmp_path: Path):
+    client = MoltsPay(private_key="0x" + "11" * 32, config_dir=str(tmp_path), buyer_id="buyer")
+
+    import pytest
+    with pytest.raises(Exception, match="Invalid balance"):
+        client.get_balance_topup_session("../wallet")

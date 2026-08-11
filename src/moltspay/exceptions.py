@@ -31,11 +31,12 @@ class AlipayProtocolError(MoltsPayError):
 
 class WalletError(MoltsPayError):
     """Wallet-related errors."""
-    pass
+    code = "WALLET_ERROR"
 
 
 class PaymentError(MoltsPayError):
     """Payment failed."""
+    code = "PAYMENT_ERROR"
     def __init__(self, message: str, tx_hash: str = None):
         super().__init__(message)
         self.tx_hash = tx_hash

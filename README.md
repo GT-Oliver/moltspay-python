@@ -43,6 +43,17 @@ For LangChain integration:
 pip install moltspay[langchain]
 ```
 
+For the Model Context Protocol server:
+```bash
+pip install moltspay[mcp]
+moltspay-mcp
+```
+
+Interactive WeChat and Alipay payments use recoverable start/status/fulfill
+tools. The unified MCP pay tool is reserved for non-interactive on-chain and
+provider-balance payments. Set `MOLTSPAY_MCP_REQUIRE_CONFIRM=1` to require
+`confirmed=true` before money-moving or fulfillment operations.
+
 For everything:
 ```bash
 pip install moltspay[all]

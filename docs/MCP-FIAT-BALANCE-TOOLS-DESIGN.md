@@ -43,9 +43,12 @@ MCP 只能通过 `MoltsPay` 公共方法调用业务逻辑，不得直接访问 
 | `moltspay_wechat_fulfill` | `identifier`, `confirmed` | 完成后的会话和服务结果 | `fulfill_wechat_payment()` | 带支付凭证重试 Provider `/execute` |
 | `moltspay_wechat_cancel` | `identifier` | cancelled 会话 | `cancel_wechat_payment()` | 本地取消 |
 | `moltspay_wechat_list` | `status?`, `limit`, `includeExpired` | 微信会话列表 | `list_wechat_payment_sessions()` | 本地只读 |
-| `moltspay_alipay_check_wallet` | `executable?` | `ready`, `walletStatus` | `check_alipay_wallet()` | 检查 `alipay-bot` |
-| `moltspay_alipay_pay` | 服务地址、服务 ID、参数、超时、确认 | `PaymentResult` 及交易号/支付 URL | `pay(..., rail="alipay")` | 402 → alipay-bot → 轮询 → 重试服务 |
-| `moltspay_pay` | `url`, `service`, `params`, `chain?`, `token`, `rail?`, `confirmed` | `PaymentResult` | `client.pay()` | 按 rail 路由到链上、余额、微信或支付宝 |
+| `moltspay_alipay_check_wallet` | 无 | `ready`, `walletStatus` | `check_alipay_wallet()` | 检查服务端配置的 `alipay-bot` |
+| `moltspay_alipay_start` | 服务地址、服务 ID、参数、超时、确认 | 可恢复会话、交易号、支付 URL | `start_alipay_payment()` | 402 → alipay-bot → 保存会话，不轮询 |
+| `moltspay_alipay_status` | `identifier` | 本地支付宝会话 | `get_alipay_payment_status()` | 本地只读，不调用 alipay-bot |
+| `moltspay_alipay_fulfill` | `identifier`, `confirmed` | 更新后的会话和服务结果 | `fulfill_alipay_payment()` | 显式恢复支付/履约一次 |
+| `moltspay_alipay_list` | `limit?` | 本地支付宝会话列表 | `list_alipay_payment_sessions()` | 本地只读 |
+| `moltspay_pay` | `url`, `service`, `params`, `chain?`, `token`, `rail?`, `confirmed` | `PaymentResult` | `client.pay()` | 仅非交互式链上或余额支付；微信/支付宝使用专用工具 |
 | `moltspay_config` | `maxPerTx?`, `maxPerDay?` | 当前配置 | `get_config()` / `update_config()` | 本地配置及消费限额 |
 
 ## 4. MCP registration contract
@@ -377,7 +380,7 @@ Description:
 
 > List persisted WeChat payment sessions, optionally filtered by status and expiry. This tool is read-only.
 
-Input: `{ "type": "object", "properties": { "status": {"type": "string", "enum": ["pending", "paid", "completed", "expired", "cancelled", "failed"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}, "includeExpired": {"type": "boolean", "default": true} }, "additionalProperties": false }`
+Input: `{ "type": "object", "properties": { "status": {"type": "string", "enum": ["pending", "paid", "completed", "expired", "cancelled", "failed", "unknown"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}, "includeExpired": {"type": "boolean", "default": true} }, "additionalProperties": false }`
 
 `data` is `{ "sessions": [], "limit": 100 }`. Calls
 `list_wechat_payment_sessions()`.
@@ -390,16 +393,16 @@ Description:
 
 > Check whether the local Alipay wallet dependency is installed, opened, and bound. This tool is read-only and never initiates a payment.
 
-Input: `{ "type": "object", "properties": { "executable": {"type": "string", "default": "alipay-bot"} }, "additionalProperties": false }`
+Input: `{ "type": "object", "additionalProperties": false }`
 
 `data` is `{ "ready": true, "executable": "alipay-bot", "walletStatus": "opened_bound" }`.
 Calls `check_alipay_wallet()`.
 
-#### `moltspay_alipay_pay`
+#### `moltspay_alipay_start`
 
 Description:
 
-> Pay for and execute a provider service through the local Alipay AI Pay wallet. This may open the wallet, spend fiat funds, poll for confirmation, and retry the provider request.
+> Start a recoverable Alipay AI Pay session and return its trade number and payment URL without polling for completion.
 
 Input:
 
@@ -413,15 +416,31 @@ Input:
     "params": {"$ref": "#/$defs/Params"},
     "framework": {"type": "string", "default": "openclaw"},
     "timeoutSeconds": {"type": "number", "exclusiveMinimum": 0, "default": 1800},
-    "pollIntervalSeconds": {"type": "number", "exclusiveMinimum": 0, "default": 3},
     "confirmed": {"$ref": "#/$defs/Confirmed"}
   },
   "additionalProperties": false
 }
 ```
 
-`data` is `PaymentResult` plus optional `tradeNo`, `outTradeNo`, and
-`paymentUrl`. Calls `client.pay(..., rail="alipay", rail_options=...)`.
+`data` is the persisted Alipay session including `paymentSessionId`, `status`,
+`tradeNo`, `outTradeNo`, `paymentUrl`, and expiry fields. Calls
+`start_alipay_payment()`.
+
+#### `moltspay_alipay_status`
+
+Reads a locally persisted Alipay session. It does not invoke `alipay-bot` and
+does not query or execute the provider service. Calls
+`get_alipay_payment_status()`.
+
+#### `moltspay_alipay_fulfill`
+
+Explicitly resumes the side-effectful `alipay-bot` query/fulfillment command
+once. It requires confirmation when enabled and calls
+`fulfill_alipay_payment()`.
+
+#### `moltspay_alipay_list`
+
+Lists locally persisted Alipay sessions and is read-only.
 
 ### 4.5 Unified payment and configuration
 
@@ -429,7 +448,7 @@ Input:
 
 Description:
 
-> Pay for and execute a provider service using the selected payment rail. Omit rail for x402 crypto payment; use balance, wechat, or alipay for the corresponding fiat or provider rail. This operation may spend funds.
+> Pay for and execute a provider service using a non-interactive on-chain or balance rail. WeChat and Alipay must use their dedicated start/status/fulfill tools. This operation may spend funds.
 
 Input:
 

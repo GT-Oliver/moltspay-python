@@ -31,11 +31,14 @@ from .permit_wallet import PermitWallet, AllowanceWallet, generate_permit_instru
 from .balance import BalanceClient, BalanceLedger, to_sat, from_sat
 from .wechat import WechatClient, WechatPaymentSession
 from .alipay import AlipayClient
+from .mcp import MoltsPayMCP, create_mcp_server
 from .chains import get_chain, get_chain_by_id, list_chains, get_chain_family, is_evm_chain, is_solana_chain
 
 __version__ = "2.4.0"
 __all__ = [
     "MoltsPay",
+    "MoltsPayMCP",
+    "create_mcp_server",
     "AsyncMoltsPay",
     "Wallet",
     "create_wallet",

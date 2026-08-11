@@ -22,7 +22,7 @@ import secrets
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 from .types import (
     ServicesManifest,
@@ -446,6 +446,8 @@ class MoltsPayServer:
                     return self._handle_balance_transactions(parsed)
                 elif parsed.path == "/balance":
                     return self._handle_balance_query(parsed)
+                elif parsed.path.startswith("/payments/wechat/"):
+                    return self._handle_wechat_status(parsed.path)
                 else:
                     self._send_json(404, {"error": "Not found"})
             
@@ -482,6 +484,28 @@ class MoltsPayServer:
             def _balance_facilitator(self):
                 facilitator = server.registry.get("balance")
                 return facilitator if isinstance(facilitator, BalanceFacilitator) else None
+
+            def _handle_wechat_status(self, path: str):
+                """Read WeChat order state without executing the paid service."""
+                facilitator = server.registry.get("wechat")
+                if not isinstance(facilitator, WechatFacilitator):
+                    return self._send_json(404, {"error": "WeChat payment rail is not configured"})
+                trade_no = unquote(path.removeprefix("/payments/wechat/"))
+                if not trade_no or len(trade_no) > 128 or not all(ch.isalnum() or ch in "._-" for ch in trade_no):
+                    return self._send_json(400, {"error": "Invalid WeChat trade number"})
+                try:
+                    result = facilitator.query_order(trade_no)
+                except Exception as exc:
+                    return self._send_json(502, {"status": "unknown", "error": str(exc)})
+                trade_state = str(result.get("trade_state", "UNKNOWN")).upper()
+                status = {
+                    "SUCCESS": "paid", "NOTPAY": "pending", "USERPAYING": "pending",
+                    "CLOSED": "failed", "REVOKED": "failed", "PAYERROR": "failed",
+                }.get(trade_state, "unknown")
+                return self._send_json(200, {
+                    "status": status, "tradeState": trade_state, "outTradeNo": trade_no,
+                    "transactionId": result.get("transaction_id"),
+                })
 
             def _handle_balance_query(self, parsed):
                 facilitator = self._balance_facilitator()
