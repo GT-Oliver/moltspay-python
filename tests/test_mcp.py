@@ -34,7 +34,10 @@ class FakeClient:
 
     def create_balance_topup_order(self, *args):
         self.calls.append(("topup", *args))
-        return {"outTradeNo": "ORDER1", "status": "pending", "expiresAt": "2099-01-01T00:00:00Z"}
+        return {
+            "outTradeNo": "ORDER1", "codeUrl": "weixin://pay/topup-1",
+            "status": "pending", "expiresAt": "2099-01-01T00:00:00Z",
+        }
 
     def confirm_balance_topup(self, *args):
         self.calls.append(("topup_confirm", *args))
@@ -163,10 +166,96 @@ def test_fastmcp_registration_exposes_constrained_tools():
     assert schema["properties"]["limit"]["maximum"] == 100
     assert schema["properties"]["offset"]["minimum"] == 0
 
-    content = asyncio.run(server.call_tool("moltspay_wechat_start", {
+    result = asyncio.run(server.call_tool("moltspay_wechat_start", {
         "serverUrl": "https://provider.test", "service": "svc", "confirmed": True,
     }))
-    assert any(getattr(item, "type", None) == "image" for item in content)
+    assert any(getattr(item, "type", None) == "image" for item in result.content)
+    assert result.structuredContent["ok"] is True
+
+
+def test_balance_topup_order_returns_qr_image_content():
+    pytest.importorskip("mcp")
+    from moltspay.mcp import create_mcp_server
+
+    server = create_mcp_server(FakeClient())
+    result = asyncio.run(server.call_tool("moltspay_balance_topup_order", {
+        "serverUrl": "https://provider.test", "confirmed": True,
+    }))
+
+    image = next(item for item in result.content if getattr(item, "type", None) == "image")
+    assert result.structuredContent["data"]["codeUrl"] == "weixin://pay/topup-1"
+    qr = result.structuredContent["data"]["qrCode"]
+    assert qr["mimeType"] == "image/png"
+    assert base64.b64decode(qr["data"]).startswith(b"\x89PNG")
+    assert image.data == qr["data"]
+
+
+def test_fastmcp_registration_documents_optional_parameters_options_and_ranges():
+    pytest.importorskip("mcp")
+    from moltspay.mcp import create_mcp_server
+
+    server = create_mcp_server(FakeClient())
+    tools = asyncio.run(server.list_tools())
+    by_name = {tool.name: tool for tool in tools}
+
+    def has_description(schema):
+        if isinstance(schema, list):
+            return any(has_description(value) for value in schema)
+        if not isinstance(schema, dict):
+            return False
+        if schema.get("description"):
+            return True
+        return any(has_description(value) for value in schema.values())
+
+    for tool in tools:
+        assert tool.description
+        assert tool.outputSchema is not None
+        assert len(tool.outputSchema["anyOf"]) == 2
+        for name, schema in tool.inputSchema.get("properties", {}).items():
+            assert has_description(schema), f"{tool.name}.{name} has no schema description"
+
+    pay = by_name["moltspay_pay"].inputSchema["properties"]
+    assert pay["token"]["enum"] == ["USDC", "USDT"]
+    assert pay["rail"]["anyOf"][0]["const"] == "balance"
+    assert pay["chain"]["anyOf"][0]["enum"] == [
+        "base", "polygon", "base_sepolia", "bnb", "bnb_testnet",
+        "tempo_moderato", "solana", "solana_devnet",
+    ]
+    assert pay["confirmed"]["default"] is False
+    assert pay["dryRun"]["default"] is False
+
+    transactions = by_name["moltspay_balance_transactions"].inputSchema["properties"]
+    assert transactions["limit"]["minimum"] == 1
+    assert transactions["limit"]["maximum"] == 100
+    assert transactions["offset"]["minimum"] == 0
+
+    topup = by_name["moltspay_balance_topup_order"].inputSchema["properties"]
+    assert topup["pack"]["anyOf"][0]["maxLength"] == 64
+    assert "pattern" in topup["pack"]["anyOf"][0]
+
+    alipay = by_name["moltspay_alipay_start"].inputSchema["properties"]
+    assert alipay["timeoutSeconds"]["exclusiveMinimum"] == 0
+    assert alipay["timeoutSeconds"]["default"] == 1800
+
+    wechat_list = by_name["moltspay_wechat_list"].inputSchema["properties"]
+    assert wechat_list["status"]["anyOf"][0]["enum"] == [
+        "pending", "paid", "completed", "expired", "cancelled", "failed", "unknown",
+    ]
+
+
+def test_unified_pay_rejects_configured_interactive_preference():
+    client = FakeClient()
+    client.get_config = lambda: {
+        "chain": "base", "limits": {}, "buyerId": "buyer", "railPreference": ["wechat"],
+    }
+
+    result = MoltsPayMCP(client).pay(
+        "https://provider.test", "svc", {}, confirmed=True,
+    )
+
+    assert result["ok"] is False
+    assert "start/status/fulfill" in result["error"]["message"]
+    assert not any(call[0] == "pay" for call in client.calls)
 
 
 def test_adapter_exposes_all_read_and_lifecycle_paths(monkeypatch):
