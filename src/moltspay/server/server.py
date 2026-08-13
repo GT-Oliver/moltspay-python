@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import secrets
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -121,6 +122,34 @@ class MoltsPayServer:
         print(f"[MoltsPay] Facilitators: {', '.join(self.registry.list_facilitators())}")
         print(f"[MoltsPay] Supported networks: {', '.join(self.registry.list_supported_networks())}")
         print(f"[MoltsPay] Protocol: x402 + MPP")
+
+    @staticmethod
+    def _balance_topup_order_is_active(
+        order: Dict[str, Any], now: Optional[datetime] = None,
+    ) -> bool:
+        """Return whether a cached top-up order still has a scannable QR code."""
+        expires_at = order.get("expires_at")
+        if not isinstance(expires_at, str) or not expires_at:
+            # Entries created by older versions did not carry their real expiry.
+            return False
+        try:
+            expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if expires.tzinfo is None:
+            return False
+        current = now or datetime.now(timezone.utc)
+        return current.astimezone(timezone.utc) < expires.astimezone(timezone.utc)
+
+    def _get_cached_balance_topup_order(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        cached = self._balance_topup_orders.get(cache_key)
+        if cached is None:
+            return None
+        if self._balance_topup_order_is_active(cached):
+            return cached
+        # Never return a QR code after WeChat's Native-order expiry.
+        self._balance_topup_orders.pop(cache_key, None)
+        return None
     
     def _get_provider_chains(self) -> List[ChainConfig]:
         """Get supported chains from provider config."""
@@ -571,12 +600,14 @@ class MoltsPayServer:
                     max_pack = to_sat(str(config["auto_topup_max"])) if config.get("auto_topup_max") else None
                 except ValueError as exc:
                     return self._send_json(400, {"error": f"Invalid pack: {exc}"})
+                if pack_sat <= 0:
+                    return self._send_json(400, {"error": "top-up pack must be greater than zero"})
                 if str(pack) not in [str(item) for item in packs] and (max_pack is None or pack_sat > max_pack):
                     return self._send_json(400, {"error": f'pack "{pack}" is not an offered top-up pack'})
                 signer = body.get("signer_address")
                 attach = {"buyer_id": buyer_id, "signer": signer.lower()} if isinstance(signer, str) and signer.startswith("0x") else {"buyer_id": buyer_id, "nonce": secrets.token_hex(8)}
                 cache_key = f"{buyer_id}|{pack}|{signer or ''}"
-                cached = server._balance_topup_orders.get(cache_key)
+                cached = server._get_cached_balance_topup_order(cache_key)
                 if cached:
                     return self._send_json(200, cached)
                 try:
@@ -586,9 +617,14 @@ class MoltsPayServer:
                 except Exception as exc:
                     return self._send_json(502, {"error": str(exc)})
                 extra = requirement.get("extra", {})
+                timeout_seconds = int(requirement.get("maxTimeoutSeconds", 300) or 300)
+                created_at = datetime.now(timezone.utc)
+                expires_at = created_at + timedelta(seconds=timeout_seconds)
                 result = {
                     "code_url": extra.get("code_url"), "out_trade_no": extra.get("out_trade_no"),
-                    "pack": str(pack), "max_timeout_seconds": requirement.get("maxTimeoutSeconds", 300),
+                    "pack": str(pack), "max_timeout_seconds": timeout_seconds,
+                    "created_at": created_at.isoformat().replace("+00:00", "Z"),
+                    "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
                 }
                 server._balance_topup_orders[cache_key] = result
                 self._send_json(200, result)
@@ -852,6 +888,22 @@ class MoltsPayServer:
                     verify_loop.close()
                 
                 if not verify_result.valid:
+                    if network == "balance" and verify_result.error == "insufficient_balance":
+                        balance_config = server.provider.balance if server.provider and server.provider.balance else {}
+                        details = dict(verify_result.details or {})
+                        if details.get("balance_sat") is not None:
+                            details["balance"] = from_sat(int(details["balance_sat"]))
+                        details.update({
+                            "required": str(requirements.amount),
+                            "currency": balance_config.get("currency", "CNY"),
+                            "topupPacks": [str(item) for item in balance_config.get("topup_packs", [])],
+                            "customTopupMax": balance_config.get("auto_topup_max"),
+                        })
+                        return self._send_json(402, {
+                            "code": "insufficient_balance",
+                            "error": "insufficient_balance",
+                            "details": details,
+                        })
                     return self._send_json(402, {
                         "error": f"Payment verification failed: {verify_result.error}",
                     })

@@ -10,7 +10,7 @@ import uuid
 from typing import Annotated, Any, Callable, Dict, Literal, Optional
 
 import httpx
-from pydantic import BaseModel, Field, RootModel
+from pydantic import BaseModel, Field
 
 from ..client import MoltsPay
 from ..exceptions import MoltsPayError, PaymentError
@@ -54,9 +54,9 @@ TopupPack = Annotated[
     Field(
         min_length=1,
         max_length=64,
-        pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$",
+        pattern=r"^(?:[1-9][0-9]*(?:\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)$",
         description=(
-            "Provider-offered top-up amount as a non-negative decimal string, for example '10.00'; "
+            "Provider-offered top-up amount as a positive decimal string, for example '10.00'; "
             "1-64 characters. The provider determines the available pack values."
         ),
     ),
@@ -164,8 +164,14 @@ class ToolFailureEnvelope(BaseModel):
     retried: Annotated[int, Field(ge=0, description="Number of automatic retries performed; currently 0.")]
 
 
-class ToolEnvelope(RootModel[ToolSuccessEnvelope | ToolFailureEnvelope]):
-    """Success-or-failure envelope shared by every MoltsPay MCP tool."""
+class ToolEnvelope(BaseModel):
+    """OpenClaw-compatible top-level object shared by every MCP tool."""
+
+    ok: bool = Field(description="Whether the tool operation succeeded.")
+    data: Optional[Any] = Field(default=None, description="Tool-specific success payload; null on failure.")
+    error: Optional[ToolErrorPayload] = Field(default=None, description="Structured error; null on success.")
+    requestId: RequestId
+    retried: Annotated[int, Field(ge=0, description="Number of automatic retries performed; currently 0.")]
 
 
 def _camel(value: Any) -> Any:
@@ -235,7 +241,12 @@ class MoltsPayMCP:
             code, retryable = "internal_error", False
         return {
             "ok": False,
-            "error": {"code": code, "message": str(exc), "retryable": retryable, "details": {}},
+            "error": {
+                "code": code,
+                "message": str(exc),
+                "retryable": retryable,
+                "details": _camel(getattr(exc, "details", {}) or {}),
+            },
             "requestId": request_id or str(uuid.uuid4()),
             "retried": 0,
         }
@@ -385,6 +396,8 @@ class MoltsPayMCP:
                     f"Configured interactive rail '{preferences[0]}' requires its start/status/fulfill tools"
                 )
             options = {"auto_topup": False} if rail == "balance" else None
+            if options is not None and requestId:
+                options["request_id"] = requestId
             return self.client.pay(url, service, token=token, chain=chain, rail=rail, payment_params=params, rail_options=options)
         return self._run(call, requestId)
 
@@ -483,7 +496,9 @@ TOOL_DESCRIPTIONS = {
         "tempo_moderato, solana, or solana_devnet; omission uses the configured default. token is USDC or USDT "
         "(default USDC). rail may be balance or omitted for on-chain payment. Interactive WeChat and Alipay "
         "rails are rejected and require dedicated tools. dryRun=true returns only the intent; confirmed=true is "
-        "required when the MCP confirmation gate is enabled. This operation may spend funds and execute service."
+        "required when the MCP confirmation gate is enabled. This operation may spend funds and execute service. "
+        "If it returns insufficient_balance, show error.details.topupPacks plus a validated custom amount, create "
+        "and confirm a balance top-up, then retry this tool; repeat while the balance is still insufficient."
     ),
     "config": (
         "Read local MoltsPay configuration when both limits are omitted. Otherwise persist maxPerTx and/or "
@@ -500,6 +515,8 @@ def create_mcp_server(client: Optional[MoltsPay] = None):
     except ImportError as exc:
         raise RuntimeError("MCP support requires: pip install 'moltspay[mcp]'") from exc
     adapter = MoltsPayMCP(client)
+    # OpenClaw requires a top-level object output schema. ToolEnvelope is flat
+    # rather than a root-level union so schema validation stays enabled.
     server = FastMCP("moltspay")
 
     def image_result(result: Dict[str, Any], code_url: Optional[str] = None) -> Any:

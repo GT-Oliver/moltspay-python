@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from moltspay.exceptions import InsufficientBalance
 from moltspay.mcp import MoltsPayMCP
 
 
@@ -210,7 +211,9 @@ def test_fastmcp_registration_documents_optional_parameters_options_and_ranges()
     for tool in tools:
         assert tool.description
         assert tool.outputSchema is not None
-        assert len(tool.outputSchema["anyOf"]) == 2
+        assert tool.outputSchema["type"] == "object"
+        assert {"ok", "requestId", "retried"}.issubset(tool.outputSchema["required"])
+        assert {"data", "error"}.issubset(tool.outputSchema["properties"])
         for name, schema in tool.inputSchema.get("properties", {}).items():
             assert has_description(schema), f"{tool.name}.{name} has no schema description"
 
@@ -258,6 +261,22 @@ def test_unified_pay_rejects_configured_interactive_preference():
     assert not any(call[0] == "pay" for call in client.calls)
 
 
+def test_balance_pay_forwards_caller_request_id_for_retry_idempotency():
+    client = FakeClient()
+
+    result = MoltsPayMCP(client).pay(
+        "https://provider.test", "ping", {}, rail="balance",
+        confirmed=True, requestId="feishu-message-123",
+    )
+
+    assert result["ok"] is True
+    pay_call = next(call for call in client.calls if call[0] == "pay")
+    assert pay_call[2]["rail_options"] == {
+        "auto_topup": False,
+        "request_id": "feishu-message-123",
+    }
+
+
 def test_adapter_exposes_all_read_and_lifecycle_paths(monkeypatch):
     monkeypatch.delenv("MOLTSPAY_MCP_REQUIRE_CONFIRM", raising=False)
     client = FakeClient()
@@ -300,3 +319,91 @@ def test_adapter_error_classification():
     }
     assert adapter._fail(ValueError("bad"), None)["error"]["code"] == "invalid_request"
     assert adapter._fail(RuntimeError("boom"), None)["error"]["code"] == "internal_error"
+
+
+def test_insufficient_balance_error_keeps_actionable_topup_details():
+    error = InsufficientBalance(
+        required="25.00", balance="0.00", topup_packs=["10.00", "20.00", "50.00", "100.00"]
+    )
+
+    result = MoltsPayMCP(FakeClient())._fail(error, "req-balance")
+
+    assert result["error"] == {
+        "code": "insufficient_balance",
+        "message": "Insufficient provider balance: need 25.00 CNY, have 0.00",
+        "retryable": False,
+        "details": {
+            "required": "25.00",
+            "balance": "0.00",
+            "currency": "CNY",
+            "topupPacks": ["10.00", "20.00", "50.00", "100.00"],
+        },
+    }
+
+
+def test_mcp_balance_purchase_can_repeat_topup_until_payment_succeeds():
+    pytest.importorskip("mcp")
+    from moltspay.mcp import create_mcp_server
+
+    class FlowClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.balance = 0
+            self.orders = {}
+
+        def get_config(self):
+            return {"chain": "base", "limits": {}, "buyerId": "feishu-user", "railPreference": []}
+
+        def pay(self, *args, **kwargs):
+            self.calls.append(("pay", args, kwargs))
+            assert kwargs["rail_options"] == {"auto_topup": False}
+            if self.balance < 25:
+                raise InsufficientBalance(
+                    required="25.00", balance=f"{self.balance:.2f}",
+                    topup_packs=["10.00", "20.00", "50.00", "100.00"],
+                )
+            return {"success": True, "result": {"ok": True}}
+
+        def create_balance_topup_order(self, server_url, pack=None, buyer_id=None):
+            order = f"ORDER{len(self.orders) + 1}"
+            self.orders[order] = int(float(pack))
+            return {"outTradeNo": order, "codeUrl": f"weixin://pay/{order}", "pack": pack, "status": "pending"}
+
+        def confirm_balance_topup(self, order, server_url=None):
+            self.balance += self.orders[order]
+            return {"credited": True, "balance": f"{self.balance:.2f}"}
+
+    server = create_mcp_server(FlowClient())
+
+    async def call(name, arguments):
+        result = await server.call_tool(name, arguments)
+        if isinstance(result, tuple):
+            return result[1]
+        return result.structuredContent
+
+    async def flow():
+        pay_args = {
+            "url": "https://provider.test", "service": "ping", "params": {},
+            "rail": "balance", "confirmed": True,
+        }
+        first = await call("moltspay_pay", pay_args)
+        topup_10 = await call("moltspay_balance_topup_order", {
+            "serverUrl": "https://provider.test", "pack": "10", "confirmed": True,
+        })
+        await call("moltspay_balance_topup_confirm", {
+            "outTradeNo": topup_10["data"]["outTradeNo"], "confirmed": True,
+        })
+        second = await call("moltspay_pay", pay_args)
+        topup_20 = await call("moltspay_balance_topup_order", {
+            "serverUrl": "https://provider.test", "pack": "20", "confirmed": True,
+        })
+        await call("moltspay_balance_topup_confirm", {
+            "outTradeNo": topup_20["data"]["outTradeNo"], "confirmed": True,
+        })
+        third = await call("moltspay_pay", pay_args)
+        return first, second, third
+
+    first, second, third = asyncio.run(flow())
+    assert first["error"]["code"] == "insufficient_balance"
+    assert second["error"]["details"]["balance"] == "10.00"
+    assert third["ok"] is True

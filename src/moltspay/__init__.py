@@ -18,6 +18,7 @@ from .models import (
 from .exceptions import (
     MoltsPayError,
     PaymentError,
+    InsufficientBalance,
     InsufficientFunds,
     LimitExceeded,
     WalletError,
@@ -60,6 +61,7 @@ __all__ = [
     "BalanceTopupSession",
     "MoltsPayError",
     "PaymentError",
+    "InsufficientBalance",
     "InsufficientFunds",
     "LimitExceeded",
     "WalletError",

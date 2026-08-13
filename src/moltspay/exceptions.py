@@ -5,8 +5,9 @@ class MoltsPayError(Exception):
     """Base exception for MoltsPay."""
     code = "MOLTSPAY_ERROR"
 
-    def __init__(self, message: str = ""):
+    def __init__(self, message: str = "", details: dict = None):
         super().__init__(message)
+        self.details = details or {}
 
 
 class UnsupportedRail(MoltsPayError):
@@ -37,9 +38,39 @@ class WalletError(MoltsPayError):
 class PaymentError(MoltsPayError):
     """Payment failed."""
     code = "PAYMENT_ERROR"
-    def __init__(self, message: str, tx_hash: str = None):
-        super().__init__(message)
+    def __init__(self, message: str, tx_hash: str = None, details: dict = None):
+        super().__init__(message, details=details)
         self.tx_hash = tx_hash
+
+
+class InsufficientBalance(PaymentError):
+    """A provider-side custodial balance cannot cover the service price."""
+
+    code = "INSUFFICIENT_BALANCE"
+
+    def __init__(
+        self,
+        required: str = None,
+        balance: str = None,
+        currency: str = "CNY",
+        topup_packs: list = None,
+        message: str = None,
+        details: dict = None,
+    ):
+        payload = dict(details or {})
+        if required is not None:
+            payload.setdefault("required", str(required))
+        if balance is not None:
+            payload.setdefault("balance", str(balance))
+        if currency:
+            payload.setdefault("currency", currency)
+        if topup_packs is not None:
+            payload.setdefault("topupPacks", [str(item) for item in topup_packs])
+        if message is None:
+            message = "Insufficient provider balance"
+            if required is not None and balance is not None:
+                message += f": need {required} {currency}, have {balance}"
+        super().__init__(message, details=payload)
 
 
 class InsufficientFunds(PaymentError):

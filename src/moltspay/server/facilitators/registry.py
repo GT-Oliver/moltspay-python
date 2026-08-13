@@ -123,8 +123,9 @@ class FacilitatorRegistry:
         Automatically selects facilitator based on network in payload/requirements.
         """
         # Determine network
+        accepted = payment_payload.get("accepted") or {}
         network = (
-            payment_payload.get("accepted", {}).get("network") or
+            accepted.get("network") or
             payment_payload.get("network") or
             requirements.get("network")
         )
@@ -148,8 +149,9 @@ class FacilitatorRegistry:
         Settle payment using the appropriate facilitator.
         """
         # Determine network
+        accepted = payment_payload.get("accepted") or {}
         network = (
-            payment_payload.get("accepted", {}).get("network") or
+            accepted.get("network") or
             payment_payload.get("network") or
             requirements.get("network")
         )

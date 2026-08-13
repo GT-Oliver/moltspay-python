@@ -8,22 +8,24 @@
                                     "balance"
                                 ],
                      "balance":  {
-                                     "db_path":  "D:/WorkPlace/GitHub/moltspay/data/balance-cny.sqlite",
+                                     "db_path":  "data/balance-cny.sqlite",
                                      "currency":  "CNY",
                                      "single_limit":  "50.00",
                                      "daily_limit":  "200.00",
                                      "topup_packs":  [
+                                                         "10.00",
                                                          "20.00",
-                                                         "50.00"
+                                                         "50.00",
+                                                         "100.00"
                                                      ],
                                      "default_pack":  "20.00",
-                                     "auto_topup_max":  "50.00"
+                                     "auto_topup_max":  "100.00"
                                  },
                      "wechat":  {
                                     "mchid":  "1648212710",
                                     "appid":  "wx4185c48b8df3450a",
                                     "serial_no":  "6C00701C394129F25C9134D0A6CB6C2814088630",
-                                    "private_key_path":  "D:/WorkPlace/GitHub/moltspay/cert/apiclient_key.pem",
+                                    "private_key_path":  "cert/apiclient_key.pem",
                                     "apiv3_key":  "wYa1e3cxyWWkHfSlRG4l8VPbV451288t",
                                     "notify_url":  "https://sr007.com/notify"
                                 }

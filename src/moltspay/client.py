@@ -248,16 +248,22 @@ class MoltsPay:
             server_url, pack=pack, context=context, buyer_id=buyer
         )
         now = time.time()
+        timeout_seconds = float(data.get("max_timeout_seconds", 300))
+        created_at = data.get("created_at") or data.get("createdAt")
+        expires_at = data.get("expires_at") or data.get("expiresAt")
+        if not isinstance(created_at, str) or not created_at:
+            created_at = datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z")
+        if not isinstance(expires_at, str) or not expires_at:
+            expires_at = datetime.fromtimestamp(now + timeout_seconds, timezone.utc).isoformat().replace("+00:00", "Z")
         session = BalanceTopupSession(
             out_trade_no=data["out_trade_no"], buyer_id=buyer or self._buyer_id or "",
             pack=str(data["pack"]), server_url=server_url.rstrip("/"), code_url=data["code_url"],
-            created_at=datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z"),
-            expires_at=datetime.fromtimestamp(now + float(data.get("max_timeout_seconds", 300)), timezone.utc).isoformat().replace("+00:00", "Z"),
+            created_at=created_at, expires_at=expires_at,
             context=context or {},
         )
         self._save_balance_topup_session(session)
         return {"outTradeNo": session.out_trade_no, "codeUrl": session.code_url, "pack": session.pack,
-                "maxTimeoutSeconds": int(data.get("max_timeout_seconds", 300)),
+                "maxTimeoutSeconds": int(timeout_seconds),
                 "buyerId": session.buyer_id, "status": session.status,
                 "createdAt": session.created_at, "expiresAt": session.expires_at}
 
@@ -995,30 +1001,44 @@ class MoltsPay:
             buyer_id = options.get("buyer_id") or self._buyer_id
             if buyer_id:
                 self._get_balance_client().buyer_id = buyer_id
-            try:
-                return self._get_balance_client().pay(service_url, service_id, params, service.price, buyer_id=buyer_id)
-            except PaymentError as exc:
-                message = str(exc)
-                fundable = any(item in message.lower() for item in ("insufficient", "unknown buyer", "buyer_not_found"))
-                if not fundable or options.get("auto_topup", True) is False:
-                    raise
-                if options.get("topup_mode") == "manual":
-                    order = self.create_balance_topup_order(
+            max_topup_attempts = int(options.get("max_topup_attempts", 10))
+            if max_topup_attempts < 1:
+                raise ValueError("max_topup_attempts must be at least 1")
+            topup_attempts = 0
+            while True:
+                try:
+                    pay_options = {"buyer_id": buyer_id}
+                    if options.get("request_id"):
+                        pay_options["request_id"] = options["request_id"]
+                    return self._get_balance_client().pay(
+                        service_url, service_id, params, service.price, **pay_options
+                    )
+                except PaymentError as exc:
+                    message = str(exc)
+                    fundable = any(item in message.lower() for item in ("insufficient", "unknown buyer", "buyer_not_found"))
+                    if not fundable or options.get("auto_topup", True) is False:
+                        raise
+                    if options.get("topup_mode") == "manual":
+                        order = self.create_balance_topup_order(
+                            service_url, pack=options.get("topup_pack"), buyer_id=buyer_id,
+                            context={"service": service_id},
+                        )
+                        if options.get("on_topup_required"):
+                            options["on_topup_required"](order["pack"], order["codeUrl"])
+                        return PaymentResult(
+                            success=False, amount=service.price, token="BALANCE", service_id=service_id,
+                            result={"status": "topup_required", "out_trade_no": order["outTradeNo"],
+                                    "code_url": order["codeUrl"], "pack": order["pack"], "server_url": service_url},
+                        )
+                    if topup_attempts >= max_topup_attempts:
+                        raise
+                    topup_attempts += 1
+                    self.topup_balance_pack(
                         service_url, pack=options.get("topup_pack"), buyer_id=buyer_id,
-                        context={"service": service_id},
+                        poll_interval=float(options.get("topup_poll_interval", 2.0)),
+                        timeout=options.get("topup_timeout"),
+                        on_code_url=options.get("on_topup_required"),
                     )
-                    if options.get("on_topup_required"):
-                        options["on_topup_required"](order["pack"], order["codeUrl"])
-                    return PaymentResult(
-                        success=False, amount=service.price, token="BALANCE", service_id=service_id,
-                        result={"status": "topup_required", "out_trade_no": order["outTradeNo"],
-                                "code_url": order["codeUrl"], "pack": order["pack"], "server_url": service_url},
-                    )
-                self.topup_balance_pack(
-                    service_url, pack=options.get("topup_pack"), buyer_id=buyer_id,
-                    poll_interval=float(options.get("topup_poll_interval", 2.0)),
-                )
-                return self._get_balance_client().pay(service_url, service_id, params, service.price, buyer_id=buyer_id)
         if selected_rail == "wechat":
             return self._pay_wechat(service_url, service_id, params, service.price, **(rail_options or {}))
         if selected_rail == "alipay":

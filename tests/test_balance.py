@@ -1,6 +1,8 @@
 """Balance-rail ledger and facilitator regression tests."""
 
 import asyncio
+import base64
+import json
 
 import pytest
 import time
@@ -8,7 +10,9 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 
 from moltspay.balance import BalanceClient, BalanceLedger, build_deduct_message, from_sat, to_sat
+from moltspay.exceptions import InsufficientBalance
 from moltspay.server.facilitators.balance import BalanceFacilitator
+from moltspay.server.facilitators.registry import FacilitatorRegistry
 
 
 def test_amount_conversion_is_exact():
@@ -79,6 +83,28 @@ def test_balance_facilitator_contract():
     assert verified.valid is True
     assert settled.success is True
     assert settled.status == "deducted"
+    facilitator.ledger.close()
+
+
+def test_registry_accepts_node_balance_payload_without_accepted_object():
+    facilitator = BalanceFacilitator(":memory:", single_limit="10.00", daily_limit="20.00")
+    facilitator.ledger.topup("node-buyer", 500, "fund")
+    registry = object.__new__(FacilitatorRegistry)
+    registry._facilitators = {"balance": facilitator}
+    requirements = facilitator.create_requirements("0.01", "ping")
+    payment = {
+        "accepted": None,
+        "scheme": "balance",
+        "network": "balance",
+        "payload": {"buyer_id": "node-buyer", "request_id": "node-request"},
+    }
+
+    verified = asyncio.run(registry.verify(payment, requirements))
+    settled = asyncio.run(registry.settle(payment, requirements))
+
+    assert verified.valid is True
+    assert settled.success is True
+    assert facilitator.ledger.get_buyer("node-buyer")["balance_sat"] == 499
     facilitator.ledger.close()
 
 
@@ -164,3 +190,42 @@ def test_balance_client_external_topup_and_payment_paths():
     assert paid.success is True and paid.tx_hash == "btx-1"
     with pytest.raises(Exception, match="Balance payment failed"):
         client.pay("https://provider.test", "svc", {})
+
+
+def test_balance_client_preserves_structured_insufficient_balance_details():
+    http = FakeBalanceHttp([
+        http_response(402, {"accepts": []}),
+        http_response(402, {
+            "code": "insufficient_balance",
+            "error": "insufficient_balance",
+            "details": {
+                "required": "25.00", "balance": "5.00", "currency": "CNY",
+                "topupPacks": ["10.00", "20.00", "50.00", "100.00"],
+                "customTopupMax": "100.00",
+            },
+        }),
+    ])
+    client = BalanceClient(buyer_id="feishu-user", http_client=http)
+
+    with pytest.raises(InsufficientBalance) as captured:
+        client.pay("https://provider.test", "ping", {})
+
+    assert captured.value.code == "INSUFFICIENT_BALANCE"
+    assert captured.value.details["required"] == "25.00"
+    assert captured.value.details["topupPacks"] == ["10.00", "20.00", "50.00", "100.00"]
+
+
+def test_balance_client_uses_caller_request_id_in_payment_payload():
+    http = FakeBalanceHttp([
+        http_response(402, {"accepts": []}),
+        http_response(200, {"result": {"ok": True}, "transaction": "btx-1"}),
+    ])
+    client = BalanceClient(buyer_id="feishu-user", http_client=http)
+
+    assert client.pay(
+        "https://provider.test", "ping", {}, request_id="feishu-message-123"
+    ).success
+
+    payment = http.calls[1][2]["headers"]["X-Payment"]
+    decoded = json.loads(base64.b64decode(payment).decode())
+    assert decoded["payload"]["request_id"] == "feishu-message-123"

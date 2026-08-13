@@ -54,6 +54,9 @@ tools. The unified MCP pay tool is reserved for non-interactive on-chain and
 provider-balance payments. Set `MOLTSPAY_MCP_REQUIRE_CONFIRM=1` to require
 `confirmed=true` before money-moving or fulfillment operations.
 
+OpenClaw 飞书 channel 的余额不足、微信充值和购买重试状态机见
+[`docs/OPENCLAW-FEISHU-BALANCE-PURCHASE.md`](docs/OPENCLAW-FEISHU-BALANCE-PURCHASE.md)。
+
 For everything:
 ```bash
 pip install moltspay[all]

@@ -129,6 +129,11 @@ def cmd_pay(args) -> int:
     if args.prompt is not None:
         params["prompt"] = args.prompt
     client = client_for(args)
+
+    def show_topup(pack: str, code_url: str) -> None:
+        print(f"Provider balance top-up required: CNY {pack}", file=sys.stderr)
+        print_wechat_qr(code_url)
+
     result = client.pay(
         args.server, args.service, token=args.token, chain=args.chain,
         rail=args.rail, payment_params=params,
@@ -137,6 +142,9 @@ def cmd_pay(args) -> int:
             "topup_pack": getattr(args, "pack", None),
             "topup_mode": getattr(args, "topup_mode", "auto"),
             "auto_topup": not getattr(args, "no_auto_topup", False),
+            "max_topup_attempts": getattr(args, "max_topup_attempts", 10),
+            "topup_poll_interval": getattr(args, "topup_poll_interval", 2.0),
+            "on_topup_required": show_topup,
         },
     )
     output(result)
@@ -352,6 +360,8 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--pack")
     command.add_argument("--topup-mode", choices=["auto", "manual"], default="auto")
     command.add_argument("--no-auto-topup", action="store_true")
+    command.add_argument("--max-topup-attempts", type=int, default=10)
+    command.add_argument("--topup-poll-interval", type=float, default=2.0)
     command.add_argument("--config-dir", default=config_default)
     command.add_argument("--json", action="store_true")
 

@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from moltspay.cli import build_parser, cmd_limits, cmd_status, configure_stdio, cmd_wechat
-from moltspay.models import Balance, Limits
+from moltspay.cli import build_parser, cmd_limits, cmd_pay, cmd_status, configure_stdio, cmd_wechat
+from moltspay.models import Balance, Limits, PaymentResult
 
 
 def test_help_lists_all_supported_commands():
@@ -127,3 +127,33 @@ def test_wechat_start_prints_qr_to_stderr_and_keeps_json_on_stdout(monkeypatch, 
     captured = capsys.readouterr()
     assert json.loads(captured.out)["status"] == "pending"
     assert "QR: weixin://wxpay/bizpayurl?pr=test" in captured.err
+
+
+def test_pay_passes_repeat_policy_and_prints_each_balance_topup_qr(monkeypatch, capsys):
+    class FakeClient:
+        def pay(self, server, service, **kwargs):
+            options = kwargs["rail_options"]
+            assert options["topup_pack"] == "10"
+            assert options["max_topup_attempts"] == 4
+            assert options["topup_poll_interval"] == 0.25
+            options["on_topup_required"]("10", "weixin://pay/topup-1")
+            options["on_topup_required"]("10", "weixin://pay/topup-2")
+            return PaymentResult(
+                success=True, amount=0.01, token="BALANCE", service_id=service,
+                result={"ok": True},
+            )
+
+    shown = []
+    monkeypatch.setattr("moltspay.cli.client_for", lambda args: FakeClient())
+    monkeypatch.setattr("moltspay.cli.print_wechat_qr", shown.append)
+    args = build_parser().parse_args([
+        "pay", "https://provider.test", "ping", "--rail", "balance", "--pack", "10",
+        "--max-topup-attempts", "4", "--topup-poll-interval", "0.25",
+    ])
+
+    assert cmd_pay(args) == 0
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["success"] is True
+    assert captured.err.count("Provider balance top-up required: CNY 10") == 2
+    assert shown == ["weixin://pay/topup-1", "weixin://pay/topup-2"]

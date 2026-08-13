@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterator, Optional, Union
 
 import httpx
 
-from .exceptions import PaymentError
+from .exceptions import InsufficientBalance, PaymentError
 from .models import BuyerBalance, PaymentResult
 
 
@@ -354,7 +354,10 @@ class BalanceClient:
             raise PaymentError(data.get("error", f"Balance top-up failed with HTTP {response.status_code}"))
         return data
 
-    def pay(self, server_url: str, service_id: str, params: Dict[str, Any], amount: float = 0.0, buyer_id: Optional[str] = None) -> PaymentResult:
+    def pay(
+        self, server_url: str, service_id: str, params: Dict[str, Any], amount: float = 0.0,
+        buyer_id: Optional[str] = None, request_id: Optional[str] = None,
+    ) -> PaymentResult:
         buyer = self._buyer(buyer_id)
         body = {"service": service_id, "params": params, "rail": "balance"}
         url = f"{server_url.rstrip('/')}/execute"
@@ -363,7 +366,7 @@ class BalanceClient:
             if initial.is_success:
                 return PaymentResult(success=True, amount=amount, token="BALANCE", service_id=service_id, result=initial.json().get("result", initial.json()))
             raise PaymentError(f"Service error: {initial.status_code} {initial.text}")
-        request_id = str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
         payment_payload: Dict[str, Any] = {"buyer_id": buyer, "request_id": request_id}
         if self.account is not None:
             from eth_account.messages import encode_defunct
@@ -379,7 +382,23 @@ class BalanceClient:
         payment = base64.b64encode(json.dumps(payload).encode()).decode()
         paid = self.http.post(url, json=body, headers={"X-Payment": payment})
         if not paid.is_success:
-            raise PaymentError(f"Balance payment failed: {paid.status_code} {paid.text}")
+            try:
+                error_data = paid.json()
+            except (ValueError, json.JSONDecodeError):
+                error_data = {}
+            error_message = str(error_data.get("error") or paid.text)
+            error_code = str(error_data.get("code") or "").lower()
+            if error_code == "insufficient_balance" or "insufficient_balance" in error_message.lower():
+                details = error_data.get("details") if isinstance(error_data.get("details"), dict) else {}
+                raise InsufficientBalance(
+                    required=details.get("required"),
+                    balance=details.get("balance"),
+                    currency=details.get("currency", "CNY"),
+                    topup_packs=details.get("topupPacks") or details.get("topup_packs"),
+                    message=error_message,
+                    details=details,
+                )
+            raise PaymentError(f"Balance payment failed: {paid.status_code} {error_message}")
         data = paid.json()
         return PaymentResult(
             success=True, amount=amount, token="BALANCE", service_id=service_id,
