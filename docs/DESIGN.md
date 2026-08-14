@@ -252,6 +252,15 @@ Missing CLI, unopened wallet, malformed trade number, rejected, and timeout
 conditions map to dedicated errors. A selected Alipay rail never silently
 falls back to crypto.
 
+The provider configuration separates three key roles. `private_key_path` is
+the application private key used to sign requests, and `app_public_key_path`
+is its matching public key (uploaded to the Alipay Open Platform). The distinct
+`platform_public_key_path` contains Alipay's platform public key and is required
+to verify OpenAPI responses. The legacy `alipay_public_key_path` name remains an
+alias for the platform public key. OpenAPI calls fail closed when the platform
+key or response signature is missing, invalid, or does not cover the exact raw
+response object.
+
 ## 12. Security and persistence
 
 The EVM wallet uses the Node-compatible scrypt plus AES-256-CBC format. Private

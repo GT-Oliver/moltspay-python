@@ -28,6 +28,14 @@
                                     "private_key_path":  "cert/apiclient_key.pem",
                                     "apiv3_key":  "wYa1e3cxyWWkHfSlRG4l8VPbV451288t",
                                     "notify_url":  "https://sr007.com/notify"
+                                },
+                     "alipay":  {
+                                    "seller_id":  "2088641494699428",
+                                    "app_id":  "2021006150642142",
+                                    "seller_name":  "上海超响应数字科技有限公司",
+                                    "service_id_default":  "API_0EA6DC4FC99A4DF7",
+                                    "private_key_path":  "alipay/ALIPAY_PRIVATE_KEY.pem",
+                                    "app_public_key_path":  "alipay/ALIPAY_APP_PUBLIC_KEY.pem"
                                 }
                  },
     "services":  [
@@ -50,6 +58,10 @@
                          "wechat":  {
                                         "price_cny":  "0.01",
                                         "description":  "Local CNY balance test service"
+                                    },
+                         "alipay":  {
+                                        "price_cny":  "0.01",
+                                        "goods_name":  "Local CNY balance test service"
                                     }
                      },
                      {
@@ -71,6 +83,10 @@
                          "wechat":  {
                                         "price_cny":  "1",
                                         "description":  "Local CNY balance test service"
+                                    },
+                         "alipay":  {
+                                        "price_cny":  "1.00",
+                                        "goods_name":  "Local CNY balance test service"
                                     }
                      }
                  ]

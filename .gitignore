@@ -7,6 +7,7 @@ __pycache__/
 
 # Certificates and private keys
 cert/
+alipay/
 *.pem
 *.key
 *.crt
