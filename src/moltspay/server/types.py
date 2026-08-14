@@ -28,9 +28,9 @@ class ServiceConfig(BaseModel):
     function: str
     input: Dict[str, ServiceInput] = Field(default_factory=dict)
     output: Dict[str, Any] = Field(default_factory=dict)
-    alipay: Optional[Dict[str, Any]] = None
     wechat: Optional[Dict[str, Any]] = None
     balance: Optional[Dict[str, Any]] = None
+    alipay: Optional[Dict[str, Any]] = None
 
     @property
     def accepted_currencies(self) -> List[str]:
@@ -54,9 +54,9 @@ class ProviderConfig(BaseModel):
     solana_wallet: Optional[str] = None  # Solana wallet address
     chain: str = "base"  # deprecated, for backward compat
     chains: Optional[List[Any]] = None  # multi-chain support (strings or ChainConfig)
-    alipay: Optional[Dict[str, Any]] = None
     wechat: Optional[Dict[str, Any]] = None
     balance: Optional[Dict[str, Any]] = None
+    alipay: Optional[Dict[str, Any]] = None
     
     def get_chains(self) -> List[ChainConfig]:
         """

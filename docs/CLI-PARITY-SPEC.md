@@ -19,7 +19,6 @@ pay <server> <service> [params]
 balance
 wechat
 services [url]
-alipay <action> [args...]
 validate <path>
 transfer <to> <amount>
 server start <paths...>

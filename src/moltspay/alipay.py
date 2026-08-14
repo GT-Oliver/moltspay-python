@@ -1,332 +1,504 @@
-"""Alipay AI Pay buyer client backed by the official ``alipay-bot`` CLI."""
+"""Buyer-side support for Alipay AI Pay (A402).
+
+The buyer never handles an Alipay credential.  It only persists the minimum
+amount of state needed to resume the official ``alipay-bot`` process.
+"""
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from .exceptions import (
-    AlipayCliNotFound, AlipayPaymentRejected, AlipayPaymentTimeout,
+    AlipayCliFailed,
+    AlipayCliNotFound,
+    AlipayPaymentRejected,
+    AlipayPaymentStateUnknown,
+    AlipayPaymentTimeout,
     AlipayProtocolError,
+    AlipayWalletNotReady,
 )
 
 
-ALIPAY_SCHEME = "alipay-aipay"
 ALIPAY_NETWORK = "alipay"
-TRADE_NO_RE = re.compile(r"(?:tradeNo|trade_no|trade-no)\s*[=:]\s*[\"']?(\d{32})(?!\d)", re.I)
-TRADE_NO_BARE_RE = re.compile(r"\b(\d{32})\b")
-URL_RE = re.compile(r"(?:alipays?://|https?://)[^\s\"'\]`)>」]+", re.I)
+ALIPAY_SCHEME = "a402"
+MAX_HEADER_BYTES = 16 * 1024
+MAX_OUTPUT_BYTES = 256 * 1024
 SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+TRADE_NO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def _iso(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-class AlipayPaymentSession(BaseModel):
-    payment_session_id: str
-    status: Literal["pending", "completed", "rejected", "expired", "failed", "unknown"] = "pending"
-    trade_no: str
-    out_trade_no: str
-    payment_url: Optional[str] = None
-    resource_url: str
-    method: str = "POST"
-    data: Optional[str] = None
-    created_at: str
-    updated_at: str
-    expires_at: str
-    result: Optional[Any] = None
-    last_error: Optional[str] = None
+def encode_a402_json(value: Dict[str, Any]) -> str:
+    """Encode a JSON object as unpadded Base64URL."""
+    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(raw) > MAX_HEADER_BYTES:
+        raise AlipayProtocolError("Alipay header exceeds the maximum size")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def _clean_url(value: str) -> str:
-    return value.rstrip(")]} `>")
-
-
-def parse_trade_no(lines: Sequence[str]) -> Optional[str]:
-    text = "\n".join(lines)
+def decode_a402_json(value: str, *, name: str = "Alipay header") -> Dict[str, Any]:
+    """Decode standard URL-safe Base64 with or without padding."""
+    if not isinstance(value, str) or not value or len(value) > MAX_HEADER_BYTES * 2:
+        raise AlipayProtocolError(f"{name} is missing or too large")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", value):
+        raise AlipayProtocolError(f"Malformed {name}")
     try:
-        data = json.loads(text)
-        for key in ("tradeNo", "trade_no", "out_trade_no"):
-            value = str(data.get(key, ""))
-            if re.fullmatch(r"\d{32}", value):
-                return value
-    except (json.JSONDecodeError, AttributeError):
-        pass
-    match = TRADE_NO_RE.search(text) or TRADE_NO_BARE_RE.search(text)
-    return match.group(1) if match else None
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        if len(raw) > MAX_HEADER_BYTES:
+            raise AlipayProtocolError(f"{name} exceeds the maximum size")
+        data = json.loads(raw.decode("utf-8"))
+    except AlipayProtocolError:
+        raise
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AlipayProtocolError(f"Malformed {name}") from exc
+    if not isinstance(data, dict):
+        raise AlipayProtocolError(f"{name} must contain a JSON object")
+    return data
 
 
-def parse_payment_url(lines: Sequence[str]) -> Optional[str]:
+def _b64url(data: bytes) -> str:
+    """Compatibility helper retained for integrations using the old module."""
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _decode_b64url(value: str) -> Dict[str, Any]:
+    return decode_a402_json(value)
+
+
+def _safe_identifier(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not SAFE_IDENTIFIER_RE.fullmatch(value):
+        raise AlipayProtocolError(f"Invalid {label}")
+    return value
+
+
+class AlipayPaymentSession(BaseModel):
+    """Recoverable local A402 session.
+
+    Sensitive challenge/proof data is deliberately not part of this model.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    payment_session_id: str
+    status: Literal["created", "pending", "processing", "completed", "rejected", "expired", "unknown"] = "created"
+    request_id: str = ""
+    resource_url: str = ""
+    method: str = "POST"
+    request_body: Optional[str] = None
+    data: Optional[str] = None
+    request_headers: Dict[str, str] = Field(default_factory=dict)
+    out_shake_no: Optional[str] = None
+    trade_no: Optional[str] = None
+    out_trade_no: Optional[str] = None
+    payment_url: Optional[str] = None
+    challenge_path: Optional[str] = None
+    intent_summary: str = "Alipay payment"
+    context: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
+    expires_at: str = ""
+    last_error_code: Optional[str] = None
+    last_error: Optional[str] = None
+    result: Optional[Any] = None
+
+
+def _json_objects(lines: Iterable[str]) -> List[Dict[str, Any]]:
+    """Extract complete JSON objects from structured CLI output."""
+    objects: List[Dict[str, Any]] = []
     for line in lines:
-        if "url" in line.lower() or "http" in line.lower():
-            match = URL_RE.search(line)
-            if match:
-                return _clean_url(match.group(0))
+        text = str(line).strip()
+        if not text or len(text.encode("utf-8", "replace")) > MAX_OUTPUT_BYTES:
+            continue
+        try:
+            item = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(item, dict):
+            objects.append(item)
+    return objects
+
+
+def _flatten_cli(lines: Sequence[str]) -> str:
+    return "\n".join(str(line) for line in lines if str(line).strip())[-4000:]
+
+
+def _value(objects: Sequence[Dict[str, Any]], *keys: str) -> Optional[str]:
+    for obj in objects:
+        for key in keys:
+            value = obj.get(key)
+            if isinstance(value, str) and value:
+                return value
+            if isinstance(value, (int, float)):
+                return str(value)
+        for nested_key in ("data", "payment", "result", "details"):
+            nested = obj.get(nested_key)
+            if isinstance(nested, dict):
+                found = _value([nested], *keys)
+                if found:
+                    return found
     return None
 
 
+def parse_alipay_cli_output(lines: Sequence[str]) -> Dict[str, Any]:
+    """Normalize official JSON output while retaining strict text fallbacks."""
+    objects = _json_objects(lines)
+    result: Dict[str, Any] = {}
+    for key, aliases in {
+        "out_shake_no": ("outShakeNo", "out_shake_no"),
+        "trade_no": ("tradeNo", "trade_no", "transactionId"),
+        "out_trade_no": ("outTradeNo", "out_trade_no"),
+        "payment_url": ("paymentUrl", "payment_url", "url"),
+        "status": ("status", "state", "paymentStatus"),
+    }.items():
+        found = _value(objects, *aliases)
+        if found:
+            result[key] = found
+    raw = _flatten_cli(lines)
+    if not result.get("trade_no"):
+        match = re.search(r"(?:交易号|trade[_ -]?no)\s*[:：=]\s*([A-Za-z0-9._-]+)", raw, re.I)
+        if match and TRADE_NO_RE.fullmatch(match.group(1)):
+            result["trade_no"] = match.group(1)
+    status = str(result.get("status", "")).upper()
+    upper = raw.upper()
+    if any(marker in status for marker in ("SUCCESS", "PAID", "COMPLETED", "FULFILLED")) or any(
+        marker in upper for marker in ("TRADE_SUCCESS", "RESOURCE RESPONSE STATUS 200")
+    ):
+        result["normalized_status"] = "completed"
+    elif any(marker in status for marker in ("REJECT", "CANCEL", "CLOSED", "FAIL", "EXPIRE")) or any(
+        marker in upper for marker in ("REJECT", "CANCEL", "CLOSED", "FAIL", "EXPIRE")
+    ):
+        result["normalized_status"] = "rejected"
+    elif any(marker in status for marker in ("PENDING", "WAIT", "PROCESS", "UNPAID")) or any(
+        marker in upper for marker in ("PENDING", "WAIT", "UNPAID", "PROCESS")
+    ):
+        result["normalized_status"] = "pending"
+    else:
+        result["normalized_status"] = "unknown"
+    result["raw"] = raw
+    return result
+
+
+def parse_trade_no(lines: Sequence[str]) -> Optional[str]:
+    return parse_alipay_cli_output(lines).get("trade_no")
+
+
+def parse_payment_url(lines: Sequence[str]) -> Optional[str]:
+    parsed = parse_alipay_cli_output(lines).get("payment_url")
+    if parsed:
+        return parsed.rstrip(")]}> `")
+    match = re.search(r"(?:支付方式|payment\s*(?:url|link)|url)\s*[:：=]\s*((?:https?://|alipays?://)[^\s\"']+)", _flatten_cli(lines), re.I)
+    return match.group(1).rstrip(")]}> `") if match else None
+
+
 def parse_status(lines: Sequence[str]) -> str:
-    raw = "\n".join(lines).strip()
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            if data.get("success") is True or data.get("code") == 200:
-                return "paid"
-            marker = (data["body"] if isinstance(data.get("body"), str) else f"{data.get('errorCode', '')} {data.get('message', '')} {data.get('reason', '')}").upper()
-        else:
-            marker = raw.upper()
-    except json.JSONDecodeError:
-        marker = raw.upper()
-    if re.search(r"TRADE_SUCCESS|TRADE_FINISHED|\"STATUS\"\s*:\s*\"FULFILLED\"|RESOURCE\s+RESPONSE\s+STATUS\s+200", marker):
-        return "paid"
-    if re.search(r"CLOSED|CANCEL|FAIL|REJECT|REFUSE|TIMEOUT|EXPIRE", marker):
-        return "rejected"
-    if re.search(r"UNPAID|WAIT|PENDING|PROCESS|NOTPAY", marker):
-        return "pending"
-    return "unknown"
+    return {"completed": "paid", "rejected": "rejected", "pending": "pending", "unknown": "unknown"}.get(
+        parse_alipay_cli_output(lines).get("normalized_status", "unknown"), "unknown"
+    )
 
 
-class AlipayClient:
-    """Run the same Alipay 402 handshake used by the Node client."""
+class AlipayBuyerClient:
+    """Adapter for the official ``alipay-bot`` executable."""
 
     def __init__(
         self,
-        session_id: Optional[str] = None,
         config_dir: Optional[str] = None,
-        framework: str = "openclaw",
         executable: str = "alipay-bot",
-        runner: Optional[Callable[[Sequence[str]], list[str]]] = None,
+        framework: str = "moltspay",
+        runner: Optional[Callable[[Sequence[str]], Sequence[str]]] = None,
     ):
-        self.session_id = session_id or f"mpay_{uuid.uuid4()}"
         self.config_dir = Path(config_dir).expanduser() if config_dir else Path.home() / ".moltspay"
         self.session_dir = self.config_dir / "alipay-sessions"
-        self.framework = framework
         self.executable = executable
+        self.framework = framework
         self.runner = runner or self._run
 
-    def _run(self, args: Sequence[str]) -> list[str]:
-        if not shutil.which(self.executable):
-            raise AlipayCliNotFound(
-                "alipay-bot was not found. Install it with: npx -y @alipay/agent-payment install-cli"
-            )
+    def _run(self, args: Sequence[str]) -> Sequence[str]:
+        executable = shutil.which(self.executable)
+        if not executable:
+            raise AlipayCliNotFound("alipay-bot was not found; install the official Alipay agent-payment CLI")
         completed = subprocess.run(
-            [self.executable, *args], capture_output=True, text=True, encoding="utf-8",
-            errors="replace", check=False,
+            [executable, *list(args)], shell=False, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False,
         )
-        lines = [line for line in (completed.stdout + "\n" + completed.stderr).splitlines() if line.strip()]
+        output = (completed.stdout + "\n" + completed.stderr).splitlines()
+        if len("\n".join(output).encode("utf-8", "replace")) > MAX_OUTPUT_BYTES:
+            raise AlipayCliFailed("alipay-bot output is too large")
         if completed.returncode != 0:
-            raise AlipayProtocolError("alipay-bot failed: " + "\n".join(lines[-10:]))
-        return lines
+            raise AlipayCliFailed("alipay-bot failed", details={"exitCode": completed.returncode})
+        return output
 
-    def check_wallet(self) -> None:
-        lines = self.runner(["check-wallet"])
-        text = "\n".join(lines).strip()
+    def _save(self, session: AlipayPaymentSession) -> None:
+        _safe_identifier(session.payment_session_id, "payment session ID")
+        self.session_dir.mkdir(parents=True, exist_ok=True)
         try:
-            data = json.loads(text)
-            ready = isinstance(data, dict) and ("code" not in data or int(data["code"]) == 200)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            ready = bool(re.search(r"READY|OPENED|BOUND|SUCCESS|已开通|已绑定", text, re.I))
+            os.chmod(self.session_dir, 0o700)
+        except OSError:
+            pass
+        target = self.session_dir / f"{session.payment_session_id}.json"
+        fd, temporary = tempfile.mkstemp(prefix=f".{session.payment_session_id}.", suffix=".tmp", dir=str(self.session_dir))
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(session.model_dump_json(indent=2))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def _load(self, identifier: str) -> AlipayPaymentSession:
+        _safe_identifier(identifier, "payment identifier")
+        path = self.session_dir / f"{identifier}.json"
+        if path.exists() and not path.is_symlink():
+            return AlipayPaymentSession.model_validate_json(path.read_text(encoding="utf-8"))
+        for item in self.list_sessions():
+            if identifier in {item.trade_no, item.out_trade_no, item.out_shake_no}:
+                return item
+        raise AlipayProtocolError("Alipay payment session was not found")
+
+    def _update(self, session: AlipayPaymentSession, **changes: Any) -> AlipayPaymentSession:
+        updated = session.model_copy(update={**changes, "updated_at": _iso(time.time())})
+        self._save(updated)
+        if updated.status in {"completed", "rejected", "expired"} and updated.challenge_path:
+            try:
+                challenge = Path(updated.challenge_path)
+                if challenge.is_file() and not challenge.is_symlink():
+                    challenge.unlink()
+            except OSError:
+                pass
+        return updated
+
+    def list_sessions(self, *, status: Optional[str] = None, limit: int = 100) -> List[AlipayPaymentSession]:
+        if not self.session_dir.exists():
+            return []
+        items: List[AlipayPaymentSession] = []
+        for path in self.session_dir.glob("*.json"):
+            if path.is_symlink():
+                continue
+            try:
+                item = AlipayPaymentSession.model_validate_json(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if status and item.status != status:
+                continue
+            items.append(self._expire(item))
+        return sorted(items, key=lambda item: item.created_at, reverse=True)[: max(1, min(limit, 100))]
+
+    def _expire(self, session: AlipayPaymentSession) -> AlipayPaymentSession:
+        if session.status in {"completed", "rejected", "expired"}:
+            return session
+        try:
+            expired = datetime.fromisoformat(session.expires_at.replace("Z", "+00:00")).timestamp() <= time.time()
+        except ValueError:
+            expired = True
+        return self._update(session, status="expired", last_error_code="alipay_payment_timeout", last_error="Alipay payment session expired") if expired else session
+
+    def get_session(self, identifier: str) -> AlipayPaymentSession:
+        return self._expire(self._load(identifier))
+
+    def check_wallet(self) -> Dict[str, Any]:
+        try:
+            lines = self.runner(["check-wallet"])
+        except AlipayCliNotFound:
+            raise
+        parsed = parse_alipay_cli_output(list(lines))
+        raw = parsed.get("raw", "").upper()
+        objects = _json_objects(list(lines))
+        structured_ready = any(
+            obj.get("ready") is True or obj.get("success") is True or obj.get("code") in (200, "200") or (obj.get("opened") is True and obj.get("bound") is True)
+            for obj in objects
+        )
+        ready = structured_ready or parsed.get("normalized_status") == "completed" or any(
+            marker in raw for marker in ("READY", "OPENED", "BOUND", "SUCCESS", "已开通", "已绑定")
+        )
         if not ready:
-            raise AlipayProtocolError("Alipay wallet is not opened; run `moltspay alipay apply` and `bind`")
+            raise AlipayWalletNotReady("Alipay AI wallet is not opened or bound")
+        return {"ready": True, "opened": True, "bound": True}
 
     def start_402(
         self,
         resource_url: str,
-        requirement: Dict[str, Any],
-        method: str = "POST",
+        payment_needed: Any = None,
+        *,
+        requirement: Optional[Dict[str, Any]] = None,
         data: Optional[str] = None,
-        intent_summary: Optional[str] = None,
-        timeout: Optional[float] = None,
-        on_payment_pending: Optional[Callable[[Dict[str, str]], None]] = None,
+        request_id: Optional[str] = None,
+        method: str = "POST",
+        request_body: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        intent_summary: str = "Alipay payment",
+        timeout: float = 1800,
+        context: Optional[Dict[str, Any]] = None,
     ) -> AlipayPaymentSession:
-        """Start an Alipay payment and persist enough state to resume it."""
-        extra = requirement.get("extra") or {}
-        payment_needed = str(extra.get("payment_needed_header", ""))
-        if not payment_needed:
-            raise AlipayProtocolError("Alipay requirement missing extra.payment_needed_header")
-        summary = intent_summary or f"Pay {requirement.get('amount', '')} {requirement.get('asset', 'CNY')}"
-        self.runner(["payment-intent", "--session-id", self.session_id, "--intent-summary", summary, "--framework", self.framework])
-        self.check_wallet()
-        challenge_dir = self.config_dir / "alipay"
-        challenge_dir.mkdir(parents=True, exist_ok=True)
-        request_id = str(extra.get("out_trade_no") or uuid.uuid4())
-        challenge_id = request_id if SAFE_IDENTIFIER_RE.fullmatch(request_id) else uuid.uuid4().hex
-        challenge = challenge_dir / f"402_{challenge_id}.txt"
-        challenge.write_text(payment_needed, encoding="utf-8")
-        args = ["402-buyer-pay", "-f", str(challenge), "-r", resource_url, "-s", self.session_id, "-i", summary, "-w", self.framework]
-        if method:
-            args.extend(["-m", method])
-        if data:
-            args.extend(["-d", data])
-        lines = self.runner(args)
-        trade_no = parse_trade_no(lines)
-        if not trade_no:
-            raise AlipayProtocolError("402-buyer-pay did not return a tradeNo")
-        payment_url = parse_payment_url(lines)
-        if on_payment_pending and payment_url:
-            on_payment_pending({"payment_url": payment_url, "trade_no": trade_no})
-        current = time.time()
+        if payment_needed is None and requirement is not None:
+            payment_needed = (requirement.get("extra") or {}).get("payment_needed_header")
+        if data is not None and request_body is None:
+            request_body = data
+        if not isinstance(payment_needed, str) or not payment_needed or len(payment_needed) > MAX_HEADER_BYTES * 2:
+            raise AlipayProtocolError("Payment-Needed is missing or too large")
+        request_id = request_id or f"req_{uuid.uuid4().hex}"
+        _safe_identifier(request_id, "request ID")
+        now = time.time()
         session = AlipayPaymentSession(
-            payment_session_id=f"{self.session_id}_{uuid.uuid4().hex[:12]}",
-            trade_no=trade_no,
-            out_trade_no=request_id,
-            payment_url=payment_url,
-            resource_url=resource_url,
-            method=method,
-            data=data,
-            created_at=_iso(current),
-            updated_at=_iso(current),
-            expires_at=_iso(current + float(timeout or requirement.get("maxTimeoutSeconds", 1800))),
+            payment_session_id=f"mpay_alipay_{uuid.uuid4().hex}", status="pending",
+            request_id=request_id, resource_url=resource_url, method=method.upper(),
+            request_body=request_body, data=request_body, request_headers=headers or {}, intent_summary=intent_summary,
+            context=context or {}, created_at=_iso(now), updated_at=_iso(now), expires_at=_iso(now + timeout),
         )
         self._save(session)
-        return session
-
-    def get_session(self, identifier: str) -> AlipayPaymentSession:
-        """Read persisted state only; this never invokes alipay-bot."""
-        return self._expire_if_needed(self._load(identifier))
+        challenge_dir = self.config_dir / "alipay-challenges"
+        challenge_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(challenge_dir, 0o700)
+        challenge_path = challenge_dir / f"{session.payment_session_id}.needed"
+        fd = os.open(str(challenge_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(payment_needed)
+        except Exception:
+            try:
+                challenge_path.unlink()
+            except OSError:
+                pass
+            raise
+        session = self._update(session, challenge_path=str(challenge_path))
+        try:
+            self.runner([
+                "payment-intent", "--session-id", session.payment_session_id,
+                "--intent-summary", intent_summary, "--framework", self.framework,
+            ])
+            self.check_wallet()
+            args = [
+                "402-buyer-pay", "--file", str(challenge_path), "--resource-url", resource_url,
+                "--resource-type", "http", "--session-id", session.payment_session_id,
+                "--intent-summary", intent_summary, "--framework", self.framework,
+            ]
+            if method:
+                args += ["--method", method.upper()]
+            if request_body is not None:
+                args += ["--data", request_body]
+            for key, value in (headers or {}).items():
+                if key.lower() not in {"payment-proof", "authorization"}:
+                    args += ["--header", f"{key}:{value}"]
+            parsed = parse_alipay_cli_output(list(self.runner(args)))
+        except AlipayWalletNotReady:
+            raise
+        except (AlipayCliNotFound, AlipayCliFailed):
+            raise
+        except Exception as exc:
+            return self._update(session, status="unknown", last_error_code="alipay_payment_state_unknown", last_error="Alipay payment result is unknown")
+        changes: Dict[str, Any] = {}
+        for key in ("out_shake_no", "trade_no", "out_trade_no", "payment_url"):
+            if parsed.get(key):
+                changes[key] = parsed[key]
+        changes["status"] = "completed" if parsed.get("normalized_status") == "completed" else "pending"
+        return self._update(session, **changes)
 
     def resume(self, identifier: str) -> AlipayPaymentSession:
-        """Resume the side-effectful Alipay query/fulfillment command once."""
         session = self.get_session(identifier)
-        if session.status in ("completed", "rejected", "expired", "failed"):
+        if session.status in {"completed", "rejected", "expired"}:
             return session
-        query = [
-            "402-query-payment-status", "-t", session.trade_no,
-            "-r", session.resource_url, "-m", session.method,
-        ]
-        if session.data:
-            query.extend(["-d", session.data])
+        query_args = ["402-query-payment-status"]
+        if session.out_shake_no:
+            query_args += ["--out-shake-no", session.out_shake_no]
+        elif session.trade_no:
+            query_args += ["--trade-no", session.trade_no]
+        else:
+            return self._update(session, status="unknown", last_error_code="alipay_payment_state_unknown", last_error="Alipay session has no recoverable payment number")
+        query_args += ["--resource-url", session.resource_url, "--resource-type", "http"]
+        if session.method:
+            query_args += ["--method", session.method]
+        if session.request_body is not None:
+            query_args += ["--data", session.request_body]
+        for key, value in session.request_headers.items():
+            if key.lower() not in {"payment-proof", "authorization"}:
+                query_args += ["--header", f"{key}:{value}"]
         try:
-            lines = self.runner(query)
-        except Exception as exc:
-            return self._update(session, status="unknown", last_error=f"Alipay resume result is unknown: {exc}")
-        status = parse_status(lines)
+            parsed = parse_alipay_cli_output(list(self.runner(query_args)))
+        except (AlipayCliNotFound, AlipayCliFailed):
+            return self._update(session, status="unknown", last_error_code="alipay_payment_state_unknown", last_error="Alipay payment result is unknown")
+        status = parsed.get("normalized_status")
         if status == "pending":
-            return self._update(session, status="pending", last_error=None)
-        if status == "unknown":
-            return self._update(session, status="unknown", last_error="Alipay returned an unknown payment state")
+            return self._update(session, status="pending", last_error_code=None, last_error=None)
         if status == "rejected":
-            return self._update(session, status="rejected", last_error=f"Alipay payment rejected: {session.trade_no}")
-        body = self._extract_body(lines)
-        try:
-            self.runner(["402-buyer-fulfillment-ack", "-t", session.trade_no])
-        except Exception:
-            pass
-        return self._update(session, status="completed", result=body, last_error=None)
+            return self._update(session, status="rejected", last_error_code="alipay_payment_rejected", last_error="Alipay payment was rejected")
+        if status != "completed":
+            return self._update(session, status="unknown", last_error_code="alipay_payment_state_unknown", last_error="Alipay returned an unknown payment state")
+        result: Any = None
+        objects = _json_objects([parsed.get("raw", "")])
+        if objects:
+            result = objects[-1].get("result", objects[-1].get("data", objects[-1]))
+        return self._update(session, status="completed", result=result, last_error_code=None, last_error=None)
 
-    def pay_402(
-        self,
-        resource_url: str,
-        requirement: Dict[str, Any],
-        method: str = "POST",
-        data: Optional[str] = None,
-        intent_summary: Optional[str] = None,
-        timeout: Optional[float] = None,
-        poll_interval: float = 3.0,
-        on_payment_pending: Optional[Callable[[Dict[str, str]], None]] = None,
-    ) -> Dict[str, Any]:
-        """Backward-compatible blocking wrapper over start/resume."""
-        session = self.start_402(
-            resource_url=resource_url, requirement=requirement, method=method, data=data,
-            intent_summary=intent_summary, timeout=timeout, on_payment_pending=on_payment_pending,
-        )
-        deadline = time.monotonic() + float(timeout or requirement.get("maxTimeoutSeconds", 1800))
-        if data:
-            session.data = data
+    def resume_alipay_payment(self, identifier: str) -> AlipayPaymentSession:
+        """Deprecated compatibility alias."""
+        return self.resume(identifier)
+
+    def status(self, identifier: str) -> AlipayPaymentSession:
+        return self.get_session(identifier)
+
+    def fulfill(self, identifier: str) -> AlipayPaymentSession:
+        return self.resume(identifier)
+
+    def pay_402(self, resource_url: str, requirement: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+        session = self.start_402(resource_url, requirement=requirement, **kwargs)
+        deadline = time.monotonic() + float(kwargs.get("timeout") or requirement.get("maxTimeoutSeconds", 1800))
         while time.monotonic() < deadline:
             session = self.resume(session.payment_session_id)
             if session.status == "completed":
-                return {
-                    "body": session.result,
-                    "payment": {
-                        "trade_no": session.trade_no,
-                        "out_trade_no": session.out_trade_no,
-                        "payment_url": session.payment_url,
-                        "session_id": session.payment_session_id,
-                    },
-                }
+                return {"body": session.result, "payment": {"trade_no": session.trade_no, "out_trade_no": session.out_trade_no, "session_id": session.payment_session_id}}
             if session.status == "rejected":
-                raise AlipayPaymentRejected(session.last_error or f"Alipay payment rejected: {session.trade_no}")
-            if session.status == "failed":
-                raise AlipayProtocolError(session.last_error or "Alipay payment failed")
-            time.sleep(max(0.05, poll_interval))
-        self._update(session, status="expired", last_error=f"Alipay payment timed out: {session.trade_no}")
-        raise AlipayPaymentTimeout(f"Alipay payment timed out: {session.trade_no}")
-
-    def list_sessions(self) -> list[AlipayPaymentSession]:
-        self.session_dir.mkdir(parents=True, exist_ok=True)
-        sessions = []
-        for path in self.session_dir.glob("*.json"):
-            try:
-                sessions.append(self._expire_if_needed(AlipayPaymentSession.model_validate_json(path.read_text(encoding="utf-8"))))
-            except Exception:
-                continue
-        return sorted(sessions, key=lambda item: item.created_at, reverse=True)
-
-    @staticmethod
-    def _validate_identifier(identifier: str) -> None:
-        if not SAFE_IDENTIFIER_RE.fullmatch(identifier):
-            raise AlipayProtocolError("Invalid Alipay payment identifier")
-
-    def _load(self, identifier: str) -> AlipayPaymentSession:
-        self._validate_identifier(identifier)
-        direct = self.session_dir / f"{identifier}.json"
-        if direct.exists():
-            return AlipayPaymentSession.model_validate_json(direct.read_text(encoding="utf-8"))
-        for session in self.list_sessions():
-            if session.trade_no == identifier or session.out_trade_no == identifier:
-                return session
-        raise AlipayProtocolError(f"Alipay payment session not found: {identifier}")
-
-    def _save(self, session: AlipayPaymentSession) -> None:
-        self._validate_identifier(session.payment_session_id)
-        self.session_dir.mkdir(parents=True, exist_ok=True)
-        (self.session_dir / f"{session.payment_session_id}.json").write_text(session.model_dump_json(indent=2), encoding="utf-8")
-
-    def _update(self, session: AlipayPaymentSession, **updates: Any) -> AlipayPaymentSession:
-        next_session = session.model_copy(update={**updates, "updated_at": _iso(time.time())})
-        self._save(next_session)
-        return next_session
-
-    def _expire_if_needed(self, session: AlipayPaymentSession) -> AlipayPaymentSession:
-        if session.status not in ("pending", "unknown"):
-            return session
-        expires = datetime.fromisoformat(session.expires_at.replace("Z", "+00:00")).timestamp()
-        if time.time() < expires:
-            return session
-        return self._update(session, status="expired", last_error=f"Alipay payment expired at {session.expires_at}")
+                raise AlipayPaymentRejected(session.last_error or "Alipay payment was rejected")
+            time.sleep(max(0.05, float(kwargs.get("poll_interval", 3.0))))
+        raise AlipayPaymentTimeout("Alipay payment timed out")
 
     @staticmethod
     def _extract_body(lines: Sequence[str]) -> Any:
-        text = "\n".join(lines).strip()
+        text = _flatten_cli(lines)
         try:
-            data = json.loads(text)
+            value = json.loads(text)
         except json.JSONDecodeError:
-            return text
-        if not isinstance(data, dict):
-            return data
-        resource = data.get("resourceResponse")
-        if resource is None and isinstance(data.get("body"), str):
-            report = data["body"]
-            match = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", report, re.S)
+            match = re.search(r"\{.*\}", text, re.S)
             if not match:
-                return report
+                return text
             try:
-                resource = json.loads(match.group(0))
+                value = json.loads(match.group(0))
             except json.JSONDecodeError:
-                return report
-        if resource is None:
-            resource = data.get("result", data.get("data", data.get("body", data)))
-        if isinstance(resource, dict):
-            resource = resource.get("result", resource.get("data", resource.get("body", resource)))
-        return resource
+                return text
+        if not isinstance(value, dict):
+            return value
+        result = value.get("resourceResponse", value.get("result", value.get("data", value.get("body", value))))
+        if isinstance(result, dict) and set(result) >= {"result"}:
+            result = result["result"]
+        return result
+
+    def close(self) -> None:
+        """The subprocess adapter owns no persistent network connection."""
+        return None
+
+
+AlipayClient = AlipayBuyerClient
+
+__all__ = [
+    "ALIPAY_NETWORK", "ALIPAY_SCHEME", "AlipayBuyerClient", "AlipayClient",
+    "AlipayPaymentSession", "decode_a402_json", "encode_a402_json",
+    "parse_alipay_cli_output", "parse_trade_no", "parse_payment_url", "parse_status",
+]

@@ -14,22 +14,6 @@ class UnsupportedRail(MoltsPayError):
     code = "UNSUPPORTED_RAIL"
 
 
-class AlipayCliNotFound(MoltsPayError):
-    code = "ALIPAY_CLI_NOT_FOUND"
-
-
-class AlipayPaymentTimeout(MoltsPayError):
-    code = "ALIPAY_PAYMENT_TIMEOUT"
-
-
-class AlipayPaymentRejected(MoltsPayError):
-    code = "ALIPAY_PAYMENT_REJECTED"
-
-
-class AlipayProtocolError(MoltsPayError):
-    code = "ALIPAY_PROTOCOL"
-
-
 class WalletError(MoltsPayError):
     """Wallet-related errors."""
     code = "WALLET_ERROR"
@@ -41,6 +25,76 @@ class PaymentError(MoltsPayError):
     def __init__(self, message: str, tx_hash: str = None, details: dict = None):
         super().__init__(message, details=details)
         self.tx_hash = tx_hash
+
+
+class AlipayError(PaymentError):
+    """Base class for stable Alipay A402 errors."""
+
+    code = "alipay_error"
+
+
+class AlipayConfigInvalid(AlipayError):
+    code = "alipay_config_invalid"
+
+
+class AlipayNotConfigured(AlipayError):
+    code = "alipay_not_configured"
+
+
+class AlipayCliNotFound(AlipayError):
+    code = "alipay_cli_not_found"
+
+
+class AlipayCliFailed(AlipayError):
+    code = "alipay_cli_failed"
+
+
+class AlipayWalletNotReady(AlipayError):
+    code = "alipay_wallet_not_ready"
+
+
+class AlipayProtocolError(AlipayError):
+    code = "alipay_challenge_invalid"
+
+
+class AlipayPaymentRejected(AlipayError):
+    code = "alipay_payment_rejected"
+
+
+class AlipayPaymentTimeout(AlipayError):
+    code = "alipay_payment_timeout"
+
+
+class AlipayPaymentStateUnknown(AlipayError):
+    code = "alipay_payment_state_unknown"
+
+
+class AlipayProofMalformed(AlipayError):
+    code = "alipay_proof_malformed"
+
+
+class AlipayProofInactive(AlipayError):
+    code = "alipay_proof_inactive"
+
+
+class AlipayVerifyUnavailable(AlipayError):
+    code = "alipay_verify_unavailable"
+
+
+class AlipayResponseSignatureInvalid(AlipayError):
+    code = "alipay_response_signature_invalid"
+
+
+class AlipayReplayDetected(AlipayError):
+    code = "alipay_replay_detected"
+
+
+class AlipayExecutionInProgress(AlipayError):
+    code = "alipay_execution_in_progress"
+
+
+class InteractiveRailRequiresLifecycle(PaymentError):
+    code = "interactive_rail_requires_lifecycle"
 
 
 class InsufficientBalance(PaymentError):

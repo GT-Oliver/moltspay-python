@@ -1,131 +1,139 @@
-"""Alipay AI Pay server facilitator with RSA2/OpenAPI support."""
+"""Provider-side Alipay AI Pay (A402) facilitator."""
 
 from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import secrets
-from datetime import datetime, timedelta
-from decimal import Decimal
+import time
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
+from ...alipay import decode_a402_json, encode_a402_json
+from ...exceptions import (
+    AlipayConfigInvalid,
+    AlipayProofMalformed,
+    AlipayResponseSignatureInvalid,
+    AlipayVerifyUnavailable,
+)
 from .base import BaseFacilitator, HealthCheckResult, SettleResult, VerifyResult
 
 
 ALIPAY_NETWORK = "alipay"
-ALIPAY_SCHEME = "alipay-aipay"
-SIGNING_FIELDS = ["amount", "currency", "goods_name", "out_trade_no", "pay_before", "resource_id", "seller_id", "service_id"]
+ALIPAY_SCHEME = "a402"
+VERIFY_METHOD = "alipay.aipay.agent.payment.verify"
+FULFILLMENT_METHOD = "alipay.aipay.agent.fulfillment.confirm"
+SIGNING_FIELDS = (
+    "amount", "currency", "goods_name", "out_trade_no", "pay_before",
+    "resource_id", "seller_id", "service_id",
+)
+AMOUNT_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,2})?$")
+SAFE_PATH_RE = re.compile(r"^/?[A-Za-z0-9][A-Za-z0-9._~:/?&=%+\-]{0,511}$")
 
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode().rstrip("=")
-
-
-def _decode_b64url(value: str) -> Dict[str, Any]:
-    return json.loads(base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)))
-
-
-def normalize_cny_amount(value: str) -> str:
-    """Validate a CNY amount and normalize it to two decimal places."""
-    amount = Decimal(str(value))
-    fen = amount * 100
-    if not amount.is_finite() or amount < Decimal("0.01") or fen != fen.to_integral_value():
-        raise ValueError("price_cny must be at least 0.01 with no more than 2 decimal places")
+def normalize_cny_amount(value: Any) -> str:
+    """Validate a CNY amount without accepting exponent/NaN spellings."""
+    text = str(value).strip()
+    if not AMOUNT_RE.fullmatch(text):
+        raise ValueError("price_cny must be a decimal with no more than 2 places")
+    try:
+        amount = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError("invalid CNY amount") from exc
+    if not amount.is_finite() or amount < Decimal("0.01"):
+        raise ValueError("price_cny must be at least 0.01 CNY")
     return f"{amount:.2f}"
 
 
-def verify_alipay_response_signature(
-    signed_content: str,
-    signature: str,
-    platform_public_key_pem: str,
-) -> bool:
-    """Verify an Alipay OpenAPI RSA2 response signature."""
-    try:
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
-        key = serialization.load_pem_public_key(platform_public_key_pem.encode())
-        key.verify(
-            base64.b64decode(signature),
-            signed_content.encode("utf-8"),
-            padding.PKCS1v15(),
-            hashes.SHA256(),
+
+def _read_secure_file(path_value: Any, label: str) -> str:
+    if not isinstance(path_value, str) or not path_value:
+        raise AlipayConfigInvalid(f"{label} path is required")
+    path = Path(path_value).expanduser()
+    try:
+        if not path.is_file() or path.is_symlink() or not os.access(path, os.R_OK):
+            raise AlipayConfigInvalid(f"{label} path is not a readable regular file")
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AlipayConfigInvalid(f"Unable to read {label}") from exc
+
+
+def _load_private_key(pem: str):
+    try:
+        from cryptography.hazmat.primitives import serialization
+        return serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
+    except Exception as exc:
+        raise AlipayConfigInvalid("Alipay private key is invalid") from exc
+
+
+def _load_public_key(pem: str):
+    try:
+        from cryptography.hazmat.primitives import serialization
+        return serialization.load_pem_public_key(pem.encode("utf-8"))
+    except Exception as exc:
+        raise AlipayConfigInvalid("Alipay platform public key is invalid") from exc
+
+
+def verify_alipay_response_signature(signed_content: str, signature: str, platform_public_key_pem: str) -> bool:
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        _load_public_key(platform_public_key_pem).verify(
+            base64.b64decode(signature, validate=True), signed_content.encode("utf-8"),
+            padding.PKCS1v15(), hashes.SHA256(),
         )
         return True
     except Exception:
         return False
 
 
-def _extract_signed_response_content(raw_response: str, response_key: str) -> str:
-    """Return the exact JSON value covered by an Alipay response signature."""
-    match = re.search(rf'"{re.escape(response_key)}"\s*:\s*', raw_response)
+def _extract_signed_response_content(raw: str, response_key: str) -> str:
+    match = re.search(r'"' + re.escape(response_key) + r'"\s*:\s*', raw)
     if not match:
-        raise RuntimeError(f"Alipay API response is missing {response_key}")
+        raise AlipayResponseSignatureInvalid("Alipay response signature wrapper is missing")
     start = match.end()
     try:
-        _, length = json.JSONDecoder().raw_decode(raw_response[start:])
+        _, length = json.JSONDecoder().raw_decode(raw[start:])
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Alipay API returned malformed signed JSON") from exc
-    return raw_response[start:start + length]
-
-
-def _read_key(
-    config: Dict[str, Any],
-    inline_name: str,
-    path_name: str,
-) -> str:
-    inline = config.get(inline_name)
-    if inline:
-        return str(inline)
-    path = config.get(path_name)
-    return Path(path).read_text(encoding="utf-8") if path else ""
-
-
-def _app_key_pair_matches(private_key_pem: str, app_public_key_pem: str) -> bool:
-    try:
-        from cryptography.hazmat.primitives import serialization
-
-        private_key = serialization.load_pem_private_key(private_key_pem.encode(), password=None)
-        expected = private_key.public_key().public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-        actual = serialization.load_pem_public_key(app_public_key_pem.encode()).public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-        return expected == actual
-    except Exception:
-        return False
+        raise AlipayResponseSignatureInvalid("Alipay response wrapper is malformed") from exc
+    return raw[start:start + length]
 
 
 class AlipayFacilitator(BaseFacilitator):
-    def __init__(self, config: Dict[str, Any]):
-        self.config = dict(config)
-        self.private_key_pem = _read_key(self.config, "private_key_pem", "private_key_path")
-        self.app_public_key_pem = _read_key(self.config, "app_public_key_pem", "app_public_key_path")
-        self.platform_public_key_pem = (
-            _read_key(self.config, "platform_public_key_pem", "platform_public_key_path")
-            or _read_key(self.config, "alipay_public_key_pem", "alipay_public_key_path")
+    def __init__(self, config: Dict[str, Any], *, request: Optional[Callable[..., Any]] = None):
+        self.config = dict(config or {})
+        self.app_id = str(self.config.get("app_id", ""))
+        self.seller_id = str(self.config.get("seller_id", ""))
+        self.seller_name = str(self.config.get("seller_name", ""))
+        if not self.app_id or not self.seller_id or not self.seller_name:
+            raise AlipayConfigInvalid("Alipay app_id, seller_id and seller_name are required")
+        private = self.config.get("private_key_pem")
+        self.private_key_pem = str(private) if private else _read_secure_file(self.config.get("private_key_path"), "private key")
+        public = self.config.get("alipay_public_key_pem") or self.config.get("platform_public_key_pem") or self.config.get("public_key_pem")
+        self.platform_public_key_pem = str(public) if public else _read_secure_file(
+            self.config.get("alipay_public_key_path") or self.config.get("platform_public_key_path") or self.config.get("public_key_path"),
+            "Alipay platform public key",
         )
-        # Kept for callers that used the old attribute name. It now has the
-        # standard Alipay meaning: the platform key used for response checks.
-        self.public_key_pem = self.platform_public_key_pem
-        if not self.private_key_pem:
-            raise ValueError("Alipay application private key is required")
-        if self.app_public_key_pem and not _app_key_pair_matches(
-            self.private_key_pem, self.app_public_key_pem,
-        ):
-            raise ValueError("Alipay application public key does not match the private key")
-        self.gateway_url = self.config.get("gateway_url", "https://openapi.alipay.com/gateway.do")
+        self._private_key = _load_private_key(self.private_key_pem)
+        _load_public_key(self.platform_public_key_pem)
+        self.gateway_url = str(self.config.get("gateway_url", "https://openapi.alipay.com/gateway.do"))
+        parsed = httpx.URL(self.gateway_url)
+        if parsed.scheme != "https" and not bool(self.config.get("allow_insecure_gateway")):
+            raise AlipayConfigInvalid("Alipay gateway_url must use HTTPS")
+        self.request = request or httpx.request
 
     @property
     def name(self) -> str:
-        return "alipay"
+        return ALIPAY_NETWORK
 
     @property
     def display_name(self) -> str:
@@ -135,118 +143,174 @@ class AlipayFacilitator(BaseFacilitator):
     def supported_networks(self) -> List[str]:
         return [ALIPAY_NETWORK]
 
-    def _sign(self, message: str) -> str:
-        try:
-            from cryptography.hazmat.primitives import hashes, serialization
-            from cryptography.hazmat.primitives.asymmetric import padding
-        except ImportError as exc:
-            raise RuntimeError("Alipay server support requires: pip install moltspay[fiat]") from exc
-        key = serialization.load_pem_private_key(self.private_key_pem.encode(), password=None)
-        return base64.b64encode(key.sign(message.encode(), padding.PKCS1v15(), hashes.SHA256())).decode()
+    def _sign(self, content: str) -> str:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        return base64.b64encode(self._private_key.sign(content.encode("utf-8"), padding.PKCS1v15(), hashes.SHA256())).decode("ascii")
 
-    def create_payment_requirements(self, service_id: str, price_cny: str, goods_name: str, resource_id: str) -> Dict[str, Any]:
-        price_cny = normalize_cny_amount(price_cny)
-        out_trade_no = "VID" + _b64url(secrets.token_bytes(22))[:29]
-        pay_before = (datetime.now() + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+    def _payment_signing_content(self, fields: Dict[str, str]) -> str:
+        missing = [key for key in SIGNING_FIELDS if not isinstance(fields.get(key), str) or not fields[key]]
+        if missing:
+            raise ValueError("missing Alipay bill fields: " + ",".join(missing))
+        return "&".join(f"{key}={fields[key]}" for key in sorted(SIGNING_FIELDS))
+
+    def create_payment_needed(
+        self, *, out_trade_no: Optional[str], amount: str, goods_name: str, resource_id: str,
+        service_id: str, timeout_seconds: Optional[int] = None, service_id_default: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        amount = normalize_cny_amount(amount)
+        if not isinstance(goods_name, str) or not goods_name.strip() or len(goods_name) > 128:
+            raise ValueError("goods_name must be non-empty and at most 128 characters")
+        if not isinstance(resource_id, str) or not SAFE_PATH_RE.fullmatch(resource_id):
+            raise ValueError("resource_id is invalid")
+        trade = out_trade_no or "MPA" + secrets.token_hex(14).upper()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", trade):
+            raise ValueError("out_trade_no is invalid")
+        service = service_id or service_id_default or self.config.get("service_id_default")
+        if not service:
+            raise ValueError("service_id is required")
+        seconds = int(timeout_seconds or self.config.get("default_timeout_seconds", 1800))
+        if seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        pay_before = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
         fields = {
-            "amount": price_cny, "currency": "CNY", "goods_name": goods_name,
-            "out_trade_no": out_trade_no, "pay_before": pay_before,
-            "resource_id": resource_id, "seller_id": self.config["seller_id"],
-            "service_id": service_id or self.config["service_id_default"],
+            "amount": amount, "currency": "CNY", "goods_name": goods_name.strip(),
+            "out_trade_no": trade, "pay_before": pay_before, "resource_id": resource_id,
+            "seller_id": self.seller_id, "service_id": str(service),
         }
-        signature = self._sign("&".join(f"{key}={fields[key]}" for key in SIGNING_FIELDS))
-        challenge = {
-            "protocol": {
-                "out_trade_no": out_trade_no, "amount": price_cny, "currency": "CNY",
-                "resource_id": resource_id, "pay_before": pay_before,
-                "seller_signature": signature, "seller_sign_type": "RSA2",
-                "seller_unique_id": self.config["seller_id"],
-            },
+        protocol = {**fields, "seller_signature": self._sign(self._payment_signing_content(fields)), "seller_sign_type": "RSA2", "seller_unique_id": self.seller_id}
+        payload = {
+            "protocol": protocol,
             "method": {
-                "seller_name": self.config["seller_name"], "seller_id": self.config["seller_id"],
-                "seller_app_id": self.config["app_id"], "goods_name": goods_name,
-                "seller_unique_id_key": "seller_id", "service_id": fields["service_id"],
+                "seller_name": self.seller_name, "seller_id": self.seller_id,
+                "seller_app_id": self.app_id, "goods_name": goods_name.strip(),
+                "seller_unique_id_key": "seller_id", "service_id": str(service),
             },
         }
-        header = _b64url(json.dumps(challenge, separators=(",", ":"), ensure_ascii=False).encode())
         return {
-            "requirement": {
-                "scheme": ALIPAY_SCHEME, "network": ALIPAY_NETWORK, "asset": "CNY",
-                "amount": price_cny, "payTo": self.config["seller_id"], "maxTimeoutSeconds": 1800,
-                "extra": {"payment_needed_header": header, "out_trade_no": out_trade_no, "pay_before": pay_before, "service_id": fields["service_id"]},
-            },
-            "payment_needed_header": header,
+            "header": encode_a402_json(payload), "payload": payload,
+            "out_trade_no": trade, "amount": amount, "resource_id": resource_id,
+            "pay_before": pay_before, "service_id": str(service), "currency": "CNY",
         }
+
+    def create_payment_requirements(self, service_id: Optional[str] = None, price_cny: Optional[str] = None, goods_name: Optional[str] = None, resource_id: Optional[str] = None, **kwargs: Any) -> Dict[str, Any]:
+        # Positional form is retained for callers of the pre-A402 adapter.
+        if service_id is not None:
+            kwargs.setdefault("service_id", service_id)
+        if price_cny is not None:
+            kwargs.setdefault("amount", price_cny)
+        if goods_name is not None:
+            kwargs.setdefault("goods_name", goods_name)
+        if resource_id is not None:
+            kwargs.setdefault("resource_id", resource_id)
+        if "amount" in kwargs and "out_trade_no" not in kwargs:
+            kwargs.setdefault("out_trade_no", None)
+        bill = self.create_payment_needed(**kwargs)
+        result = {
+            "scheme": ALIPAY_SCHEME, "network": ALIPAY_NETWORK, "asset": "CNY",
+            "amount": bill["amount"], "payTo": self.seller_id,
+            "maxTimeoutSeconds": int(self.config.get("default_timeout_seconds", 1800)),
+            "extra": {"payment_needed_header": bill["header"], "out_trade_no": bill["out_trade_no"], "resource_id": bill["resource_id"], "service_id": bill["service_id"]},
+            "bill": bill,
+        }
+        result["payment_needed_header"] = bill["header"]
+        result["requirement"] = {key: value for key, value in result.items() if key != "requirement"}
+        return result
 
     @staticmethod
-    def _proof(payment_payload: Dict[str, Any]) -> Dict[str, Any]:
-        raw = payment_payload.get("payload")
-        if isinstance(raw, dict):
-            raw = raw.get("paymentProof") or raw.get("proofHeader") or raw.get("payment_proof")
-        if not isinstance(raw, str) or not raw:
-            raise ValueError("Alipay payment payload is missing Payment-Proof")
-        return _decode_b64url(raw)
+    def parse_payment_proof(value: str) -> Dict[str, str]:
+        try:
+            data = decode_a402_json(value, name="Payment-Proof")
+        except Exception as exc:
+            raise AlipayProofMalformed("Payment-Proof is malformed") from exc
+        protocol = data.get("protocol")
+        method = data.get("method")
+        if not isinstance(protocol, dict) or not isinstance(method, dict):
+            raise AlipayProofMalformed("Payment-Proof has invalid sections")
+        values = {"payment_proof": protocol.get("payment_proof"), "trade_no": protocol.get("trade_no"), "client_session": method.get("client_session")}
+        if any(not isinstance(item, str) or not item or len(item) > 512 for item in values.values()):
+            raise AlipayProofMalformed("Payment-Proof has missing or invalid fields")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", values["trade_no"]):
+            raise AlipayProofMalformed("Payment-Proof trade_no is invalid")
+        return values  # type: ignore[return-value]
+
+    def _gateway_signing_content(self, params: Dict[str, str]) -> str:
+        return "&".join(f"{key}={params[key]}" for key in sorted(params) if key != "sign")
+
+    def _call(self, method: str, biz_content: Dict[str, Any]) -> Dict[str, Any]:
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        params: Dict[str, str] = {
+            "app_id": self.app_id, "method": method, "format": "JSON", "charset": "utf-8",
+            "sign_type": "RSA2", "timestamp": timestamp, "version": "1.0",
+            "biz_content": json.dumps(biz_content, ensure_ascii=False, separators=(",", ":")),
+        }
+        params["sign"] = self._sign(self._gateway_signing_content(params))
+        try:
+            response = self.request("POST", self.gateway_url, data=params, timeout=float(self.config.get("api_timeout_seconds", 30)), headers={"Accept": "application/json"})
+            raw = response.text
+            if not response.is_success:
+                raise AlipayVerifyUnavailable("Alipay OpenAPI request failed")
+            data = json.loads(raw)
+        except AlipayVerifyUnavailable:
+            raise
+        except (httpx.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            raise AlipayVerifyUnavailable("Alipay OpenAPI response is unavailable") from exc
+        wrapper = f"{method.replace('.', '_')}_response"
+        response_obj = data.get(wrapper) if isinstance(data, dict) else None
+        if not isinstance(response_obj, dict) or not data.get("sign"):
+            raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is missing signed fields")
+        if not verify_alipay_response_signature(_extract_signed_response_content(raw, wrapper), str(data["sign"]), self.platform_public_key_pem):
+            raise AlipayResponseSignatureInvalid("Alipay OpenAPI response signature is invalid")
+        return response_obj
+
+    def verify_payment(self, proof: Dict[str, str]) -> Dict[str, Any]:
+        return self._openapi(VERIFY_METHOD, proof)
+
+    def confirm_fulfillment(self, trade_no: str) -> Dict[str, Any]:
+        return self._openapi(FULFILLMENT_METHOD, {"trade_no": trade_no})
 
     def _openapi(self, method: str, business: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.platform_public_key_pem:
-            raise RuntimeError(
-                "Alipay platform public key is required to verify OpenAPI responses"
-            )
-        params = {
-            "app_id": self.config["app_id"], "method": method, "format": "JSON",
-            "charset": "utf-8", "sign_type": "RSA2",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "version": "1.0",
-            "biz_content": json.dumps(business, separators=(",", ":"), ensure_ascii=False),
-        }
-        canonical = "&".join(f"{key}={params[key]}" for key in sorted(params) if params[key] not in (None, ""))
-        params["sign"] = self._sign(canonical)
-        response = httpx.post(self.gateway_url, data=params, timeout=30.0)
-        response.raise_for_status()
-        raw_response = response.text
-        data = response.json()
-        wrapper = method.replace(".", "_") + "_response"
-        response_key = wrapper if wrapper in data else "error_response" if "error_response" in data else wrapper
-        signature = data.get("sign")
-        if not isinstance(signature, str) or not signature:
-            raise RuntimeError("Alipay API response is missing sign")
-        signed_content = _extract_signed_response_content(raw_response, response_key)
-        if not verify_alipay_response_signature(
-            signed_content, signature, self.platform_public_key_pem,
-        ):
-            raise RuntimeError("Alipay API response signature verification failed")
-        return data[response_key]
+        """Compatibility name for the signed gateway call."""
+        return self._call(method, business)
 
     async def verify(self, payment_payload: Dict[str, Any], requirements: Dict[str, Any]) -> VerifyResult:
         try:
-            proof = self._proof(payment_payload)
-            protocol, method_data = proof["protocol"], proof["method"]
-            result = self._openapi("alipay.aipay.agent.payment.verify", {
-                "payment_proof": protocol["payment_proof"], "trade_no": protocol["trade_no"],
-                "client_session": method_data["client_session"],
-            })
-            if str(result.get("code")) != "10000":
-                return VerifyResult(valid=False, error=f"alipay verify {result.get('code')}: {result.get('sub_msg') or result.get('msg')}", details=result)
-            return VerifyResult(valid=True, details=result)
-        except Exception as exc:
-            return VerifyResult(valid=False, error=str(exc))
+            raw = payment_payload.get("proof") or payment_payload.get("payment_proof") or payment_payload.get("Payment-Proof")
+            proof = self.parse_payment_proof(raw) if isinstance(raw, str) else payment_payload.get("payload")
+            if not isinstance(proof, dict):
+                raise AlipayProofMalformed("Payment-Proof is missing")
+            response = self.verify_payment(proof)
+            if str(response.get("code")) != "10000" or response.get("active") is not True:
+                return VerifyResult(valid=False, error="alipay_proof_inactive", details={"code": response.get("code")})
+            expected = normalize_cny_amount(requirements["amount"])
+            if normalize_cny_amount(response.get("amount")) != expected:
+                return VerifyResult(valid=False, error="alipay_amount_mismatch", details={"amount": response.get("amount")})
+            if str(response.get("trade_no")) != str(proof.get("trade_no")):
+                return VerifyResult(valid=False, error="alipay_order_mismatch", details={"trade_no": response.get("trade_no")})
+            for key in ("out_trade_no", "resource_id", "trade_no"):
+                expected_value = (requirements.get("extra") or {}).get(key) or requirements.get(key)
+                if expected_value and str(response.get(key)) != str(expected_value):
+                    return VerifyResult(valid=False, error="alipay_order_mismatch" if key == "out_trade_no" else "alipay_resource_mismatch", details={key: response.get(key)})
+            return VerifyResult(valid=True, details={**response, "proof": proof})
+        except (AlipayProofMalformed, AlipayResponseSignatureInvalid, AlipayVerifyUnavailable) as exc:
+            return VerifyResult(valid=False, error=exc.code, details={})
+        except Exception:
+            return VerifyResult(valid=False, error="alipay_verify_unavailable", details={})
 
     async def settle(self, payment_payload: Dict[str, Any], requirements: Dict[str, Any]) -> SettleResult:
-        try:
-            trade_no = self._proof(payment_payload)["protocol"]["trade_no"]
-            result = self._openapi("alipay.aipay.agent.fulfillment.confirm", {"trade_no": trade_no})
-            if str(result.get("code")) != "10000":
-                return SettleResult(success=False, transaction=trade_no, status="fulfillment_failed", error=str(result.get("sub_msg") or result.get("msg")))
-            return SettleResult(success=True, transaction=trade_no, status="fulfilled")
-        except Exception as exc:
-            return SettleResult(success=False, error=str(exc))
+        proof = payment_payload.get("payload") or {}
+        trade_no = proof.get("trade_no") if isinstance(proof, dict) else None
+        if not trade_no:
+            return SettleResult(success=False, error="alipay_proof_malformed")
+        return SettleResult(success=True, transaction=str(trade_no), status="verified")
 
     async def health_check(self) -> HealthCheckResult:
         try:
-            self._sign("health-check")
-            if not self.platform_public_key_pem:
-                raise RuntimeError("Alipay platform public key is not configured")
-            from cryptography.hazmat.primitives import serialization
-            serialization.load_pem_public_key(self.platform_public_key_pem.encode())
+            _load_private_key(self.private_key_pem)
+            _load_public_key(self.platform_public_key_pem)
             return HealthCheckResult(healthy=True)
         except Exception as exc:
-            return HealthCheckResult(healthy=False, error=str(exc))
+            return HealthCheckResult(healthy=False, error="alipay_config_invalid")
+
+
+__all__ = ["AlipayFacilitator", "ALIPAY_NETWORK", "ALIPAY_SCHEME", "normalize_cny_amount", "verify_alipay_response_signature"]

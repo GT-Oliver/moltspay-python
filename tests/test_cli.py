@@ -14,7 +14,7 @@ def test_help_lists_all_supported_commands():
 
     for command in (
         "init", "status", "faucet", "pay", "approve", "services", "fund",
-        "transfer", "config", "balance", "wechat", "alipay", "list", "validate", "server",
+        "transfer", "config", "balance", "wechat", "list", "validate", "server",
     ):
         assert command in help_text
 

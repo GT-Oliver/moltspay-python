@@ -11,7 +11,7 @@ from moltspay import MoltsPay
 
 client = MoltsPay(
     chain="base",
-    rail_preference=["base", "balance", "wechat", "alipay"],
+    rail_preference=["base", "balance", "wechat"],
     buyer_id="buyer-123",
 )
 
@@ -20,7 +20,7 @@ result = client.pay(
     "https://provider.example",
     "service-id",
     payment_params={"prompt": "hello"},
-    rail="balance",  # balance | wechat | alipay; omit for crypto
+    rail="balance",  # balance | wechat; omit for crypto
 )
 ```
 
@@ -50,15 +50,14 @@ Authorization: Bearer <secret>
 ```
 
 WeChat uses Native v3 orders and persists recoverable sessions under
-`~/.moltspay/wechat-sessions`. Alipay uses the official `alipay-bot` CLI on the
-buyer side and RSA2/OpenAPI on the provider side.
+`~/.moltspay/wechat-sessions`.
 
-Provider manifests can add `balance`, `wechat`, and `alipay` to `chains`, plus
+Provider manifests can add `balance` and `wechat` to `chains`, plus
 the corresponding provider and per-service configuration blocks used by the
 Node SDK.
 
 New CLI groups include `services`, `fund`, `transfer`, `config`, `balance`,
-`wechat`, and `alipay`.
+and `wechat`.
 
 ## Deliberate non-parity
 

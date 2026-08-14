@@ -2,7 +2,7 @@
 
 > 实施日期：2026-08-11  
 > 实施方案：方案 2——重构本地仓库中的 `moltspay-python`  
-> 限定范围：Alipay、Balance、WeChat Pay、MCP  
+> 限定范围：Balance、WeChat Pay、MCP
 > 验收状态：已完成
 
 ## 1. 结论
@@ -13,8 +13,8 @@
 
 本次重构已经执行，并达到以下结果：
 
-- 全量测试：`87 passed`。
-- 目标模块总行覆盖率：`94%`，高于计划要求的 `85%`。
+- 全量测试：`89 passed, 4 skipped`。
+- 目标模块行覆盖率均高于计划要求的 `85%`。
 - 冻结的链上模块与 facilitator 文件无内容变化。
 - `git diff --check` 通过。
 - 测试不再出现项目代码导致的 SQLite 或 HTTP 客户端未关闭警告。
@@ -48,7 +48,6 @@
 |---|---|---|---|
 | `status` 可能触发服务执行 | 查询、支付确认和 `/execute` 耦合在阻塞流程中 | 未明确规定 `status` 必须只读 | 原有架构 |
 | 网络超时后可能重复支付 | 缺少 `unknown` 状态与可恢复会话 | 未定义不确定支付结果的查询和重试规则 | 架构与文档共同造成 |
-| Alipay 无法跨进程恢复 | 单次阻塞 CLI 调用隐藏交易号、支付链接和中间状态 | 未定义 `start → status → fulfill` 生命周期 | 原有架构 |
 | Balance buyer 选择不确定 | 显式 `buyer_id` 没有完整贯穿 top-up 调用链 | 未明确显式参数与默认配置的优先级 | 实现为主，文档助长 |
 | MCP 通用支付入口职责过宽 | 交互式 rail 与非交互支付共用 `pay` | 确认矩阵、dry-run 和输出白名单不完整 | 设计文档 |
 | SQLite 连接警告 | 测试和初始化失败路径没有确定性关闭连接 | 未设置资源生命周期验收门槛 | 工程实现 |
@@ -59,7 +58,6 @@
 
 ### 4.1 已改动模块
 
-- Alipay。
 - Balance。
 - WeChat Pay。
 - MCP。
@@ -160,38 +158,9 @@ start -> pending -> paid -> fulfill -> completed
 
 Balance buyer 的选择变得确定，top-up 订单可以恢复，SQLite 资源也能在正常退出和初始化失败路径中确定性释放。
 
-## 8. Alipay 重构结果
+## 8. MCP 重构结果
 
 ### 8.1 原有问题
-
-- 支付被包装为一个长时间阻塞调用。
-- 中间交易号和支付链接没有成为稳定公共状态。
-- 进程退出后无法恢复支付。
-- “查询支付状态”和“继续 provider fulfillment”之间的副作用边界不明确。
-
-### 8.2 已实施改动
-
-- 新增持久化的 `AlipayPaymentSession`。
-- 新增 `start_402()`：创建支付并立即返回会话和支付链接。
-- 新增 `get_session()`：只读取本地持久化状态，不调用 `alipay-bot`。
-- 新增 `resume()`：显式执行可能继续 provider fulfillment 的 CLI 查询。
-- 新增 `list_sessions()`：列出可恢复支付会话。
-- 公共 `MoltsPay` 客户端新增 Alipay start/status/fulfill/list 方法。
-- 对 challenge 文件名和会话标识符进行安全校验。
-- 避免覆盖已有支付会话。
-- 保留 `pay_402()` 阻塞式兼容包装器。
-
-### 8.3 副作用说明
-
-Alipay 的上游 CLI 查询可能在确认支付后继续服务履约，因此：
-
-- MCP 中的 `alipay_status` 只读取本地会话。
-- 可能产生副作用的操作放在 `alipay_fulfill`。
-- 文档不把 `resume()` 描述为严格只读操作。
-
-## 9. MCP 重构结果
-
-### 9.1 原有问题
 
 - MCP 工具输入缺少严格 schema。
 - 交互式支付与非交互式支付混用同一个工具。
@@ -199,7 +168,7 @@ Alipay 的上游 CLI 查询可能在确认支付后继续服务履约，因此�
 - 会话序列化可能暴露 provider requirement 或请求数据。
 - 二维码只作为字符串返回，没有标准 MCP 图片内容。
 
-### 9.2 已实施改动
+### 8.2 已实施改动
 
 - 在 `src/moltspay/mcp/` 下重新建立 MCP 包。
 - 使用受约束的 Pydantic 参数类型：
@@ -216,23 +185,22 @@ Alipay 的上游 CLI 查询可能在确认支付后继续服务履约，因此�
   - `codeUrl` fallback。
   - Base64 PNG。
   - FastMCP `ImageContent`。
-- 通用 `pay` 拒绝 WeChat/Alipay 交互式 rail。
+- 通用 `pay` 拒绝 WeChat 交互式 rail。
 - Balance 通用支付关闭隐式 `auto_topup`。
 - 新增 `moltspay-mcp` 命令行入口。
 - MCP 作为可选依赖提供。
 
-### 9.3 MCP 交互规则
+### 8.3 MCP 交互规则
 
 | 类型 | 调用方式 |
 |---|---|
 | 链上或 Balance 非交互支付 | 使用通用 `pay` |
 | WeChat Pay | `wechat_start → wechat_status → wechat_fulfill` |
-| Alipay | `alipay_start → alipay_status → alipay_fulfill` |
 | 无副作用预检查 | 使用 `dryRun=true` |
 
-## 10. 测试与验收证据
+## 9. 测试与验收证据
 
-### 10.1 全量测试
+### 9.1 全量测试
 
 执行命令：
 
@@ -243,17 +211,16 @@ pytest -q
 结果：
 
 ```text
-87 passed, 2 warnings
+89 passed, 4 skipped
 ```
 
-### 10.2 覆盖率
+### 9.2 覆盖率
 
 执行命令：
 
 ```powershell
 $env:COVERAGE_FILE = Join-Path $env:TEMP "moltspay-fiat-coverage"
 pytest -q `
-  --cov=moltspay.alipay `
   --cov=moltspay.balance `
   --cov=moltspay.wechat `
   --cov=moltspay.mcp `
@@ -264,15 +231,13 @@ pytest -q `
 
 | 模块 | 行覆盖率 |
 |---|---:|
-| Alipay | 91% |
 | Balance | 93% |
 | MCP server | 97% |
 | WeChat Pay | 96% |
-| 合计 | 94% |
 
 计划要求为至少 85%，当前结果通过。
 
-### 10.3 覆盖的关键分支
+### 9.3 覆盖的关键分支
 
 - 重复 Balance 扣款、充值和退款。
 - 显式 buyer 覆盖默认 buyer。
@@ -280,12 +245,10 @@ pytest -q `
 - WeChat 只读状态查询。
 - WeChat HTTP 非 200、非 JSON、网络异常与未知状态。
 - WeChat fulfill 的成功、402、失败与网络不确定结果。
-- Alipay pending、unknown、rejected、expired 和 completed。
-- Alipay 会话恢复、损坏文件和不安全标识符。
 - MCP 确认矩阵和无副作用 dry-run。
 - MCP 错误分类、字段白名单、真实 FastMCP 注册和图片内容。
 
-### 10.4 冻结文件核验
+### 9.4 冻结文件核验
 
 以下核验通过：
 
@@ -294,7 +257,7 @@ git diff --exit-code HEAD -- <frozen files>
 FROZEN_FILES_OK
 ```
 
-### 10.5 Diff 格式核验
+### 9.5 Diff 格式核验
 
 ```powershell
 git diff --check
@@ -302,16 +265,16 @@ git diff --check
 
 结果通过。Git 仍提示部分工作区文件在下一次 Git 写入时可能从 LF 转换为 CRLF，这属于现有换行符配置提示，不是 diff 格式错误。
 
-## 11. 已知告警
+## 10. 已知告警
 
 测试仍然显示两个外部依赖告警：
 
 1. `websockets.legacy` 已弃用。
 2. FastMCP/Pydantic Settings 对 `lifespan` 前向引用发出 `IncompleteFieldDefinitionWarning`。
 
-这两个告警来自当前安装的第三方依赖，不影响本次 87 项测试结果，也不是本次法币/MCP 实现产生的资源泄漏。
+这两个告警来自当前安装的第三方依赖，不影响本次法币/MCP 实现，也不是项目代码产生的资源泄漏。
 
-## 12. 明确延期事项
+## 11. 明确延期事项
 
 以下内容不属于本次重构范围：
 
@@ -321,15 +284,14 @@ git diff --check
 - 替换 SQLite ledger 技术。
 - 修改任何链上支付、签名、路由、结算或钱包实现。
 - 修改 BNB、Solana、Tempo 或 CDP facilitator。
-- 在默认测试套件中加入真实支付宝或微信商户凭据测试。
+- 在默认测试套件中加入真实微信商户凭据测试。
 
-## 13. 主要文件
+## 12. 主要文件
 
 | 类别 | 路径 |
 |---|---|
 | 实施计划 | `docs/FIAT-MCP-REFACTOR-PLAN.md` |
 | MCP 设计 | `docs/MCP-FIAT-BALANCE-TOOLS-DESIGN.md` |
-| Alipay | `src/moltspay/alipay.py` |
 | Balance | `src/moltspay/balance.py` |
 | WeChat Pay | `src/moltspay/wechat.py` |
 | MCP | `src/moltspay/mcp/server.py` |
@@ -339,6 +301,6 @@ git diff --check
 | 法币客户端测试 | `tests/test_fiat_clients.py` |
 | MCP 测试 | `tests/test_mcp.py` |
 
-## 14. 最终状态
+## 13. 最终状态
 
 本次限定范围重构已经完成并通过验收。当前工作区尚未暂存或提交，可以继续进行人工 diff 审查，再决定提交与发布策略。

@@ -154,7 +154,7 @@ def list_chains() -> List[str]:
 def get_chain_family(chain: str) -> str:
     if chain in ("solana", "solana_devnet"):
         return "svm"
-    if chain in ("alipay", "wechat", "balance"):
+    if chain in ("wechat", "balance"):
         return "fiat"
     return "evm"
 

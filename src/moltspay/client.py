@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 import httpx
@@ -12,7 +13,8 @@ import httpx
 from .wallet import Wallet
 from .x402 import X402Client, AsyncX402Client
 from .models import Service, Balance, Limits, PaymentResult, TokenSymbol, FundingResult, FaucetResult, TransferResult, ServicesResponse, BalanceTopupSession
-from .exceptions import InsufficientFunds, LimitExceeded, PaymentError, UnsupportedRail
+from .exceptions import InsufficientFunds, LimitExceeded, PaymentError, UnsupportedRail, AlipayPaymentRejected, AlipayPaymentTimeout, AlipayPaymentStateUnknown
+from .alipay import AlipayBuyerClient, AlipayPaymentSession, decode_a402_json
 from .chains import CHAINS, get_protocol
 
 # ERC20 ABI for balanceOf and allowance
@@ -240,10 +242,14 @@ class MoltsPay:
 
     def create_balance_topup_order(
         self, server_url: str, pack: Optional[str] = None, buyer_id: str = None,
-        context: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None, rail: str = "wechat",
     ) -> Dict[str, Any]:
         """Create and persist a recoverable balance top-up order."""
         buyer = buyer_id or self._buyer_id
+        if rail == "alipay":
+            return self._create_alipay_topup_order(server_url, pack=pack, buyer_id=buyer, context=context)
+        if rail != "wechat":
+            raise UnsupportedRail(f"Unsupported top-up rail: {rail}")
         data = self._get_balance_client().create_topup_order(
             server_url, pack=pack, context=context, buyer_id=buyer
         )
@@ -266,6 +272,41 @@ class MoltsPay:
                 "maxTimeoutSeconds": int(timeout_seconds),
                 "buyerId": session.buyer_id, "status": session.status,
                 "createdAt": session.created_at, "expiresAt": session.expires_at}
+
+    def _create_alipay_topup_order(self, server_url: str, pack: Optional[str], buyer_id: Optional[str], context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not buyer_id:
+            raise PaymentError("Balance top-up requires buyer_id")
+        pack = str(pack or "")
+        request_id = (context or {}).get("request_id") or f"req_{uuid.uuid4().hex}"
+        body = {"buyer_id": buyer_id, "pack": pack, "request_id": request_id, "signer_address": self.get_balance_signer_address()}
+        response = httpx.post(f"{server_url.rstrip('/')}/balance/topup/alipay", json=body, headers={"Accept-Payment-Rail": "alipay", "Idempotency-Key": request_id}, timeout=self._timeout)
+        if response.status_code != 402:
+            data = response.json() if response.content else {}
+            raise PaymentError(str(data.get("error") or "Alipay top-up order failed"))
+        needed = response.headers.get("Payment-Needed")
+        if not needed:
+            raise PaymentError("alipay_payment_needed_missing")
+        decoded = decode_a402_json(needed, name="Payment-Needed")
+        out_trade_no = str((decoded.get("protocol") or {}).get("out_trade_no") or "")
+        if not out_trade_no:
+            raise PaymentError("alipay_challenge_invalid")
+        session = self._get_alipay_client().start_402(
+            f"{server_url.rstrip('/')}/balance/topup/alipay", needed, request_id=request_id,
+            method="POST", request_body=json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+            headers={"Content-Type": "application/json", "Accept-Payment-Rail": "alipay", "Idempotency-Key": request_id},
+            intent_summary=(context or {}).get("intent_summary") or f"为 Provider 余额充值 {pack} CNY",
+            timeout=float((context or {}).get("timeout") or self._timeout or 1800),
+            context={**(context or {}), "kind": "balance_topup", "buyer_id": buyer_id, "pack": pack},
+        )
+        now = time.time()
+        expires_at = session.expires_at
+        topup = BalanceTopupSession(
+            out_trade_no=out_trade_no, buyer_id=buyer_id, pack=pack, server_url=server_url.rstrip("/"),
+            code_url="", rail="alipay", payment_session_id=session.payment_session_id,
+            created_at=session.created_at, expires_at=expires_at, context=context or {},
+        )
+        self._save_balance_topup_session(topup)
+        return {"outTradeNo": out_trade_no, "pack": pack, "rail": "alipay", "paymentSessionId": session.payment_session_id, "status": session.status, "createdAt": topup.created_at, "expiresAt": topup.expires_at}
 
     def _balance_topup_dir(self) -> Path:
         return self._config_dir / "balance-topup-sessions"
@@ -319,6 +360,15 @@ class MoltsPay:
         url = server_url or (session.server_url if session else None)
         if not url:
             return {"credited": False, "reason": f"No server URL for {out_trade_no}: pass server_url or run topup-order first"}
+        if session and session.rail == "alipay" and session.payment_session_id:
+            observed = self.resume_alipay_payment(session.payment_session_id)
+            if observed.status == "completed" and isinstance(observed.result, dict) and observed.result.get("credited"):
+                session.status = "credited"
+                session.tx_id = observed.result.get("tx_id") or observed.result.get("txId")
+                session.balance = observed.result.get("balance")
+                self._save_balance_topup_session(session)
+                return {"credited": True, "balance": session.balance, "txId": session.tx_id, "replayed": observed.result.get("replayed", False)}
+            return {"credited": False, "pending": observed.status in {"pending", "processing", "unknown"}, "reason": observed.last_error}
         data = self._get_balance_client().confirm_topup(url, out_trade_no)
         if data.get("credited") and session:
             session.status = "credited"
@@ -331,10 +381,10 @@ class MoltsPay:
     def topup_balance_pack(
         self, server_url: str, pack: Optional[str] = None, buyer_id: str = None,
         poll_interval: float = 2.0, timeout: Optional[float] = None,
-        on_code_url: Optional[Callable[[str, str], None]] = None,
+        on_code_url: Optional[Callable[[str, str], None]] = None, rail: str = "wechat",
     ) -> Dict[str, Any]:
-        order = self.create_balance_topup_order(server_url, pack=pack, buyer_id=buyer_id)
-        if on_code_url:
+        order = self.create_balance_topup_order(server_url, pack=pack, buyer_id=buyer_id, rail=rail)
+        if on_code_url and order.get("codeUrl"):
             on_code_url(order["pack"], order["codeUrl"])
         deadline = time.time() + float(timeout or order["maxTimeoutSeconds"])
         while time.time() < deadline:
@@ -350,6 +400,11 @@ class MoltsPay:
             self._wechat_client = WechatClient(config_dir=str(self._config_dir), timeout=self._timeout)
         return self._wechat_client
 
+    def _get_alipay_client(self) -> AlipayBuyerClient:
+        if self._alipay_client is None:
+            self._alipay_client = AlipayBuyerClient(config_dir=str(self._config_dir))
+        return self._alipay_client
+
     def _rail_challenge(self, service_url: str, service_id: str, params: Dict[str, Any], rail: str):
         from .x402 import parse_402_response
         url = f"{service_url.rstrip('/')}/execute"
@@ -363,7 +418,7 @@ class MoltsPay:
                 return url, body, None, response
             raise PaymentError(f"Service error: {response.status_code} {response.text}")
         parsed = parse_402_response(response, service_id)
-        aliases = {"wechat": {"wechatpay-native", "wechat"}, "alipay": {"alipay-aipay", "alipay"}}
+        aliases = {"wechat": {"wechatpay-native", "wechat"}}
         requirement = next((item for item in parsed.accepts if item.get("scheme") in aliases.get(rail, {rail}) or item.get("network") == rail), None)
         if not requirement:
             raise UnsupportedRail(f"Server does not offer payment rail: {rail}")
@@ -396,47 +451,76 @@ class MoltsPay:
     def list_wechat_payment_sessions(self):
         return self._get_wechat_client().list_sessions()
 
-    def check_alipay_wallet(self, executable: str = "alipay-bot") -> None:
-        """Check the locally installed Alipay wallet dependency."""
-        return self._get_alipay_client(executable=executable).check_wallet()
-
-    def _get_alipay_client(self, executable: str = "alipay-bot", framework: Optional[str] = None):
-        from .alipay import AlipayClient
-        client = self._alipay_client
-        if client is None or client.executable != executable:
-            client = AlipayClient(
-                config_dir=str(self._config_dir), executable=executable,
-                framework=framework or "openclaw",
-            )
-            self._alipay_client = client
-        elif framework:
-            client.framework = framework
-        return client
+    def check_alipay_wallet(self):
+        return self._get_alipay_client().check_wallet()
 
     def start_alipay_payment(
         self, service_url: str, service_id: str, params: Optional[Dict[str, Any]] = None,
-        framework: str = "openclaw", timeout: float = 1800.0,
-        on_payment_pending: Optional[Callable[[Dict[str, str]], None]] = None,
-    ):
-        """Start an Alipay payment and return a recoverable pending session."""
-        url, body, requirement, response = self._rail_challenge(service_url, service_id, params or {}, "alipay")
-        if requirement is None:
-            raise PaymentError("Service completed without requiring an Alipay payment")
-        return self._get_alipay_client(framework=framework).start_402(
-            resource_url=url, requirement=requirement, data=json.dumps(body), timeout=timeout,
-            on_payment_pending=on_payment_pending,
+        intent_summary: Optional[str] = None, timeout: Optional[float] = None,
+        request_id: Optional[str] = None, **options: Any,
+    ) -> AlipayPaymentSession:
+        """Start a recoverable A402 session from the provider's real 402 response."""
+        body = {"service": service_id, "params": params or {}, "rail": "alipay"}
+        url = f"{service_url.rstrip('/')}/execute"
+        request_id = request_id or str(options.pop("idempotency_key", "")) or f"req_{uuid.uuid4().hex}"
+        response = httpx.post(
+            url, json=body,
+            headers={"Accept-Payment-Rail": "alipay", "Idempotency-Key": request_id},
+            timeout=self._timeout,
+        )
+        if response.status_code != 402:
+            if response.is_success:
+                raise PaymentError("Service completed without requiring an Alipay payment")
+            raise PaymentError(f"Service error: {response.status_code}")
+        payment_needed = response.headers.get("Payment-Needed")
+        if not payment_needed:
+            raise PaymentError("alipay_payment_needed_missing")
+        # Validate encoding before invoking an external payment process.
+        decode_a402_json(payment_needed, name="Payment-Needed")
+        summary = intent_summary or f"购买 {service_id} 服务"
+        return self._get_alipay_client().start_402(
+            url, payment_needed, request_id=request_id, method="POST",
+            request_body=json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+            headers={"Content-Type": "application/json", "Accept-Payment-Rail": "alipay", "Idempotency-Key": request_id},
+            intent_summary=summary, timeout=float(timeout or self._timeout or 1800),
+            context={"server_url": service_url, "service_id": service_id, "params": params or {}},
         )
 
-    def get_alipay_payment_status(self, identifier: str):
-        """Read the locally persisted Alipay session without invoking alipay-bot."""
+    def get_alipay_payment_status(self, identifier: str) -> AlipayPaymentSession:
         return self._get_alipay_client().get_session(identifier)
 
-    def fulfill_alipay_payment(self, identifier: str):
-        """Resume the side-effectful Alipay payment/fulfillment operation once."""
+    def resume_alipay_payment(self, identifier: str) -> AlipayPaymentSession:
         return self._get_alipay_client().resume(identifier)
 
-    def list_alipay_payment_sessions(self):
-        return self._get_alipay_client().list_sessions()
+    def list_alipay_payment_sessions(self, **kwargs: Any) -> List[AlipayPaymentSession]:
+        return self._get_alipay_client().list_sessions(**kwargs)
+
+    def _pay_alipay(self, service_url: str, service_id: str, params: Dict[str, Any], amount: float, **options: Any) -> PaymentResult:
+        session = self.start_alipay_payment(
+            service_url, service_id, params,
+            intent_summary=options.get("intent_summary"), timeout=options.get("timeout"),
+            request_id=options.get("request_id"),
+        )
+        deadline = time.monotonic() + float(options.get("timeout") or self._timeout or 1800)
+        while time.monotonic() < deadline:
+            session = self.resume_alipay_payment(session.payment_session_id)
+            if session.status == "completed":
+                result = session.result
+                if isinstance(result, dict):
+                    result = result.get("result", result.get("data", result))
+                return PaymentResult(
+                    success=True, amount=amount, token="CNY", service_id=service_id, result=result,
+                    network="alipay", facilitator="alipay",
+                    payment={"session_id": session.payment_session_id, "trade_no": session.trade_no, "out_trade_no": session.out_trade_no},
+                )
+            if session.status == "rejected":
+                raise AlipayPaymentRejected(session.last_error or "Alipay payment was rejected", details={"paymentSessionId": session.payment_session_id, "tradeNo": session.trade_no})
+            if session.status == "expired":
+                raise AlipayPaymentTimeout(session.last_error or "Alipay payment timed out", details={"paymentSessionId": session.payment_session_id, "tradeNo": session.trade_no})
+            if session.status == "unknown":
+                raise AlipayPaymentStateUnknown(session.last_error or "Alipay payment state is unknown", details={"paymentSessionId": session.payment_session_id, "tradeNo": session.trade_no})
+            time.sleep(max(0.05, float(options.get("poll_interval", 3.0))))
+        raise AlipayPaymentTimeout("Alipay payment timed out", details={"paymentSessionId": session.payment_session_id, "tradeNo": session.trade_no})
 
     def _pay_wechat(self, service_url: str, service_id: str, params: Dict[str, Any], amount: float, **options: Any) -> PaymentResult:
         session = self.start_wechat_payment(service_url, service_id, params, **{k: v for k, v in options.items() if k in {"timeout", "on_payment_pending"}})
@@ -461,32 +545,6 @@ class MoltsPay:
             payment={"out_trade_no": completed.out_trade_no, "session_id": completed.payment_session_id},
         )
 
-    def _pay_alipay(self, service_url: str, service_id: str, params: Dict[str, Any], amount: float, **options: Any) -> PaymentResult:
-        url, body, requirement, response = self._rail_challenge(service_url, service_id, params, "alipay")
-        if requirement is None:
-            data = response.json()
-            return PaymentResult(success=True, amount=amount, token="CNY", service_id=service_id, result=data.get("result", data))
-        if self._alipay_client is None:
-            from .alipay import AlipayClient
-            self._alipay_client = AlipayClient(
-                config_dir=str(self._config_dir),
-                framework=options.get("framework", "openclaw"),
-            )
-        elif options.get("framework"):
-            self._alipay_client.framework = options["framework"]
-        result = self._alipay_client.pay_402(
-            resource_url=url, requirement=requirement, data=json.dumps(body),
-            intent_summary=options.get("intent_summary"), timeout=options.get("timeout"),
-            poll_interval=float(options.get("poll_interval", 3.0)),
-            on_payment_pending=options.get("on_payment_pending"),
-        )
-        payment = result["payment"]
-        return PaymentResult(
-            success=True, amount=amount, token="CNY", service_id=service_id,
-            result=result["body"], facilitator="alipay", network="alipay",
-            tx_hash=f"alipay:{payment['trade_no']}", payment=payment,
-        )
-    
     def balance(self, chain: str = None) -> Balance:
         """
         Get wallet balance on a specific chain.
@@ -978,7 +1036,7 @@ class MoltsPay:
             raise PaymentError(f"Unsupported token: {token}. Use USDC or USDT.")
         
         # USDT requires gas for on-chain approval (no EIP-2612 support) - EVM only
-        if token == "USDT" and not self._is_solana_chain(chain):
+        if token == "USDT" and selected_rail != "alipay" and not self._is_solana_chain(chain):
             bal = self.balance()
             if bal.native < 0.0001:
                 raise PaymentError(
@@ -1021,7 +1079,7 @@ class MoltsPay:
                     if options.get("topup_mode") == "manual":
                         order = self.create_balance_topup_order(
                             service_url, pack=options.get("topup_pack"), buyer_id=buyer_id,
-                            context={"service": service_id},
+                            context={"service": service_id}, rail=options.get("topup_rail", "wechat"),
                         )
                         if options.get("on_topup_required"):
                             options["on_topup_required"](order["pack"], order["codeUrl"])
@@ -1038,6 +1096,7 @@ class MoltsPay:
                         poll_interval=float(options.get("topup_poll_interval", 2.0)),
                         timeout=options.get("topup_timeout"),
                         on_code_url=options.get("on_topup_required"),
+                        rail=options.get("topup_rail", "wechat"),
                     )
         if selected_rail == "wechat":
             return self._pay_wechat(service_url, service_id, params, service.price, **(rail_options or {}))
@@ -1215,7 +1274,7 @@ class MoltsPay:
     def close(self):
         """Close the client."""
         self._x402.close()
-        for extra_client in (self._balance_client, self._wechat_client):
+        for extra_client in (self._balance_client, self._wechat_client, self._alipay_client):
             if extra_client is not None:
                 extra_client.close()
     
@@ -1431,17 +1490,17 @@ class AsyncMoltsPay:
         import asyncio
         return await asyncio.to_thread(self._get_sync_client().list_balance_transactions, server_url, buyer_id, limit, offset)
 
-    async def create_balance_topup_order(self, server_url: str, pack: str = None, buyer_id: str = None, context: Dict[str, Any] = None):
+    async def create_balance_topup_order(self, server_url: str, pack: str = None, buyer_id: str = None, context: Dict[str, Any] = None, rail: str = "wechat"):
         import asyncio
-        return await asyncio.to_thread(self._get_sync_client().create_balance_topup_order, server_url, pack, buyer_id, context)
+        return await asyncio.to_thread(self._get_sync_client().create_balance_topup_order, server_url, pack, buyer_id, context, rail)
 
     async def confirm_balance_topup(self, out_trade_no: str, server_url: str = None):
         import asyncio
         return await asyncio.to_thread(self._get_sync_client().confirm_balance_topup, out_trade_no, server_url)
 
-    async def topup_balance_pack(self, server_url: str, pack: str = None, buyer_id: str = None, poll_interval: float = 2.0, timeout: float = None):
+    async def topup_balance_pack(self, server_url: str, pack: str = None, buyer_id: str = None, poll_interval: float = 2.0, timeout: float = None, rail: str = "wechat"):
         import asyncio
-        return await asyncio.to_thread(self._get_sync_client().topup_balance_pack, server_url, pack, buyer_id, poll_interval, timeout)
+        return await asyncio.to_thread(self._get_sync_client().topup_balance_pack, server_url, pack, buyer_id, poll_interval, timeout, None, rail)
     
     async def close(self):
         """Close the client."""

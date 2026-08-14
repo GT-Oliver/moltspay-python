@@ -8,7 +8,7 @@ MCP 模块是 `MoltsPay` 公共 API 的适配层，不重新实现钱包、账�
 MCP tool
   -> 输入校验、确认门禁、错误映射、序列化
   -> MoltsPay public method
-  -> x402 / BalanceClient / WechatClient / AlipayClient
+  -> x402 / BalanceClient / WechatClient
   -> Provider API、区块链或第三方支付平台
 ```
 
@@ -43,12 +43,7 @@ MCP 只能通过 `MoltsPay` 公共方法调用业务逻辑，不得直接访问 
 | `moltspay_wechat_fulfill` | `identifier`, `confirmed` | 完成后的会话和服务结果 | `fulfill_wechat_payment()` | 带支付凭证重试 Provider `/execute` |
 | `moltspay_wechat_cancel` | `identifier` | cancelled 会话 | `cancel_wechat_payment()` | 本地取消 |
 | `moltspay_wechat_list` | `status?`, `limit`, `includeExpired` | 微信会话列表 | `list_wechat_payment_sessions()` | 本地只读 |
-| `moltspay_alipay_check_wallet` | 无 | `ready`, `walletStatus` | `check_alipay_wallet()` | 检查服务端配置的 `alipay-bot` |
-| `moltspay_alipay_start` | 服务地址、服务 ID、参数、超时、确认 | 可恢复会话、交易号、支付 URL | `start_alipay_payment()` | 402 → alipay-bot → 保存会话，不轮询 |
-| `moltspay_alipay_status` | `identifier` | 本地支付宝会话 | `get_alipay_payment_status()` | 本地只读，不调用 alipay-bot |
-| `moltspay_alipay_fulfill` | `identifier`, `confirmed` | 更新后的会话和服务结果 | `fulfill_alipay_payment()` | 显式恢复支付/履约一次 |
-| `moltspay_alipay_list` | `limit?` | 本地支付宝会话列表 | `list_alipay_payment_sessions()` | 本地只读 |
-| `moltspay_pay` | `url`, `service`, `params`, `chain?`, `token`, `rail?`, `confirmed` | `PaymentResult` | `client.pay()` | 仅非交互式链上或余额支付；微信/支付宝使用专用工具 |
+| `moltspay_pay` | `url`, `service`, `params`, `chain?`, `token`, `rail?`, `confirmed` | `PaymentResult` | `client.pay()` | 仅非交互式链上或余额支付；微信使用专用工具 |
 | `moltspay_config` | `maxPerTx?`, `maxPerDay?` | 当前配置 | `get_config()` / `update_config()` | 本地配置及消费限额 |
 
 ## 4. MCP registration contract
@@ -396,71 +391,13 @@ Input: `{ "type": "object", "properties": { "status": {"type": "string", "enum":
 `data` is `{ "sessions": [], "limit": 100 }`. Calls
 `list_wechat_payment_sessions()`.
 
-### 4.4 Alipay tools
-
-#### `moltspay_alipay_check_wallet`
-
-Description:
-
-> Check whether the local Alipay wallet dependency is installed, opened, and bound. This tool is read-only and never initiates a payment.
-
-Input: `{ "type": "object", "additionalProperties": false }`
-
-`data` is `{ "ready": true, "executable": "alipay-bot", "walletStatus": "opened_bound" }`.
-Calls `check_alipay_wallet()`.
-
-#### `moltspay_alipay_start`
-
-Description:
-
-> Start a recoverable Alipay AI Pay session and return its trade number and payment URL without polling for completion.
-
-Input:
-
-```json
-{
-  "type": "object",
-  "required": ["serverUrl", "service"],
-  "properties": {
-    "serverUrl": {"type": "string", "format": "uri"},
-    "service": {"type": "string", "minLength": 1},
-    "params": {"$ref": "#/$defs/Params"},
-    "framework": {"type": "string", "minLength": 1, "maxLength": 128, "default": "openclaw", "description": "Framework passed to alipay-bot."},
-    "timeoutSeconds": {"type": "number", "exclusiveMinimum": 0, "default": 1800, "description": "Timeout in seconds; no SDK maximum."},
-    "confirmed": {"$ref": "#/$defs/Confirmed"},
-    "dryRun": {"$ref": "#/$defs/DryRun"}
-  },
-  "additionalProperties": false
-}
-```
-
-`data` is the persisted Alipay session including `paymentSessionId`, `status`,
-`tradeNo`, `outTradeNo`, `paymentUrl`, and expiry fields. Calls
-`start_alipay_payment()`.
-
-#### `moltspay_alipay_status`
-
-Reads a locally persisted Alipay session. It does not invoke `alipay-bot` and
-does not query or execute the provider service. Calls
-`get_alipay_payment_status()`.
-
-#### `moltspay_alipay_fulfill`
-
-Explicitly resumes the side-effectful `alipay-bot` query/fulfillment command
-once. It requires confirmation when enabled and calls
-`fulfill_alipay_payment()`.
-
-#### `moltspay_alipay_list`
-
-Lists locally persisted Alipay sessions and is read-only.
-
-### 4.5 Unified payment and configuration
+### 4.4 Unified payment and configuration
 
 #### `moltspay_pay`
 
 Description:
 
-> Pay for and execute a provider service using a non-interactive on-chain or balance rail. WeChat and Alipay must use their dedicated start/status/fulfill tools. This operation may spend funds.
+> Pay for and execute a provider service using a non-interactive on-chain or balance rail. WeChat must use its dedicated start/status/fulfill tools. This operation may spend funds.
 
 Input:
 
@@ -515,14 +452,10 @@ rail=wechat
   -> 用户扫码
   -> 查询并 fulfill 会话
 
-rail=alipay
-  -> 调用 alipay-bot
-  -> 轮询支付结果
-  -> 带支付结果重试 Provider
 ```
 
 `moltspay_pay` 的返回结构必须保留统一的 `PaymentResult` 字段，并在不同 rail 下通过
-`result` 或 `payment` 携带对应的 `codeUrl`、`outTradeNo`、`tradeNo` 和状态信息。
+`result` 或 `payment` 携带对应的 `codeUrl`、`outTradeNo` 和状态信息。
 
 ## 6. 二维码边界
 

@@ -42,7 +42,7 @@ MoltsPay / AsyncMoltsPay
         +-- wallet.py --------------------- EVM wallet, limits, transfers
         +-- wallet_solana.py -------------- optional Solana keypair
         +-- balance.py -------------------- balance rail client + SQLite ledger
-        +-- wechat.py / alipay.py ---------- fiat rail clients
+        +-- wechat.py ---------------------- fiat rail client
         |
         +-- cli.py ------------------------- command-line adapter
         +-- server/ ------------------------ provider runtime and facilitators
@@ -80,7 +80,6 @@ rail is explicitly selected, it takes precedence over direct crypto payment:
 
 - `balance`: calls the provider's balance API and uses a buyer account.
 - `wechat`: creates or continues a WeChat Native payment session.
-- `alipay`: delegates to the configured Alipay client/provider flow.
 - no rail: performs the protocol flow selected by the chain and the provider's
   402 response.
 
@@ -108,7 +107,7 @@ Protocol-specific behavior:
 
 The provider server mirrors this model. `server.MoltsPayServer` loads skill
 manifests, advertises supported networks, and uses `FacilitatorRegistry` to
-select CDP, BNB, Solana, balance, WeChat, or Alipay settlement behavior.
+select CDP, BNB, Solana, balance, or WeChat settlement behavior.
 
 ## 5. Wallets, limits, and persistence
 
@@ -149,7 +148,7 @@ manifest declares provider identity, wallet/chains, service IDs, prices,
 accepted currencies, input schema, output schema, and the function to execute.
 The server loads one or more skill directories and exposes discovery plus
 paid execution over HTTP. Provider manifests may additionally configure
-`balance`, `wechat`, and `alipay` rails.
+`balance` and `wechat` rails.
 
 ## 8. Verification and testing strategy
 
@@ -231,36 +230,6 @@ at least the required fen amount, and returns the WeChat transaction ID.
 Repeated status and fulfillment operations are safe and must not create a
 second order.
 
-### Alipay AI Pay rail
-
-The `alipay` rail uses scheme `alipay-aipay`. The buyer-side
-`AlipayClient` invokes the official `alipay-bot` CLI; the provider signs the
-challenge with RSA2 and calls the Alipay verify and fulfillment APIs. Amounts
-are CNY yuan. The signed field order is:
-
-```text
-amount, currency, goods_name, out_trade_no,
-pay_before, resource_id, seller_id, service_id
-```
-
-The buyer flow is `payment-intent -> check-wallet -> 402-buyer-pay ->
-402-query-payment-status -> 402-buyer-fulfillment-ack`. It accepts JSON and
-human-readable CLI output, requires a pure 32-digit `tradeNo`, preserves the
-cashier URL, and normalizes paid, pending, and rejected states. The challenge
-is persisted under `~/.moltspay/alipay/402_<request_id>.txt` for recovery.
-Missing CLI, unopened wallet, malformed trade number, rejected, and timeout
-conditions map to dedicated errors. A selected Alipay rail never silently
-falls back to crypto.
-
-The provider configuration separates three key roles. `private_key_path` is
-the application private key used to sign requests, and `app_public_key_path`
-is its matching public key (uploaded to the Alipay Open Platform). The distinct
-`platform_public_key_path` contains Alipay's platform public key and is required
-to verify OpenAPI responses. The legacy `alipay_public_key_path` name remains an
-alias for the platform public key. OpenAPI calls fail closed when the platform
-key or response signature is missing, invalid, or does not cover the exact raw
-response object.
-
 ## 12. Security and persistence
 
 The EVM wallet uses the Node-compatible scrypt plus AES-256-CBC format. Private
@@ -281,7 +250,7 @@ and failure recovery before `pay()` exposes it.
 
 The MCP module is a thin stdio adapter over `MoltsPay` public methods. It owns
 tool schemas, input validation, confirmation gates, error envelopes, and
-serialization; it does not implement x402, ledger, WeChat, Alipay, polling, or
+serialization; it does not implement x402, ledger, WeChat, polling, or
 QR encoding. The source of truth for the detailed mapping is
 [`MCP-FIAT-BALANCE-TOOLS-DESIGN.md`](MCP-FIAT-BALANCE-TOOLS-DESIGN.md).
 
@@ -293,7 +262,7 @@ QR tool is not required for WeChat payment. Balance top-up still returns its
 MCP adapter does not return private keys, signatures, or payment credentials.
 
 The implemented tool groups are wallet/status, balance, WeChat Native,
-Alipay, unified payment, and configuration. A tool must not be documented as
+unified payment, and configuration. A tool must not be documented as
 implemented unless it is registered by `mcp/server.py`; in particular,
 `moltspay_services` requires an explicit implementation before it can be part
 of the supported MCP contract.

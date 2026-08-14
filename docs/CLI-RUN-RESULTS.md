@@ -38,7 +38,6 @@
 | 23 | 使用实际会话 ID执行 `wechat fulfill` | 0 | 成功处理本地过期会话，状态为 `cancelled` |
 | 24 | 使用实际会话 ID执行 `wechat cancel` | 0 | 成功，状态为 `cancelled` |
 | 25 | `moltspay wechat list` | 0 | 成功返回本地微信会话列表 |
-| 26 | `moltspay alipay --help` | 0 | 成功，显示 `action` 和 `args` 参数 |
 | 27 | `moltspay init --help` | 0 | 成功，显示链、配置目录和强制覆盖参数 |
 | 28 | `moltspay pay --help` | 0 | 成功，显示支付、通道、充值和超时参数 |
 | 29 | `moltspay-server --help` | 0 | 成功，显示技能目录、端口和主机参数 |

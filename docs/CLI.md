@@ -37,7 +37,6 @@ pip install "qrcode>=7.4"
 | `limits` | 查看或更新消费限额 | `--chain`、`--max-per-tx`、`--max-per-day` | `moltspay limits --max-per-tx 10 --max-per-day 100` |
 | `balance` | 管理服务方余额账户 | 见下方子命令表 | `moltspay balance query https://provider.example` |
 | `wechat` | 管理微信 Native 支付会话 | 见下方子命令表 | `moltspay wechat list` |
-| `alipay` | 转发命令到官方 `alipay-bot` CLI | `action`、`args...` | `moltspay alipay --help` |
 
 支持的链由当前版本的链配置决定，可通过命令帮助查看：
 
@@ -54,7 +53,7 @@ moltspay pay --help
 | `service` | 服务 ID |
 | `--chain` | 支付链，默认 `base` |
 | `--token` | 支付代币：`USDC` 或 `USDT`，默认 `USDC` |
-| `--rail` | 支付通道：`balance`、`wechat` 或 `alipay` |
+| `--rail` | 支付通道：`balance` 或 `wechat` |
 | `--prompt` | 传给服务的快捷 prompt 参数 |
 | `--params` | JSON 格式的额外服务参数 |
 | `--timeout` | 请求超时时间（秒），默认 `180` |

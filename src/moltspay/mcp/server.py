@@ -7,13 +7,13 @@ import io
 import json
 import os
 import uuid
-from typing import Annotated, Any, Callable, Dict, Literal, Optional
+from typing import Annotated, Any, Callable, Dict, Literal, Optional, Union
 
 import httpx
 from pydantic import BaseModel, Field
 
 from ..client import MoltsPay
-from ..exceptions import MoltsPayError, PaymentError
+from ..exceptions import MoltsPayError, PaymentError, InteractiveRailRequiresLifecycle
 
 
 ServiceId = Annotated[
@@ -61,14 +61,6 @@ TopupPack = Annotated[
         ),
     ),
 ]
-FrameworkName = Annotated[
-    str,
-    Field(
-        min_length=1,
-        max_length=128,
-        description="Framework name passed to alipay-bot; defaults to 'openclaw'; 1-128 characters.",
-    ),
-]
 RequestId = Annotated[
     str,
     Field(
@@ -98,13 +90,21 @@ PaymentToken = Annotated[
     Literal["USDC", "USDT"],
     Field(description="Payment token; USDC or USDT. Defaults to USDC."),
 ]
-PaymentRail = Annotated[
-    Literal["balance"],
-    Field(description="Set to 'balance' for provider balance; omit for an on-chain payment."),
+PaymentRail = Union[
+    Annotated[Literal["balance"], Field(description="Use the provider balance rail.")],
+    Annotated[Literal["alipay"], Field(description="Use the explicit Alipay A402 lifecycle.")],
+]
+AlipayStatus = Annotated[
+    Literal["created", "pending", "processing", "completed", "rejected", "expired", "unknown"],
+    Field(description="Optional Alipay session status filter."),
 ]
 TopupStatus = Annotated[
     Literal["pending", "credited", "expired"],
     Field(description="Optional top-up status filter: pending, credited, or expired."),
+]
+TopupRail = Union[
+    Annotated[Literal["wechat"], Field(description="Use the existing WeChat Native top-up flow.")],
+    Annotated[Literal["alipay"], Field(description="Use the Alipay A402 top-up lifecycle.")],
 ]
 WechatStatus = Annotated[
     Literal["pending", "paid", "completed", "expired", "cancelled", "failed", "unknown"],
@@ -134,6 +134,10 @@ DryRun = Annotated[
 ServiceParams = Annotated[
     Dict[str, Any],
     Field(description="Provider service parameters. Use an empty object when the service takes no parameters."),
+]
+IntentSummary = Annotated[
+    str,
+    Field(min_length=1, max_length=1024, description="Human-readable, non-sensitive reason for the payment."),
 ]
 
 
@@ -205,17 +209,22 @@ def _wechat_session(session: Any) -> Dict[str, Any]:
 
 
 def _alipay_session(session: Any) -> Dict[str, Any]:
+    """Serialize only safe recoverability metadata; never expose proof/challenge."""
     return _camel({
         "payment_session_id": session.payment_session_id,
         "status": session.status,
+        "request_id": session.request_id,
+        "resource_url": session.resource_url,
+        "method": session.method,
+        "out_shake_no": session.out_shake_no,
         "trade_no": session.trade_no,
         "out_trade_no": session.out_trade_no,
-        "payment_url": session.payment_url,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "expires_at": session.expires_at,
-        "result": session.result,
+        "last_error_code": session.last_error_code,
         "last_error": session.last_error,
+        "result": session.result,
     })
 
 
@@ -234,7 +243,7 @@ class MoltsPayMCP:
             code, retryable = "timeout", True
         elif isinstance(exc, MoltsPayError):
             code = str(getattr(exc, "code", "payment_error")).lower()
-            retryable = "timeout" in code
+            retryable = code in {"alipay_verify_unavailable", "alipay_payment_state_unknown", "alipay_execution_in_progress", "alipay_payment_timeout"} or "timeout" in code
         elif isinstance(exc, (ValueError, TypeError)):
             code, retryable = "invalid_request", False
         else:
@@ -294,11 +303,13 @@ class MoltsPayMCP:
     def balance_set_buyer(self, buyerId: BuyerId, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         return self._run(lambda: {"buyerId": buyerId, "config": self.client.update_config(buyer_id=buyerId)}, requestId)
 
-    def balance_topup_order(self, serverUrl: HttpUrl, pack: Optional[TopupPack] = None, buyerId: Optional[BuyerId] = None, confirmed: Confirmed = False, dryRun: DryRun = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
+    def balance_topup_order(self, serverUrl: HttpUrl, pack: Optional[TopupPack] = None, buyerId: Optional[BuyerId] = None, rail: TopupRail = "wechat", confirmed: Confirmed = False, dryRun: DryRun = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         def call():
             if dryRun:
-                return {"intent": "create_balance_topup_order", "serverUrl": serverUrl, "pack": pack, "buyerId": buyerId}
+                return {"intent": "create_balance_topup_order", "serverUrl": serverUrl, "pack": pack, "buyerId": buyerId, "rail": rail}
             self._confirm(confirmed)
+            if rail == "alipay":
+                return self.client.create_balance_topup_order(serverUrl, pack, buyerId, rail="alipay")
             return self.client.create_balance_topup_order(serverUrl, pack, buyerId)
         return self._run(call, requestId)
 
@@ -314,6 +325,12 @@ class MoltsPayMCP:
             if session is None:
                 raise PaymentError(f"Balance top-up session not found: {outTradeNo}")
             return session
+        return self._run(call, requestId)
+
+    def balance_topup_resume(self, outTradeNo: OutTradeNo, confirmed: Confirmed = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
+        def call():
+            self._confirm(confirmed)
+            return self.client.confirm_balance_topup(outTradeNo)
         return self._run(call, requestId)
 
     def balance_topup_list(self, status: Optional[TopupStatus] = None, limit: PageLimit = 100, requestId: Optional[RequestId] = None) -> ToolEnvelope:
@@ -361,33 +378,35 @@ class MoltsPayMCP:
         return self._run(call, requestId)
 
     def alipay_check_wallet(self, requestId: Optional[RequestId] = None) -> ToolEnvelope:
-        return self._run(lambda: (self.client.check_alipay_wallet() or {"ready": True, "walletStatus": "opened_bound"}), requestId)
+        return self._run(self.client.check_alipay_wallet, requestId)
 
-    def alipay_start(self, serverUrl: HttpUrl, service: ServiceId, params: Optional[ServiceParams] = None, framework: FrameworkName = "openclaw", timeoutSeconds: PositiveSeconds = 1800, confirmed: Confirmed = False, dryRun: DryRun = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
+    def alipay_start(self, serverUrl: HttpUrl, service: ServiceId, params: Optional[ServiceParams] = None, intentSummary: Optional[IntentSummary] = None, timeoutSeconds: Optional[PositiveSeconds] = None, confirmed: Confirmed = False, dryRun: DryRun = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         def call():
             if dryRun:
-                return {"intent": "start_alipay_payment", "serverUrl": serverUrl, "service": service, "params": params or {}}
+                return {"intent": "start_alipay_payment", "serverUrl": serverUrl, "service": service, "params": params or {}, "intentSummary": intentSummary, "timeoutSeconds": timeoutSeconds}
             self._confirm(confirmed)
-            return _alipay_session(self.client.start_alipay_payment(serverUrl, service, params or {}, framework, timeoutSeconds))
+            return _alipay_session(self.client.start_alipay_payment(serverUrl, service, params or {}, intent_summary=intentSummary, timeout=timeoutSeconds, request_id=requestId))
         return self._run(call, requestId)
 
     def alipay_status(self, identifier: Identifier, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         return self._run(lambda: _alipay_session(self.client.get_alipay_payment_status(identifier)), requestId)
 
-    def alipay_fulfill(self, identifier: Identifier, confirmed: Confirmed = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
+    def alipay_resume(self, identifier: Identifier, confirmed: Confirmed = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         def call():
             self._confirm(confirmed)
-            return _alipay_session(self.client.fulfill_alipay_payment(identifier))
+            return _alipay_session(self.client.resume_alipay_payment(identifier))
         return self._run(call, requestId)
 
-    def alipay_list(self, limit: PageLimit = 100, requestId: Optional[RequestId] = None) -> ToolEnvelope:
-        return self._run(lambda: {"sessions": [_alipay_session(item) for item in self.client.list_alipay_payment_sessions()[:limit]], "limit": limit}, requestId)
+    def alipay_list(self, status: Optional[AlipayStatus] = None, limit: PageLimit = 100, requestId: Optional[RequestId] = None) -> ToolEnvelope:
+        return self._run(lambda: {"sessions": [_alipay_session(item) for item in self.client.list_alipay_payment_sessions(status=status, limit=limit)], "limit": limit}, requestId)
 
     def pay(self, url: HttpUrl, service: ServiceId, params: ServiceParams, chain: Optional[PaymentChain] = None, token: PaymentToken = "USDC", rail: Optional[PaymentRail] = None, confirmed: Confirmed = False, dryRun: DryRun = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         def call():
             if dryRun:
                 return {"intent": "pay", "url": url, "service": service, "params": params, "chain": chain, "token": token, "rail": rail}
             self._confirm(confirmed)
+            if rail == "alipay":
+                raise InteractiveRailRequiresLifecycle("Interactive Alipay payments require moltspay_alipay_start", details={"tool": "moltspay_alipay_start"})
             if rail not in {None, "balance"}:
                 raise PaymentError(f"Interactive rail '{rail}' requires its start/status/fulfill tools")
             preferences = self.client.get_config().get("railPreference", []) if rail is None else []
@@ -430,6 +449,7 @@ TOOL_DESCRIPTIONS = {
         "confirmation gate is enabled. Returns codeUrl plus a PNG QR image for scanning. This does not itself "
         "confirm or credit the top-up."
     ),
+    "balance_topup_resume": "Resume a locally persisted WeChat or Alipay balance top-up; this may contact the provider and credit the account.",
     "balance_topup_confirm": (
         "Ask the provider to confirm an existing top-up order; a paid order may be credited to the provider "
         "balance and the local session may be updated. outTradeNo is required. serverUrl is optional when the "
@@ -467,35 +487,20 @@ TOOL_DESCRIPTIONS = {
         "List locally persisted WeChat sessions. status may be pending, paid, completed, expired, cancelled, "
         "failed, unknown, or omitted for all. limit is 1-100 (default 100); includeExpired defaults to true."
     ),
-    "alipay_check_wallet": (
-        "Run alipay-bot's read-only wallet check and report whether the configured local Alipay wallet is "
-        "installed, opened, and bound. This never initiates a payment."
-    ),
+    "alipay_check_wallet": "Read-only check of the official Alipay AI wallet readiness; never pays or changes local state.",
     "alipay_start": (
-        "Start an Alipay AI Pay challenge and persist a recoverable session without polling for completion. "
-        "params is optional and defaults to an empty object; framework defaults to openclaw; timeoutSeconds "
-        "must be greater than 0 and defaults to 1800. dryRun=true returns only the intent. confirmed=true is "
-        "required when the MCP confirmation gate is enabled. This invokes alipay-bot and may initiate payment."
+        "Start a recoverable Alipay A402 service payment. This creates an interactive payment session and may "
+        "invoke the official alipay-bot; dryRun=true performs no network, subprocess, or local write."
     ),
-    "alipay_status": (
-        "Read a locally persisted Alipay session without invoking alipay-bot or contacting the provider. "
-        "identifier may be the local session ID, tradeNo, or outTradeNo. Local expiry may be persisted."
-    ),
-    "alipay_fulfill": (
-        "Resume one Alipay payment-status and fulfillment attempt through alipay-bot; it may execute the paid "
-        "provider service and send a fulfillment acknowledgement. identifier may be the local session ID, "
-        "tradeNo, or outTradeNo. confirmed=true is required when the MCP confirmation gate is enabled."
-    ),
-    "alipay_list": (
-        "List locally persisted Alipay sessions. limit is 1-100 (default 100). Does not invoke alipay-bot or "
-        "contact the provider, although local expiry may be persisted."
-    ),
+    "alipay_status": "Read one local Alipay session without contacting Alipay, invoking alipay-bot, or retrying the provider.",
+    "alipay_resume": "Resume an Alipay session; this is side-effectful and may query payment, retry the resource, and confirm fulfillment.",
+    "alipay_list": "List local Alipay sessions without returning payment proofs, wallet credentials, or challenge contents.",
     "pay": (
         "Pay for and execute a provider service using only an on-chain payment or provider balance. params is "
         "required and may be empty. chain may be base, polygon, base_sepolia, bnb, bnb_testnet, "
         "tempo_moderato, solana, or solana_devnet; omission uses the configured default. token is USDC or USDT "
-        "(default USDC). rail may be balance or omitted for on-chain payment. Interactive WeChat and Alipay "
-        "rails are rejected and require dedicated tools. dryRun=true returns only the intent; confirmed=true is "
+        "(default USDC). rail may be balance or omitted for on-chain payment. The interactive WeChat rail is "
+        "rejected and requires dedicated tools. dryRun=true returns only the intent; confirmed=true is "
         "required when the MCP confirmation gate is enabled. This operation may spend funds and execute service. "
         "If it returns insufficient_balance, show error.details.topupPacks plus a validated custom amount, create "
         "and confirm a balance top-up, then retry this tool; repeat while the balance is still insufficient."
@@ -535,12 +540,13 @@ def create_mcp_server(client: Optional[MoltsPay] = None):
                 serverUrl: HttpUrl,
                 pack: Optional[TopupPack] = None,
                 buyerId: Optional[BuyerId] = None,
+                rail: TopupRail = "wechat",
                 confirmed: Confirmed = False,
                 dryRun: DryRun = False,
                 requestId: Optional[RequestId] = None,
             ):
                 result = adapter.balance_topup_order(
-                    serverUrl, pack, buyerId, confirmed, dryRun, requestId
+                    serverUrl, pack, buyerId, rail, confirmed, dryRun, requestId
                 )
                 code_url = result.get("data", {}).get("codeUrl") if result.get("ok") else None
                 return image_result(result, code_url)
@@ -561,6 +567,23 @@ def create_mcp_server(client: Optional[MoltsPay] = None):
 
             wechat_start_tool.__annotations__["return"] = Annotated[CallToolResult, ToolEnvelope]
             handler = wechat_start_tool
+        elif name == "alipay_start":
+            def alipay_start_tool(
+                serverUrl: HttpUrl,
+                service: ServiceId,
+                params: Optional[ServiceParams] = None,
+                intentSummary: Optional[IntentSummary] = None,
+                timeoutSeconds: Optional[PositiveSeconds] = None,
+                confirmed: Confirmed = False,
+                dryRun: DryRun = False,
+                requestId: Optional[RequestId] = None,
+            ):
+                result = adapter.alipay_start(serverUrl, service, params, intentSummary, timeoutSeconds, confirmed, dryRun, requestId)
+                result_text = json.dumps(result, ensure_ascii=False, default=str)
+                return CallToolResult(content=[TextContent(type="text", text=result_text)], structuredContent=result)
+
+            alipay_start_tool.__annotations__["return"] = Annotated[CallToolResult, ToolEnvelope]
+            handler = alipay_start_tool
         else:
             handler = getattr(adapter, name)
         server.tool(name=f"moltspay_{name}", description=description)(handler)

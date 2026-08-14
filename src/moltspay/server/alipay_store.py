@@ -1,0 +1,234 @@
+"""Durable SQLite state for A402 orders and fulfillment acknowledgements."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+import threading
+from datetime import timedelta
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterator, Optional
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def proof_hash(payment_proof: str) -> str:
+    return hashlib.sha256(payment_proof.encode("utf-8")).hexdigest()
+
+
+class AlipayOrderStore:
+    """SQLite-backed order store with database-level replay protection."""
+
+    def __init__(self, db_path: str = "data/alipay-a402.sqlite"):
+        self.db_path = str(db_path)
+        if self.db_path != ":memory:":
+            Path(self.db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.db_path, isolation_level=None, check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
+        self.db.execute("PRAGMA foreign_keys=ON")
+        if self.db_path != ":memory:":
+            self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.executescript("""
+        CREATE TABLE IF NOT EXISTS alipay_orders (
+          out_trade_no TEXT PRIMARY KEY,
+          request_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK(kind IN ('service','balance_topup')),
+          service_id TEXT,
+          buyer_id TEXT,
+          amount_fen INTEGER NOT NULL,
+          currency TEXT NOT NULL DEFAULT 'CNY',
+          resource_id TEXT NOT NULL,
+          goods_name TEXT NOT NULL,
+          pay_before TEXT NOT NULL,
+          trade_no TEXT UNIQUE,
+          proof_hash TEXT UNIQUE,
+          status TEXT NOT NULL,
+          result_json TEXT,
+          error_code TEXT,
+          ledger_tx_id TEXT UNIQUE,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT,
+          UNIQUE(request_id, kind, resource_id)
+        );
+        CREATE TABLE IF NOT EXISTS alipay_fulfillment_outbox (
+          trade_no TEXT PRIMARY KEY,
+          out_trade_no TEXT NOT NULL REFERENCES alipay_orders(out_trade_no),
+          status TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at TEXT NOT NULL,
+          last_error_code TEXT,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_alipay_orders_request ON alipay_orders(request_id, kind, resource_id);
+        """)
+
+    @contextmanager
+    def _transaction(self) -> Iterator[None]:
+        with self._lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    def _row(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        value = dict(row)
+        if value.get("result_json"):
+            try:
+                value["result"] = json.loads(value["result_json"])
+            except json.JSONDecodeError:
+                value["result"] = None
+        value.pop("result_json", None)
+        return value
+
+    def get(self, out_trade_no: str) -> Optional[Dict[str, Any]]:
+        return self._row(self.db.execute("SELECT * FROM alipay_orders WHERE out_trade_no=?", (out_trade_no,)).fetchone())
+
+    def get_by_request(self, request_id: str, kind: str, resource_id: str) -> Optional[Dict[str, Any]]:
+        return self._row(self.db.execute(
+            "SELECT * FROM alipay_orders WHERE request_id=? AND kind=? AND resource_id=?",
+            (request_id, kind, resource_id),
+        ).fetchone())
+
+    def get_by_trade(self, trade_no: str) -> Optional[Dict[str, Any]]:
+        return self._row(self.db.execute("SELECT * FROM alipay_orders WHERE trade_no=?", (trade_no,)).fetchone())
+
+    def get_by_proof_hash(self, digest: str) -> Optional[Dict[str, Any]]:
+        return self._row(self.db.execute("SELECT * FROM alipay_orders WHERE proof_hash=?", (digest,)).fetchone())
+
+    def create_order(self, *, request_id: str, kind: str, amount_fen: int, resource_id: str, goods_name: str,
+                     pay_before: str, service_id: Optional[str] = None, buyer_id: Optional[str] = None,
+                     out_trade_no: Optional[str] = None, currency: str = "CNY") -> Dict[str, Any]:
+        if kind not in {"service", "balance_topup"} or amount_fen <= 0:
+            raise ValueError("invalid Alipay order")
+        existing = self.get_by_request(request_id, kind, resource_id)
+        if existing:
+            return existing
+        trade = out_trade_no or ("MPA" if kind == "service" else "MPT") + uuid.uuid4().hex[:26].upper()
+        now = utc_now()
+        with self._transaction():
+            self.db.execute(
+                """INSERT INTO alipay_orders
+                (out_trade_no,request_id,kind,service_id,buyer_id,amount_fen,currency,resource_id,goods_name,pay_before,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?, ?, ?)""",
+                (trade, request_id, kind, service_id, buyer_id, amount_fen, currency, resource_id, goods_name, pay_before, "offered", now, now),
+            )
+        return self.get(trade) or {}
+
+    def claim_execution(self, out_trade_no: str, *, trade_no: str, digest: str, resource_id: str) -> Dict[str, Any]:
+        """Bind proof/trade and atomically acquire the one execution slot."""
+        now = utc_now()
+        with self._transaction():
+            row = self.db.execute("SELECT * FROM alipay_orders WHERE out_trade_no=?", (out_trade_no,)).fetchone()
+            if row is None:
+                return {"state": "not_found"}
+            if row["resource_id"] != resource_id:
+                return {"state": "resource_mismatch", "order": dict(row)}
+            if row["trade_no"] and row["trade_no"] != trade_no:
+                return {"state": "replay", "order": dict(row)}
+            other = self.db.execute("SELECT * FROM alipay_orders WHERE trade_no=? AND out_trade_no<>?", (trade_no, out_trade_no)).fetchone()
+            if other is not None:
+                return {"state": "replay", "order": dict(other)}
+            if row["proof_hash"] and row["proof_hash"] != digest:
+                return {"state": "replay", "order": dict(row)}
+            if row["pay_before"]:
+                try:
+                    expiry = datetime.fromisoformat(row["pay_before"].replace("Z", "+00:00"))
+                    if expiry.tzinfo is None or expiry <= datetime.now(timezone.utc):
+                        self.db.execute("UPDATE alipay_orders SET status='expired',updated_at=? WHERE out_trade_no=?", (now, out_trade_no))
+                        return {"state": "expired", "order": self.get(out_trade_no)}
+                except ValueError:
+                    return {"state": "rejected", "order": self._row(row)}
+            if row["status"] == "completed":
+                return {"state": "completed", "order": self._row(row)}
+            if row["status"] == "executing":
+                return {"state": "executing", "order": self._row(row)}
+            if row["status"] not in {"offered", "verified", "unknown"}:
+                return {"state": "rejected", "order": self._row(row)}
+            self.db.execute(
+                "UPDATE alipay_orders SET trade_no=?,proof_hash=?,status='executing',updated_at=? WHERE out_trade_no=?",
+                (trade_no, digest, now, out_trade_no),
+            )
+            return {"state": "claimed", "order": self.get(out_trade_no)}
+
+    def mark_verified(self, out_trade_no: str, trade_no: str, digest: str) -> None:
+        with self._transaction():
+            self.db.execute("UPDATE alipay_orders SET trade_no=?,proof_hash=?,status='verified',updated_at=? WHERE out_trade_no=? AND status='offered'", (trade_no, digest, utc_now(), out_trade_no))
+
+    def complete(self, out_trade_no: str, result: Any, *, ledger_tx_id: Optional[str] = None) -> Dict[str, Any]:
+        now = utc_now()
+        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        with self._transaction():
+            row = self.db.execute("SELECT trade_no,status FROM alipay_orders WHERE out_trade_no=?", (out_trade_no,)).fetchone()
+            if not row:
+                raise KeyError("Alipay order not found")
+            if row["status"] != "completed":
+                self.db.execute("UPDATE alipay_orders SET status='completed',result_json=?,ledger_tx_id=COALESCE(?,ledger_tx_id),updated_at=?,completed_at=? WHERE out_trade_no=?", (encoded, ledger_tx_id, now, now, out_trade_no))
+            trade_no = row["trade_no"]
+            if trade_no:
+                self.db.execute("INSERT OR IGNORE INTO alipay_fulfillment_outbox(trade_no,out_trade_no,status,next_attempt_at,created_at,updated_at) VALUES(?,?, 'pending', ?, ?, ?)", (trade_no, out_trade_no, now, now, now))
+        return self.get(out_trade_no) or {}
+
+    def fail_delivery(self, out_trade_no: str, error_code: str, result: Any = None) -> Dict[str, Any]:
+        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")) if result is not None else None
+        with self._transaction():
+            self.db.execute("UPDATE alipay_orders SET status='delivery_failed',error_code=?,result_json=?,updated_at=? WHERE out_trade_no=?", (error_code, encoded, utc_now(), out_trade_no))
+        return self.get(out_trade_no) or {}
+
+    def list_outbox(self, limit: int = 100) -> list[Dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM alipay_fulfillment_outbox WHERE status IN ('pending','retry_wait') AND next_attempt_at<=? ORDER BY next_attempt_at LIMIT ?", (utc_now(), max(1, min(limit, 1000)))).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_outbox(self, limit: int = 100) -> list[Dict[str, Any]]:
+        """Atomically lease due outbox rows for one worker."""
+        claimed: list[Dict[str, Any]] = []
+        with self._transaction():
+            rows = self.db.execute("SELECT * FROM alipay_fulfillment_outbox WHERE status IN ('pending','retry_wait') AND next_attempt_at<=? ORDER BY next_attempt_at LIMIT ?", (utc_now(), max(1, min(limit, 1000)))).fetchall()
+            for row in rows:
+                changed = self.db.execute("UPDATE alipay_fulfillment_outbox SET status='sending',updated_at=? WHERE trade_no=? AND status IN ('pending','retry_wait')", (utc_now(), row["trade_no"])).rowcount
+                if changed:
+                    claimed.append(dict(row))
+        return claimed
+
+    def run_fulfillment_once(self, confirm: Any, *, retry_limit: int = 12) -> int:
+        processed = 0
+        for row in self.claim_outbox():
+            processed += 1
+            try:
+                confirm(row["trade_no"])
+            except Exception:
+                attempts = int(row.get("attempt_count", 0)) + 1
+                if attempts >= retry_limit:
+                    self.mark_outbox(row["trade_no"], "exhausted", error_code="alipay_fulfillment_exhausted", error="fulfillment confirmation failed")
+                else:
+                    delay = min(3600, 2 ** min(attempts, 10))
+                    next_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(timespec="seconds")
+                    self.mark_outbox(row["trade_no"], "retry_wait", error_code="alipay_fulfillment_pending", error="fulfillment confirmation failed", next_attempt_at=next_at)
+            else:
+                self.mark_outbox(row["trade_no"], "confirmed")
+        return processed
+
+    def mark_outbox(self, trade_no: str, status: str, *, error_code: Optional[str] = None, error: Optional[str] = None, next_attempt_at: Optional[str] = None) -> None:
+        with self._transaction():
+            self.db.execute("UPDATE alipay_fulfillment_outbox SET status=?,attempt_count=attempt_count+1,last_error_code=?,last_error=?,next_attempt_at=COALESCE(?,next_attempt_at),updated_at=? WHERE trade_no=?", (status, error_code, error, next_attempt_at or utc_now(), utc_now(), trade_no))
+
+    def close(self) -> None:
+        self.db.close()
+
+
+__all__ = ["AlipayOrderStore", "proof_hash"]

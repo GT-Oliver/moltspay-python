@@ -81,29 +81,6 @@ class FakeClient:
         expired.status = "expired"
         return [pending, expired]
 
-    def start_alipay_payment(self, *args):
-        self.calls.append(("alipay_start", *args))
-        return SimpleNamespace(
-            payment_session_id="mpay_1", status="pending", trade_no="1" * 32,
-            out_trade_no="ORDER2", payment_url="https://pay.test/2", created_at="now",
-            updated_at="now", expires_at="later", result=None, last_error=None,
-            data="sensitive params", resource_url="https://provider/execute",
-        )
-
-    def check_alipay_wallet(self):
-        self.calls.append(("alipay_wallet",))
-
-    def get_alipay_payment_status(self, identifier):
-        return self.start_alipay_payment()
-
-    def fulfill_alipay_payment(self, identifier):
-        session = self.start_alipay_payment()
-        session.status = "completed"
-        return session
-
-    def list_alipay_payment_sessions(self):
-        return [self.start_alipay_payment(), self.start_alipay_payment()]
-
     def pay(self, *args, **kwargs):
         self.calls.append(("pay", args, kwargs))
         return {"success": True}
@@ -162,7 +139,6 @@ def test_fastmcp_registration_exposes_constrained_tools():
     by_name = {tool.name: tool for tool in tools}
 
     assert "moltspay_wechat_start" in by_name
-    assert "moltspay_alipay_start" in by_name
     schema = by_name["moltspay_balance_transactions"].inputSchema
     assert schema["properties"]["limit"]["maximum"] == 100
     assert schema["properties"]["offset"]["minimum"] == 0
@@ -236,10 +212,6 @@ def test_fastmcp_registration_documents_optional_parameters_options_and_ranges()
     assert topup["pack"]["anyOf"][0]["maxLength"] == 64
     assert "pattern" in topup["pack"]["anyOf"][0]
 
-    alipay = by_name["moltspay_alipay_start"].inputSchema["properties"]
-    assert alipay["timeoutSeconds"]["exclusiveMinimum"] == 0
-    assert alipay["timeoutSeconds"]["default"] == 1800
-
     wechat_list = by_name["moltspay_wechat_list"].inputSchema["properties"]
     assert wechat_list["status"]["anyOf"][0]["enum"] == [
         "pending", "paid", "completed", "expired", "cancelled", "failed", "unknown",
@@ -297,13 +269,6 @@ def test_adapter_exposes_all_read_and_lifecycle_paths(monkeypatch):
     assert adapter.wechat_fulfill("WX1", confirmed=True)["data"]["status"] == "completed"
     assert adapter.wechat_cancel("WX1")["data"]["status"] == "cancelled"
     assert len(adapter.wechat_list(includeExpired=False)["data"]["sessions"]) == 1
-
-    assert adapter.alipay_check_wallet()["data"]["ready"] is True
-    assert adapter.alipay_start("https://provider.test", "svc", dryRun=True)["data"]["intent"] == "start_alipay_payment"
-    assert adapter.alipay_start("https://provider.test", "svc", confirmed=True)["ok"]
-    assert adapter.alipay_status("ORDER2")["ok"]
-    assert adapter.alipay_fulfill("ORDER2", confirmed=True)["data"]["status"] == "completed"
-    assert len(adapter.alipay_list(limit=1)["data"]["sessions"]) == 1
 
     assert adapter.pay("https://provider.test", "svc", {}, dryRun=True)["data"]["intent"] == "pay"
     assert adapter.pay("https://provider.test", "svc", {}, rail="balance", confirmed=True)["ok"]

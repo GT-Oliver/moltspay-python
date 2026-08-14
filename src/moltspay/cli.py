@@ -11,6 +11,7 @@ from . import __version__
 from .chains import CHAINS, is_testnet, list_chains
 from .client import MoltsPay
 from .wallet import DEFAULT_WALLET_PATH, Wallet
+from .exceptions import MoltsPayError
 
 DEFAULT_CONFIG_DIR = DEFAULT_WALLET_PATH.parent
 
@@ -144,11 +145,31 @@ def cmd_pay(args) -> int:
             "auto_topup": not getattr(args, "no_auto_topup", False),
             "max_topup_attempts": getattr(args, "max_topup_attempts", 10),
             "topup_poll_interval": getattr(args, "topup_poll_interval", 2.0),
+            "topup_rail": getattr(args, "topup_rail", "wechat"),
             "on_topup_required": show_topup,
+            "intent_summary": getattr(args, "intent_summary", None),
+            "timeout": getattr(args, "timeout", None),
+            "poll_interval": getattr(args, "poll_interval", 3.0),
         },
     )
     output(result)
     return 0 if result.success else 1
+
+
+def cmd_alipay(args) -> int:
+    client = client_for(args)
+    command = args.alipay_command
+    if command == "check-wallet":
+        output(client.check_alipay_wallet())
+    elif command == "status":
+        output(client.get_alipay_payment_status(args.identifier))
+    elif command == "resume":
+        session = client.resume_alipay_payment(args.identifier)
+        output(session)
+        return 0 if session.status in {"completed", "pending", "processing"} else 1
+    elif command == "list":
+        output(client.list_alipay_payment_sessions(limit=args.limit))
+    return 0
 
 
 def cmd_approve(args) -> int:
@@ -275,9 +296,9 @@ def cmd_balance(args) -> int:
                                     tx_hash=args.tx_hash, chain=args.chain,
                                     trade_no=args.trade_no, out_trade_no=args.out_trade_no))
     elif args.balance_command == "topup-order":
-        result = client.create_balance_topup_order(args.server, pack=args.pack, buyer_id=args.buyer)
+        result = client.create_balance_topup_order(args.server, pack=args.pack, buyer_id=args.buyer, rail=getattr(args, "rail", "wechat"))
         output({"status": "topup_required", "out_trade_no": result["outTradeNo"],
-                "code_url": result["codeUrl"], "pack": result["pack"], "server_url": args.server})
+                "code_url": result.get("codeUrl"), "payment_session_id": result.get("paymentSessionId"), "rail": result.get("rail", "wechat"), "pack": result["pack"], "server_url": args.server})
     elif args.balance_command == "topup-confirm":
         output(client.confirm_balance_topup(args.id, server_url=getattr(args, "server", None)))
     elif args.balance_command == "topup-status":
@@ -285,7 +306,7 @@ def cmd_balance(args) -> int:
     elif args.balance_command == "topup-list":
         output(client.list_balance_topup_sessions())
     elif args.balance_command == "topup-pack":
-        output(client.topup_balance_pack(args.server, pack=args.pack, buyer_id=args.buyer))
+        output(client.topup_balance_pack(args.server, pack=args.pack, buyer_id=args.buyer, rail=getattr(args, "rail", "wechat")))
     return 0
 
 
@@ -310,12 +331,6 @@ def cmd_wechat(args) -> int:
         output(client.cancel_wechat_payment(args.identifier))
     elif args.wechat_command == "list":
         output([item.model_dump() for item in client.list_wechat_payment_sessions()])
-    return 0
-
-
-def cmd_alipay(args) -> int:
-    from .alipay import AlipayClient
-    print("\n".join(AlipayClient().runner([args.action, *args.args])))
     return 0
 
 
@@ -362,6 +377,10 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--no-auto-topup", action="store_true")
     command.add_argument("--max-topup-attempts", type=int, default=10)
     command.add_argument("--topup-poll-interval", type=float, default=2.0)
+    command.add_argument("--topup-rail", choices=["wechat", "alipay"], default="wechat")
+    command.add_argument("--intent-summary", help="Human-readable purpose passed to the official Alipay CLI")
+    command.add_argument("--timeout", type=float, help="Maximum Alipay interaction time in seconds")
+    command.add_argument("--poll-interval", type=float, default=3.0, help="Alipay resume polling interval")
     command.add_argument("--config-dir", default=config_default)
     command.add_argument("--json", action="store_true")
 
@@ -440,6 +459,7 @@ def build_parser() -> argparse.ArgumentParser:
     child.add_argument("server")
     child.add_argument("--pack")
     child.add_argument("--buyer")
+    child.add_argument("--rail", choices=["wechat", "alipay"], default="wechat")
     child.add_argument("--config-dir", default=config_default)
     child.add_argument("--json", action="store_true")
     child = children.add_parser("topup-confirm")
@@ -459,6 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
     child.add_argument("server")
     child.add_argument("--pack")
     child.add_argument("--buyer")
+    child.add_argument("--rail", choices=["wechat", "alipay"], default="wechat")
     child.add_argument("--config-dir", default=config_default)
     child.add_argument("--json", action="store_true")
 
@@ -473,6 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     child.add_argument("--data")
     child.add_argument("--config-dir", default=config_default)
     child.add_argument("--json", action="store_true")
+
     for name in ("status", "fulfill", "cancel"):
         child = children.add_parser(name)
         child.add_argument("identifier")
@@ -482,6 +504,20 @@ def build_parser() -> argparse.ArgumentParser:
     child.add_argument("--config-dir", default=config_default)
     child.add_argument("--json", action="store_true")
 
+    command = sub.add_parser("alipay", help="Manage Alipay A402 payments", description="Start and recover Alipay AI Pay sessions")
+    children = command.add_subparsers(dest="alipay_command", required=True)
+    child = children.add_parser("check-wallet", help="Read official Alipay AI wallet readiness")
+    child.add_argument("--config-dir", default=config_default)
+    child.add_argument("--json", action="store_true")
+    for name in ("status", "resume"):
+        child = children.add_parser(name, help=("Resume a payment; this may retry the provider request" if name == "resume" else "Read a local payment session"))
+        child.add_argument("identifier")
+        child.add_argument("--config-dir", default=config_default)
+        child.add_argument("--json", action="store_true")
+    child = children.add_parser("list", help="List local Alipay payment sessions")
+    child.add_argument("--limit", type=int, default=100)
+    child.add_argument("--config-dir", default=config_default)
+    child.add_argument("--json", action="store_true")
     command = sub.add_parser("list", help="List recent transactions")
     command.add_argument("--days", default="7")
     command.add_argument("--chain", default="all")
@@ -502,9 +538,6 @@ def build_parser() -> argparse.ArgumentParser:
     child = children.add_parser("stop")
     child.add_argument("--config-dir", default=config_default)
 
-    command = sub.add_parser("alipay", help="Run Alipay buyer commands", description="Pass commands through to the official alipay-bot CLI")
-    command.add_argument("action")
-    command.add_argument("args", nargs="*")
     return parser
 
 
@@ -523,7 +556,21 @@ def main() -> int:
     try:
         return COMMANDS[args.command](args)
     except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        if isinstance(exc, MoltsPayError):
+            payload = {
+                "success": False, "error": {"code": str(exc.code).lower(), "message": str(exc),
+                "retryable": str(exc.code).lower() in {"alipay_payment_timeout", "alipay_payment_state_unknown", "alipay_verify_unavailable"},
+                "details": getattr(exc, "details", {}) or {}},
+            }
+            if getattr(args, "json", False):
+                output(payload)
+            else:
+                print(f"Error [{payload['error']['code']}]: {exc}", file=sys.stderr)
+                session_id = payload["error"]["details"].get("paymentSessionId")
+                if session_id:
+                    print(f"Resume with: moltspay alipay resume {session_id}", file=sys.stderr)
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
         return 1
 
 

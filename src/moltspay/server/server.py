@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
 
 from .types import (
     ServicesManifest,
@@ -44,7 +44,10 @@ from .facilitators import FacilitatorRegistry
 from .facilitators.cdp import load_env_file
 from .facilitators.balance import BalanceFacilitator
 from .facilitators.wechat import WechatFacilitator
-from .facilitators.alipay import AlipayFacilitator
+from .facilitators.alipay import AlipayFacilitator, ALIPAY_NETWORK, normalize_cny_amount
+from .alipay_store import AlipayOrderStore, proof_hash
+from ..alipay import encode_a402_json
+from ..exceptions import AlipayProtocolError
 from ..balance import from_sat, to_sat
 
 
@@ -103,8 +106,12 @@ class MoltsPayServer:
             ))
         if self.provider and self.provider.wechat:
             self.registry.register("wechat", WechatFacilitator(self.provider.wechat))
+        self.alipay = None
+        self.alipay_store = None
         if self.provider and self.provider.alipay:
-            self.registry.register("alipay", AlipayFacilitator(self.provider.alipay))
+            self.alipay = AlipayFacilitator(self.provider.alipay)
+            self.alipay_store = AlipayOrderStore(self.provider.alipay.get("order_db_path", "data/alipay-a402.sqlite"))
+            self.registry.register("alipay", self.alipay)
         
         # Get configured chains
         self.chains = self._get_provider_chains()
@@ -159,7 +166,7 @@ class MoltsPayServer:
             result = []
             for c in chains:
                 # Determine network from chain name
-                if c.chain in ("balance", "alipay", "wechat"):
+                if c.chain in ("balance", "wechat", "alipay"):
                     network = c.network or c.chain
                     wallet = c.wallet
                 elif c.chain.startswith("solana"):
@@ -317,8 +324,8 @@ class MoltsPayServer:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Payment")
-                self.send_header("Access-Control-Expose-Headers", "X-Payment-Required, X-Payment-Response")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Payment, Accept-Payment-Rail, Payment-Proof, Idempotency-Key")
+                self.send_header("Access-Control-Expose-Headers", "X-Payment-Required, X-Payment-Response, Payment-Needed, Payment-Validation")
                 if headers:
                     for key, value in headers.items():
                         self.send_header(key, value)
@@ -333,7 +340,6 @@ class MoltsPayServer:
                     client_chain: Client's requested chain (only adds MPP header if tempo_moderato)
                 """
                 accepts = []
-                payment_needed_header = None
                 
                 # Get BNB spender address if available
                 bnb_spender = server.registry.get_bnb_spender_address()
@@ -356,18 +362,6 @@ class MoltsPayServer:
                                 price_cny=str(config.wechat["price_cny"]),
                                 description=str(config.wechat["description"]),
                             ))
-                        continue
-                    if chain_config.network == "alipay":
-                        alipay = server.registry.get("alipay")
-                        if isinstance(alipay, AlipayFacilitator) and config.alipay:
-                            built = alipay.create_payment_requirements(
-                                service_id=str(config.alipay.get("service_id") or server.provider.alipay.get("service_id_default", "")),
-                                price_cny=str(config.alipay["price_cny"]),
-                                goods_name=str(config.alipay["goods_name"]),
-                                resource_id=f"/execute?service={config.id}",
-                            )
-                            accepts.append(built["requirement"])
-                            payment_needed_header = built["payment_needed_header"]
                         continue
                     token_addresses = TOKEN_ADDRESSES.get(chain_config.network, {})
                     # Get decimals for this network (default 6, BNB uses 18)
@@ -422,8 +416,6 @@ class MoltsPayServer:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("X-Payment-Required", encoded)
-                if payment_needed_header:
-                    self.send_header("Payment-Needed", payment_needed_header)
                 
                 # Add MPP WWW-Authenticate header ONLY if client requested tempo_moderato
                 # This prevents MPP from overriding x402 on other chains
@@ -456,7 +448,8 @@ class MoltsPayServer:
                 self.send_response(204)
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Payment, Accept-Payment-Rail")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Payment, Accept-Payment-Rail, Payment-Proof, Idempotency-Key")
+                self.send_header("Access-Control-Expose-Headers", "X-Payment-Required, X-Payment-Response, Payment-Needed, Payment-Validation")
                 self.end_headers()
             
             def do_GET(self):
@@ -496,15 +489,19 @@ class MoltsPayServer:
                 
                 # Get payment header
                 payment_header = self.headers.get("X-Payment")
+                payment_proof = self.headers.get("Payment-Proof")
+                idempotency_key = self.headers.get("Idempotency-Key")
                 
                 if parsed.path == "/execute":
-                    return self._handle_execute(body, payment_header)
+                    return self._handle_execute(body, payment_header, payment_proof, idempotency_key)
                 elif parsed.path == "/balance/topup":
                     return self._handle_balance_topup(body)
                 elif parsed.path == "/balance/topup/order":
                     return self._handle_balance_topup_order(body)
                 elif parsed.path == "/balance/topup/confirm":
                     return self._handle_balance_topup_confirm(body)
+                elif parsed.path == "/balance/topup/alipay":
+                    return self._handle_balance_topup_alipay(body, payment_proof, idempotency_key)
                 elif parsed.path == "/balance/refund":
                     return self._handle_balance_refund(body)
                 else:
@@ -629,6 +626,73 @@ class MoltsPayServer:
                 server._balance_topup_orders[cache_key] = result
                 self._send_json(200, result)
 
+            def _handle_balance_topup_alipay(self, body: Dict[str, Any], payment_proof: Optional[str], idempotency_key: Optional[str]):
+                facilitator = self._balance_facilitator()
+                if not facilitator or not server.alipay or not server.alipay_store:
+                    return self._send_json(400, {"code": "alipay_not_configured", "error": "Alipay balance top-up is not configured"})
+                buyer_id = body.get("buyer_id") if isinstance(body, dict) else None
+                pack = body.get("pack") if isinstance(body, dict) else None
+                if not isinstance(buyer_id, str) or not buyer_id or not isinstance(pack, str):
+                    return self._send_json(422, {"code": "alipay_topup_binding_invalid", "error": "buyer_id and pack are required"})
+                config = server.provider.balance if server.provider and server.provider.balance else {}
+                try:
+                    from decimal import Decimal
+                    amount = normalize_cny_amount(pack)
+                    amount_fen = int(Decimal(amount) * 100)
+                except Exception:
+                    return self._send_json(422, {"code": "alipay_topup_binding_invalid", "error": "pack must be a valid positive CNY amount"})
+                packs = [str(item) for item in config.get("topup_packs", [])]
+                if packs and amount not in [normalize_cny_amount(item) for item in packs if str(item)]:
+                    return self._send_json(422, {"code": "alipay_topup_binding_invalid", "error": "pack is not offered by this provider"})
+                resource_id = "/balance/topup/alipay"
+                request_id = idempotency_key or str(body.get("request_id") or f"req_{secrets.token_hex(12)}")
+                if payment_proof:
+                    try:
+                        proof = server.alipay.parse_payment_proof(payment_proof)
+                        verified = server.alipay.verify_payment(proof)
+                    except Exception:
+                        return self._send_json(503, {"code": "alipay_verify_unavailable", "error": "Alipay verification is temporarily unavailable", "retryable": True})
+                    order = server.alipay_store.get(str(verified.get("out_trade_no") or ""))
+                    if not order:
+                        return self._send_json(404, {"code": "alipay_order_not_found", "error": "Alipay top-up order was not found"})
+                    if order.get("kind") != "balance_topup" or order.get("buyer_id") != buyer_id:
+                        return self._send_json(403, {"code": "alipay_topup_binding_invalid", "error": "Alipay proof is bound to another buyer or resource"})
+                    try:
+                        matches = normalize_cny_amount(verified.get("amount")) == f"{order['amount_fen'] / 100:.2f}"
+                    except Exception:
+                        matches = False
+                    if not matches or verified.get("active") is not True or verified.get("resource_id") != resource_id:
+                        return self._send_json(409, {"code": "alipay_amount_mismatch", "error": "Alipay top-up does not match the order"})
+                    trade_no = str(verified.get("trade_no") or proof["trade_no"])
+                    claimed = server.alipay_store.claim_execution(order["out_trade_no"], trade_no=trade_no, digest=proof_hash(payment_proof), resource_id=resource_id)
+                    if claimed["state"] == "completed":
+                        return self._send_json(200, {**(claimed["order"].get("result") or {}), "replayed": True})
+                    if claimed["state"] == "executing":
+                        return self._send_json(409, {"code": "alipay_execution_in_progress", "error": "Alipay top-up is already being credited", "retryable": True})
+                    if claimed["state"] != "claimed":
+                        return self._send_json(409, {"code": "alipay_replay_detected", "error": "Alipay top-up proof was replayed"})
+                    try:
+                        credited = facilitator.ledger.topup(buyer_id, order["amount_fen"], f"alipay:{trade_no}", description=f"Alipay top-up out_trade_no={order['out_trade_no']}")
+                        result = {"credited": True, "buyer_id": buyer_id, "rail": "alipay", "amount": f"{order['amount_fen'] / 100:.2f}", "currency": "CNY", "trade_no": trade_no, "out_trade_no": order["out_trade_no"], "tx_id": credited["tx_id"], "balance": from_sat(credited["balance_sat"]), "replayed": bool(credited.get("replayed"))}
+                        server.alipay_store.complete(order["out_trade_no"], result, ledger_tx_id=credited["tx_id"])
+                        try:
+                            server.alipay.confirm_fulfillment(trade_no)
+                            server.alipay_store.mark_outbox(trade_no, "confirmed")
+                        except Exception:
+                            pass
+                        return self._send_json(200, result, {"Payment-Validation": encode_a402_json({"trade_no": trade_no, "out_trade_no": order["out_trade_no"], "validated": True, "resource_id": resource_id})})
+                    except Exception:
+                        server.alipay_store.fail_delivery(order["out_trade_no"], "alipay_topup_credit_failed")
+                        return self._send_json(500, {"code": "alipay_topup_credit_failed", "error": "Alipay top-up credit failed"})
+                try:
+                    existing = server.alipay_store.get_by_request(request_id, "balance_topup", resource_id)
+                    order = existing or server.alipay_store.create_order(request_id=request_id, kind="balance_topup", amount_fen=amount_fen, resource_id=resource_id, goods_name=f"Provider balance top-up {amount}", pay_before="", buyer_id=buyer_id)
+                    bill = server.alipay.create_payment_needed(out_trade_no=order["out_trade_no"], amount=amount, goods_name=f"Provider balance top-up {amount}", resource_id=resource_id, service_id=str(server.alipay.config.get("service_id_default") or "balance_topup"), timeout_seconds=int(config.get("default_timeout_seconds") or server.alipay.config.get("default_timeout_seconds", 1800)))
+                    server.alipay_store.db.execute("UPDATE alipay_orders SET pay_before=?,updated_at=? WHERE out_trade_no=?", (bill["pay_before"], datetime.now(timezone.utc).isoformat(), order["out_trade_no"]))
+                except Exception:
+                    return self._send_json(500, {"code": "alipay_config_invalid", "error": "Unable to create Alipay top-up bill"})
+                return self._send_json(402, {"code": "payment_needed", "message": "Payment is required for balance top-up", "resourceId": resource_id, "requestId": request_id}, {"Payment-Needed": bill["header"], "Cache-Control": "no-store"})
+
             def _handle_balance_topup_confirm(self, body):
                 facilitator = self._balance_facilitator()
                 wechat = server.registry.get("wechat")
@@ -697,6 +761,7 @@ class MoltsPayServer:
                             "input": {k: v.model_dump() for k, v in svc.input.items()},
                             "output": svc.output,
                             "available": svc.id in server.skills,
+                            "paymentRails": ({"alipay": {"available": True, "interactive": True, "protocol": "a402", "currency": "CNY", "amount": normalize_cny_amount(svc.alipay["price_cny"])}} if svc.alipay and server.alipay else {}),
                         })
                 
                 self._send_json(200, {
@@ -727,6 +792,7 @@ class MoltsPayServer:
                             "currency": svc.currency,
                             "acceptedCurrencies": svc.accepted_currencies,
                             "available": svc.id in server.skills,
+                            "paymentRails": ({"alipay": {"available": True, "interactive": True, "protocol": "a402", "currency": "CNY", "amount": normalize_cny_amount(svc.alipay["price_cny"])}} if svc.alipay and server.alipay else {}),
                         })
                 
                 self._send_json(200, {
@@ -764,7 +830,93 @@ class MoltsPayServer:
                     "registered": len(server.skills),
                 })
             
-            def _handle_execute(self, body: Dict[str, Any], payment_header: Optional[str]):
+            def _send_alipay_402(self, skill: RegisteredSkill, request_id: Optional[str]):
+                if not server.alipay or not server.alipay_store or not skill.config.alipay:
+                    return self._send_json(400, {"code": "alipay_not_configured", "error": "Alipay rail is not configured for this service"})
+                alipay_config = skill.config.alipay
+                amount = str(alipay_config.get("price_cny", ""))
+                resource_id = str(alipay_config.get("resource_id") or f"/execute?service={quote(skill.id, safe='')}")
+                service_id = str(alipay_config.get("service_id") or server.alipay.config.get("service_id_default") or skill.id)
+                try:
+                    from decimal import Decimal
+                    amount_fen = int(Decimal(normalize_cny_amount(amount)) * 100)
+                    order = server.alipay_store.create_order(
+                        request_id=request_id or f"req_{secrets.token_hex(12)}", kind="service", amount_fen=amount_fen,
+                        resource_id=resource_id, goods_name=str(alipay_config.get("goods_name") or skill.config.name),
+                        pay_before="", service_id=skill.id,
+                    )
+                    bill = server.alipay.create_payment_needed(
+                        out_trade_no=order["out_trade_no"], amount=amount,
+                        goods_name=str(alipay_config.get("goods_name") or skill.config.name),
+                        resource_id=resource_id, service_id=service_id,
+                        timeout_seconds=int(alipay_config.get("pay_timeout_seconds") or server.alipay.config.get("default_timeout_seconds", 1800)),
+                    )
+                except Exception as exc:
+                    return self._send_json(500, {"code": "alipay_config_invalid", "error": str(exc)})
+                # Keep the signed expiry and exact amount in the durable order.
+                server.alipay_store.db.execute("UPDATE alipay_orders SET pay_before=?,updated_at=? WHERE out_trade_no=?", (bill["pay_before"], datetime.now(timezone.utc).isoformat(), order["out_trade_no"]))
+                response = {"code": "payment_needed", "message": "Payment is required to access this resource", "resourceId": resource_id, "requestId": request_id}
+                return self._send_json(402, response, {
+                    "Payment-Needed": bill["header"], "Cache-Control": "no-store",
+                })
+
+            def _handle_alipay_execute(self, skill: RegisteredSkill, body: Dict[str, Any], payment_proof: str):
+                if not server.alipay or not server.alipay_store:
+                    return self._send_json(400, {"code": "alipay_not_configured", "error": "Alipay rail is not configured"})
+                try:
+                    proof = server.alipay.parse_payment_proof(payment_proof)
+                except Exception:
+                    return self._send_json(400, {"code": "alipay_proof_malformed", "error": "Payment-Proof is malformed"})
+                try:
+                    verified = server.alipay.verify_payment(proof)
+                except Exception as exc:
+                    code = getattr(exc, "code", "alipay_verify_unavailable")
+                    status = 502 if code == "alipay_response_signature_invalid" else 503
+                    return self._send_json(status, {"code": code, "error": code, "retryable": status >= 500})
+                if str(verified.get("code")) != "10000" or verified.get("active") is not True:
+                    return self._send_json(402, {"code": "alipay_proof_inactive", "error": "Payment-Proof is inactive"})
+                out_trade_no = str(verified.get("out_trade_no") or "")
+                order = server.alipay_store.get(out_trade_no)
+                if not order:
+                    return self._send_json(404, {"code": "alipay_order_not_found", "error": "Alipay order was not found"})
+                try:
+                    amount_matches = normalize_cny_amount(verified.get("amount")) == f"{order['amount_fen'] / 100:.2f}"
+                except Exception:
+                    amount_matches = False
+                if not amount_matches or str(verified.get("currency", "CNY")) != "CNY":
+                    return self._send_json(409, {"code": "alipay_amount_mismatch", "error": "Alipay amount does not match the order"})
+                resource_id = str(verified.get("resource_id") or "")
+                if resource_id != order["resource_id"]:
+                    return self._send_json(403, {"code": "alipay_resource_mismatch", "error": "Alipay resource does not match the order"})
+                claimed = server.alipay_store.claim_execution(out_trade_no, trade_no=str(verified.get("trade_no") or proof["trade_no"]), digest=proof_hash(payment_proof), resource_id=resource_id)
+                if claimed["state"] == "completed":
+                    cached = claimed["order"]
+                    return self._send_json(200, {"success": True, "result": cached.get("result"), "replayed": True}, {"Payment-Validation": encode_a402_json({"trade_no": cached.get("trade_no"), "out_trade_no": out_trade_no, "validated": True, "resource_id": resource_id})})
+                if claimed["state"] == "executing":
+                    return self._send_json(409, {"code": "alipay_execution_in_progress", "error": "Alipay execution is already in progress", "retryable": True})
+                if claimed["state"] == "replay":
+                    return self._send_json(409, {"code": "alipay_replay_detected", "error": "Alipay proof or trade number was replayed"})
+                if claimed["state"] != "claimed":
+                    return self._send_json(403, {"code": "alipay_resource_mismatch", "error": "Alipay order cannot be used for this resource"})
+                try:
+                    loop = asyncio.new_event_loop()
+                    try:
+                        result = loop.run_until_complete(asyncio.wait_for(server._execute_handler(skill.handler, body.get("params", {})), timeout=int(os.environ.get("SKILL_TIMEOUT_SECONDS", "1200"))))
+                    finally:
+                        loop.close()
+                except Exception as exc:
+                    server.alipay_store.fail_delivery(out_trade_no, "service_execution_failed_after_payment", {"error": "service execution failed"})
+                    return self._send_json(500, {"code": "service_execution_failed_after_payment", "error": "Service execution failed after payment"})
+                completed = server.alipay_store.complete(out_trade_no, result)
+                try:
+                    server.alipay.confirm_fulfillment(str(verified.get("trade_no") or proof["trade_no"]))
+                    server.alipay_store.mark_outbox(str(verified.get("trade_no") or proof["trade_no"]), "confirmed")
+                except Exception:
+                    # The business result is durable; the outbox remains retryable.
+                    pass
+                return self._send_json(200, {"success": True, "result": result, "payment": {"status": "validated", "network": "alipay"}}, {"Payment-Validation": encode_a402_json({"trade_no": verified.get("trade_no"), "out_trade_no": out_trade_no, "validated": True, "resource_id": resource_id})})
+
+            def _handle_execute(self, body: Dict[str, Any], payment_header: Optional[str], payment_proof: Optional[str] = None, idempotency_key: Optional[str] = None):
                 """POST /execute - Execute service with x402 payment."""
                 service_id = body.get("service")
                 params = body.get("params", {})
@@ -775,6 +927,12 @@ class MoltsPayServer:
                 skill = server.skills.get(service_id)
                 if not skill:
                     return self._send_json(404, {"error": f"Service '{service_id}' not found"})
+
+                requested_rail = (self.headers.get("Accept-Payment-Rail") or body.get("rail") or "").lower()
+                if requested_rail == "alipay" or payment_proof:
+                    if payment_proof:
+                        return self._handle_alipay_execute(skill, body, payment_proof)
+                    return self._send_alipay_402(skill, idempotency_key)
                 
                 # Validate required params
                 for key, field in skill.config.input.items():
@@ -807,7 +965,7 @@ class MoltsPayServer:
                 scheme = payment.accepted.get("scheme") if payment.accepted else payment.scheme
                 network = payment.accepted.get("network") if payment.accepted else payment.network
                 
-                if scheme not in ("exact", "balance", "wechatpay-native", "alipay-aipay"):
+                if scheme not in ("exact", "balance", "wechatpay-native"):
                     return self._send_json(402, {"error": f"Unsupported scheme: {scheme}"})
                 
                 # Validate network is one of our supported chains
@@ -816,7 +974,7 @@ class MoltsPayServer:
                     return self._send_json(402, {"error": f"Network {network} not supported. Supported: {supported}"})
                 
                 # Detect payment token
-                payment_token = None if network in ("balance", "wechat", "alipay") else server._detect_payment_token(payment, network)
+                payment_token = None if network in ("balance", "wechat") else server._detect_payment_token(payment, network)
                 if payment_token and payment_token not in skill.config.accepted_currencies:
                     accepted = skill.config.accepted_currencies
                     return self._send_json(402, {
@@ -839,17 +997,6 @@ class MoltsPayServer:
                         amount=str(skill.config.wechat["price_cny"]),
                         payTo=str(server.provider.wechat["mchid"]),
                         maxTimeoutSeconds=int(accepted.get("maxTimeoutSeconds", 300)),
-                        extra=accepted.get("extra", {}),
-                    )
-                elif network == "alipay":
-                    if skill.config.alipay is None:
-                        return self._send_json(402, {"error": "Alipay rail not enabled for this service"})
-                    accepted = payment.accepted or {}
-                    requirements = X402PaymentRequirements(
-                        scheme="alipay-aipay", network="alipay", asset="CNY",
-                        amount=str(skill.config.alipay["price_cny"]),
-                        payTo=str(server.provider.alipay["seller_id"]),
-                        maxTimeoutSeconds=int(accepted.get("maxTimeoutSeconds", 1800)),
                         extra=accepted.get("extra", {}),
                     )
                 else:

@@ -13,7 +13,7 @@ MoltsPay lets an agent discover a provider's services, handle an HTTP `402 Payme
 - Discover priced services exposed by a MoltsPay provider.
 - Pay with USDC or USDT through x402 and chain-specific facilitators.
 - Use Base, Polygon, BNB Chain, Solana, and Tempo networks.
-- Use provider balances, WeChat Pay, or Alipay when the provider supports them.
+- Use provider balances or WeChat Pay when the provider supports them.
 - Auto-create EVM and Solana wallets and enforce local spending limits.
 - Run through Python, the CLI, MCP, LangChain, or the provider server.
 - Share the EVM wallet format with the Node.js MoltsPay SDK.
@@ -187,7 +187,6 @@ These are local SDK policy controls, not on-chain allowances. They protect calls
 | Crypto | Omit `rail` | Uses `chain` and `token` to complete the provider's 402 challenge |
 | Provider balance | `rail="balance"` | Deducts from a provider-managed buyer balance; supports recoverable top-ups |
 | WeChat Pay | `rail="wechat"` | Creates a Native payment QR session, polls it, then fulfills the service |
-| Alipay | `rail="alipay"` | Uses the official `alipay-bot` buyer flow and resumes fulfillment |
 
 Example using a provider balance:
 
@@ -206,7 +205,7 @@ result = client.pay(
 )
 ```
 
-Interactive WeChat and Alipay flows persist recoverable sessions locally. See [Node.js compatibility and fiat rails](docs/NODE-PARITY.md) for the session and provider contracts.
+Interactive WeChat flows persist recoverable sessions locally. See [Node.js compatibility and fiat rails](docs/NODE-PARITY.md) for the session and provider contracts.
 
 ## Core API
 
@@ -312,7 +311,7 @@ moltspay pay \
   --prompt "a cat dancing in the rain"
 ```
 
-The CLI also exposes `transfer`, `approve`, `config`, `balance`, `wechat`, `alipay`, `validate`, and `server` commands. Run `moltspay <command> --help` or read the [CLI reference](docs/CLI.md) for details.
+The CLI also exposes `transfer`, `approve`, `config`, `balance`, `wechat`, `validate`, and `server` commands. Run `moltspay <command> --help` or read the [CLI reference](docs/CLI.md) for details.
 
 ## MCP server
 
@@ -323,7 +322,7 @@ pip install "moltspay[mcp]" pillow
 moltspay-mcp
 ```
 
-Pillow is required for the MCP server's PNG QR image output. The MCP adapter exposes namespaced tools such as `moltspay_status`, `moltspay_pay`, balance top-up tools, and recoverable WeChat/Alipay session tools. Tool results use a stable envelope with `ok`, `data` or `error`, `requestId`, and `retried`.
+Pillow is required for the MCP server's PNG QR image output. The MCP adapter exposes namespaced tools such as `moltspay_status`, `moltspay_pay`, balance top-up tools, and recoverable WeChat session tools. Tool results use a stable envelope with `ok`, `data` or `error`, `requestId`, and `retried`.
 
 Require explicit confirmation for money-moving or fulfillment tools:
 
@@ -332,7 +331,7 @@ export MOLTSPAY_MCP_REQUIRE_CONFIRM=1
 moltspay-mcp
 ```
 
-The unified `moltspay_pay` tool supports on-chain and provider-balance payments. WeChat and Alipay use their dedicated start/status/fulfill tools.
+The unified `moltspay_pay` tool supports on-chain and provider-balance payments. WeChat uses its dedicated start/status/fulfill tools.
 
 ## LangChain
 

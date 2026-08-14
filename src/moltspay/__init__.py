@@ -23,6 +23,22 @@ from .exceptions import (
     LimitExceeded,
     WalletError,
     UnsupportedRail,
+    AlipayError,
+    AlipayConfigInvalid,
+    AlipayNotConfigured,
+    AlipayCliNotFound,
+    AlipayCliFailed,
+    AlipayWalletNotReady,
+    AlipayProtocolError,
+    AlipayPaymentRejected,
+    AlipayPaymentTimeout,
+    AlipayPaymentStateUnknown,
+    AlipayProofMalformed,
+    AlipayVerifyUnavailable,
+    AlipayResponseSignatureInvalid,
+    AlipayReplayDetected,
+    AlipayExecutionInProgress,
+    InteractiveRailRequiresLifecycle,
 )
 from .verify import verify_payment, get_transaction_status, wait_for_transaction
 from .secure_wallet import SecureWallet
@@ -31,7 +47,7 @@ from .invoice import PaymentAgent
 from .permit_wallet import PermitWallet, AllowanceWallet, generate_permit_instructions
 from .balance import BalanceClient, BalanceLedger, to_sat, from_sat
 from .wechat import WechatClient, WechatPaymentSession
-from .alipay import AlipayClient
+from .alipay import AlipayBuyerClient, AlipayClient, AlipayPaymentSession
 from .mcp import MoltsPayMCP, create_mcp_server
 from .chains import get_chain, get_chain_by_id, list_chains, get_chain_family, is_evm_chain, is_solana_chain
 
@@ -66,6 +82,22 @@ __all__ = [
     "LimitExceeded",
     "WalletError",
     "UnsupportedRail",
+    "AlipayError",
+    "AlipayConfigInvalid",
+    "AlipayNotConfigured",
+    "AlipayCliNotFound",
+    "AlipayCliFailed",
+    "AlipayWalletNotReady",
+    "AlipayProtocolError",
+    "AlipayPaymentRejected",
+    "AlipayPaymentTimeout",
+    "AlipayPaymentStateUnknown",
+    "AlipayProofMalformed",
+    "AlipayVerifyUnavailable",
+    "AlipayResponseSignatureInvalid",
+    "AlipayReplayDetected",
+    "AlipayExecutionInProgress",
+    "InteractiveRailRequiresLifecycle",
     "verify_payment",
     "get_transaction_status",
     "wait_for_transaction",
@@ -81,7 +113,9 @@ __all__ = [
     "from_sat",
     "WechatClient",
     "WechatPaymentSession",
+    "AlipayBuyerClient",
     "AlipayClient",
+    "AlipayPaymentSession",
     "get_chain",
     "get_chain_by_id",
     "list_chains",

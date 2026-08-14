@@ -2,7 +2,7 @@
 
 ## Scope
 
-This refactor is limited to Alipay, provider balance, WeChat Pay, and MCP.
+This refactor is limited to provider balance, WeChat Pay, and MCP.
 The existing on-chain x402 implementation, wallets, chain registry, and the
 BNB, Solana, Tempo, and CDP facilitators are frozen.
 
@@ -17,9 +17,8 @@ not alter on-chain routing, signing, settlement, or wallet behavior.
    outcomes explicitly.
 3. Make provider balance buyer selection and top-up confirmation deterministic
    and idempotent.
-4. Make Alipay payments recoverable instead of requiring one blocking call.
-5. Expose the resulting public APIs through strict MCP tool contracts.
-6. Preserve existing synchronous SDK entry points as compatibility wrappers.
+4. Expose the resulting public APIs through strict MCP tool contracts.
+5. Preserve existing synchronous SDK entry points as compatibility wrappers.
 
 ## Target lifecycle
 
@@ -52,14 +51,7 @@ cause a second payment automatically.
 - Validate identifiers before using them as file names.
 - Close owned HTTP and SQLite resources deterministically.
 
-### Stage 3: Alipay
-
-- Split payment start, one-shot resume/query, and blocking compatibility flows.
-- Persist the minimum information required to resume by trade number.
-- Return payment URLs immediately instead of hiding them behind polling.
-- Restrict executable selection to server configuration.
-
-### Stage 4: MCP
+### Stage 3: MCP
 
 - Register tools with constrained Pydantic input models.
 - Use a stable success/error envelope and an explicit confirmation matrix.
@@ -117,10 +109,10 @@ Completion gates:
 
 ## Implementation result (2026-08-11)
 
-The four delivery stages are implemented. The final verification results are:
+The three delivery stages are implemented. The final verification results are:
 
-- Full test suite: 87 passed.
-- Target-module line coverage: 94% overall (Alipay 91%, Balance 93%, MCP server 97%, WeChat Pay 96%).
+- Full test suite: 89 passed, 4 skipped.
+- Target-module line coverage: Balance 93%, MCP server 97%, WeChat Pay 96%.
 - Resource lifecycle: no unclosed SQLite or HTTP-client warnings from project code.
 - Frozen on-chain files and facilitators: no content changes from `HEAD`.
 - Diff hygiene: `git diff --check` passes.

@@ -62,6 +62,7 @@ from .facilitators import (
     WechatFacilitator,
     AlipayFacilitator,
 )
+from .alipay_store import AlipayOrderStore
 from .types import (
     ServicesManifest,
     ServiceConfig,
@@ -85,6 +86,7 @@ __all__ = [
     "BalanceFacilitator",
     "WechatFacilitator",
     "AlipayFacilitator",
+    "AlipayOrderStore",
     "ServicesManifest",
     "ServiceConfig",
     "ProviderConfig",
