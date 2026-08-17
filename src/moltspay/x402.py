@@ -66,6 +66,7 @@ def _service_from_dict(svc: dict) -> Service:
         chains=svc.get("chains"), parameters=svc.get("parameters", svc.get("input")),
         input=svc.get("input", svc.get("parameters", {})), output=svc.get("output", {}),
         available=svc.get("available", True), provider=svc.get("provider"), endpoint=svc.get("endpoint"),
+        paymentRails=svc.get("paymentRails", svc.get("payment_rails", {})),
     )
 
 

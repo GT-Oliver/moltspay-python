@@ -53,6 +53,14 @@ class AlipayWalletNotReady(AlipayError):
     code = "alipay_wallet_not_ready"
 
 
+class AlipayRequestContextMissing(AlipayError):
+    code = "alipay_request_context_missing"
+
+
+class AlipayRequestContextInvalid(AlipayError):
+    code = "alipay_request_context_invalid"
+
+
 class AlipayProtocolError(AlipayError):
     code = "alipay_challenge_invalid"
 

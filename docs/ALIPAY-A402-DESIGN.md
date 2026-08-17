@@ -122,7 +122,7 @@ Buyer CLI / MCP
       "app_id": "2026xxxxxxxxxxxx",
       "seller_id": "2088xxxxxxxxxxxx",
       "seller_name": "Example Provider",
-      "service_id_default": "aipay_service_default",
+      "balance_topup_service_id": "aipay_balance_topup",
       "private_key_path": "/secure/path/alipay-app-private-key.pem",
       "alipay_public_key_path": "/secure/path/alipay-platform-public-key.pem",
       "gateway_url": "https://openapi.alipay.com/gateway.do",
@@ -167,9 +167,10 @@ Buyer CLI / MCP
 
 - `price_cny` 使用十进制字符串，最小 `0.01`，最多两位小数；
 - `goods_name` 非空且限制长度；
-- `service_id` 缺省时继承 `service_id_default`；
+- `service_id` 必填，且必须是支付宝侧为该服务注册的 ID，不回退到内部 service/skill ID；
 - `resource_id` 缺省时规范化为 `/execute?service=<urlencoded service id>`；
 - 相同 `out_trade_no` 对应的金额、资源和服务 ID 创建后不可修改。
+- 余额充值使用独立的 `provider.alipay.balance_topup_service_id`，不得复用隐式默认值。
 
 ### 5.3 服务发现
 

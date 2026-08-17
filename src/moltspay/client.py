@@ -93,6 +93,7 @@ class MoltsPay:
         config_dir: Optional[str] = None,
         rail_preference: Optional[List[str]] = None,
         buyer_id: Optional[str] = None,
+        alipay_framework: Optional[str] = None,
     ):
         """
         Initialize MoltsPay client.
@@ -120,6 +121,7 @@ class MoltsPay:
         self._balance_client = None
         self._wechat_client = None
         self._alipay_client = None
+        self._alipay_framework = alipay_framework or "moltspay"
         
         # Solana wallet (lazy loaded)
         self._solana_wallet = None
@@ -402,7 +404,9 @@ class MoltsPay:
 
     def _get_alipay_client(self) -> AlipayBuyerClient:
         if self._alipay_client is None:
-            self._alipay_client = AlipayBuyerClient(config_dir=str(self._config_dir))
+            self._alipay_client = AlipayBuyerClient(
+                config_dir=str(self._config_dir), framework=self._alipay_framework
+            )
         return self._alipay_client
 
     def _rail_challenge(self, service_url: str, service_id: str, params: Dict[str, Any], rail: str):
@@ -457,9 +461,15 @@ class MoltsPay:
     def start_alipay_payment(
         self, service_url: str, service_id: str, params: Optional[Dict[str, Any]] = None,
         intent_summary: Optional[str] = None, timeout: Optional[float] = None,
-        request_id: Optional[str] = None, **options: Any,
+        request_id: Optional[str] = None, business_session_id: Optional[str] = None,
+        **options: Any,
     ) -> AlipayPaymentSession:
         """Start a recoverable A402 session from the provider's real 402 response."""
+        alipay_client = self._get_alipay_client()
+        # Resolve and validate runtime identity before the provider creates an
+        # offered order. This prevents orphaned A402 bills when the caller did
+        # not propagate its real framework session.
+        business_session_id = alipay_client._business_session_id(business_session_id)
         body = {"service": service_id, "params": params or {}, "rail": "alipay"}
         url = f"{service_url.rstrip('/')}/execute"
         request_id = request_id or str(options.pop("idempotency_key", "")) or f"req_{uuid.uuid4().hex}"
@@ -476,13 +486,19 @@ class MoltsPay:
         if not payment_needed:
             raise PaymentError("alipay_payment_needed_missing")
         # Validate encoding before invoking an external payment process.
-        decode_a402_json(payment_needed, name="Payment-Needed")
-        summary = intent_summary or f"购买 {service_id} 服务"
-        return self._get_alipay_client().start_402(
+        needed = decode_a402_json(payment_needed, name="Payment-Needed")
+        protocol = needed.get("protocol") if isinstance(needed.get("protocol"), dict) else {}
+        amount = protocol.get("amount")
+        currency = protocol.get("currency")
+        summary = intent_summary or f"原始请求：购买 {service_id} 服务"
+        if amount is not None and currency:
+            summary = f"{summary}；支付宝账单：{amount} {currency}"
+        return alipay_client.start_402(
             url, payment_needed, request_id=request_id, method="POST",
             request_body=json.dumps(body, ensure_ascii=False, separators=(",", ":")),
             headers={"Content-Type": "application/json", "Accept-Payment-Rail": "alipay", "Idempotency-Key": request_id},
-            intent_summary=summary, timeout=float(timeout or self._timeout or 1800),
+            business_session_id=business_session_id, intent_summary=summary,
+            timeout=float(timeout or self._timeout or 1800),
             context={"server_url": service_url, "service_id": service_id, "params": params or {}},
         )
 
@@ -495,11 +511,15 @@ class MoltsPay:
     def list_alipay_payment_sessions(self, **kwargs: Any) -> List[AlipayPaymentSession]:
         return self._get_alipay_client().list_sessions(**kwargs)
 
-    def _pay_alipay(self, service_url: str, service_id: str, params: Dict[str, Any], amount: float, **options: Any) -> PaymentResult:
+    def _pay_alipay(
+        self, service_url: str, service_id: str, params: Dict[str, Any],
+        amount: float, currency: str = "CNY", **options: Any,
+    ) -> PaymentResult:
         session = self.start_alipay_payment(
             service_url, service_id, params,
             intent_summary=options.get("intent_summary"), timeout=options.get("timeout"),
             request_id=options.get("request_id"),
+            business_session_id=options.get("business_session_id"),
         )
         deadline = time.monotonic() + float(options.get("timeout") or self._timeout or 1800)
         while time.monotonic() < deadline:
@@ -509,7 +529,10 @@ class MoltsPay:
                 if isinstance(result, dict):
                     result = result.get("result", result.get("data", result))
                 return PaymentResult(
-                    success=True, amount=amount, token="CNY", service_id=service_id, result=result,
+                    success=True,
+                    amount=float(session.amount) if session.amount is not None else amount,
+                    token=session.currency or currency,
+                    service_id=service_id, result=result,
                     network="alipay", facilitator="alipay",
                     payment={"session_id": session.payment_session_id, "trade_no": session.trade_no, "out_trade_no": session.out_trade_no},
                 )
@@ -1101,7 +1124,16 @@ class MoltsPay:
         if selected_rail == "wechat":
             return self._pay_wechat(service_url, service_id, params, service.price, **(rail_options or {}))
         if selected_rail == "alipay":
-            return self._pay_alipay(service_url, service_id, params, service.price, **(rail_options or {}))
+            quote = service.payment_rails.get("alipay", {})
+            if not isinstance(quote, dict) or quote.get("amount") is None:
+                raise UnsupportedRail(
+                    "Service discovery does not include an Alipay-specific quote"
+                )
+            amount = float(quote["amount"])
+            currency = str(quote.get("currency") or "CNY")
+            return self._pay_alipay(
+                service_url, service_id, params, amount, currency, **(rail_options or {})
+            )
         if selected_rail and selected_rail not in CHAINS:
             raise UnsupportedRail(f"Unsupported payment rail: {selected_rail}")
         

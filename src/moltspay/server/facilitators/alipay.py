@@ -156,7 +156,7 @@ class AlipayFacilitator(BaseFacilitator):
 
     def create_payment_needed(
         self, *, out_trade_no: Optional[str], amount: str, goods_name: str, resource_id: str,
-        service_id: str, timeout_seconds: Optional[int] = None, service_id_default: Optional[str] = None,
+        service_id: str, timeout_seconds: Optional[int] = None,
     ) -> Dict[str, Any]:
         amount = normalize_cny_amount(amount)
         if not isinstance(goods_name, str) or not goods_name.strip() or len(goods_name) > 128:
@@ -166,7 +166,7 @@ class AlipayFacilitator(BaseFacilitator):
         trade = out_trade_no or "MPA" + secrets.token_hex(14).upper()
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", trade):
             raise ValueError("out_trade_no is invalid")
-        service = service_id or service_id_default or self.config.get("service_id_default")
+        service = service_id.strip() if isinstance(service_id, str) else ""
         if not service:
             raise ValueError("service_id is required")
         seconds = int(timeout_seconds or self.config.get("default_timeout_seconds", 1800))
@@ -287,10 +287,14 @@ class AlipayFacilitator(BaseFacilitator):
                 return VerifyResult(valid=False, error="alipay_amount_mismatch", details={"amount": response.get("amount")})
             if str(response.get("trade_no")) != str(proof.get("trade_no")):
                 return VerifyResult(valid=False, error="alipay_order_mismatch", details={"trade_no": response.get("trade_no")})
-            for key in ("out_trade_no", "resource_id", "trade_no"):
+            for key in ("out_trade_no", "service_id", "resource_id", "trade_no"):
                 expected_value = (requirements.get("extra") or {}).get(key) or requirements.get(key)
                 if expected_value and str(response.get(key)) != str(expected_value):
-                    return VerifyResult(valid=False, error="alipay_order_mismatch" if key == "out_trade_no" else "alipay_resource_mismatch", details={key: response.get(key)})
+                    error = {
+                        "out_trade_no": "alipay_order_mismatch",
+                        "service_id": "alipay_service_mismatch",
+                    }.get(key, "alipay_resource_mismatch")
+                    return VerifyResult(valid=False, error=error, details={key: response.get(key)})
             return VerifyResult(valid=True, details={**response, "proof": proof})
         except (AlipayProofMalformed, AlipayResponseSignatureInvalid, AlipayVerifyUnavailable) as exc:
             return VerifyResult(valid=False, error=exc.code, details={})

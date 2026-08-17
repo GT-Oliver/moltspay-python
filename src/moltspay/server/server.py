@@ -537,12 +537,17 @@ class MoltsPayServer:
                 facilitator = self._balance_facilitator()
                 if not facilitator:
                     return self._send_json(404, {"error": "Balance rail not configured"})
+                balance_config = server.provider.balance if server.provider and server.provider.balance else {}
+                topup_policy = {
+                    "topupPacks": [str(item) for item in balance_config.get("topup_packs", [])],
+                    "customTopupMax": balance_config.get("auto_topup_max"),
+                }
                 buyer_id = (parse_qs(parsed.query).get("buyer_id") or [""])[0]
                 buyer = facilitator.ledger.get_buyer(buyer_id)
                 if not buyer:
                     return self._send_json(200, {
                         "buyer_id": buyer_id, "balance": "0.00", "currency": facilitator.currency,
-                        "exists": False,
+                        "exists": False, **topup_policy,
                     })
                 self._send_json(200, {
                     "buyer_id": buyer_id, "currency": facilitator.currency,
@@ -552,6 +557,7 @@ class MoltsPayServer:
                     "single_limit": from_sat(buyer["single_limit_sat"]),
                     "daily_limit": from_sat(buyer["daily_limit_sat"]),
                     "status": buyer["status"],
+                    **topup_policy,
                 })
 
             def _handle_balance_transactions(self, parsed):
@@ -657,6 +663,8 @@ class MoltsPayServer:
                         return self._send_json(404, {"code": "alipay_order_not_found", "error": "Alipay top-up order was not found"})
                     if order.get("kind") != "balance_topup" or order.get("buyer_id") != buyer_id:
                         return self._send_json(403, {"code": "alipay_topup_binding_invalid", "error": "Alipay proof is bound to another buyer or resource"})
+                    if str(verified.get("service_id") or "") != str(order.get("service_id") or ""):
+                        return self._send_json(403, {"code": "alipay_service_mismatch", "error": "Alipay service does not match the top-up order"})
                     try:
                         matches = normalize_cny_amount(verified.get("amount")) == f"{order['amount_fen'] / 100:.2f}"
                     except Exception:
@@ -685,9 +693,12 @@ class MoltsPayServer:
                         server.alipay_store.fail_delivery(order["out_trade_no"], "alipay_topup_credit_failed")
                         return self._send_json(500, {"code": "alipay_topup_credit_failed", "error": "Alipay top-up credit failed"})
                 try:
-                    existing = server.alipay_store.get_by_request(request_id, "balance_topup", resource_id)
-                    order = existing or server.alipay_store.create_order(request_id=request_id, kind="balance_topup", amount_fen=amount_fen, resource_id=resource_id, goods_name=f"Provider balance top-up {amount}", pay_before="", buyer_id=buyer_id)
-                    bill = server.alipay.create_payment_needed(out_trade_no=order["out_trade_no"], amount=amount, goods_name=f"Provider balance top-up {amount}", resource_id=resource_id, service_id=str(server.alipay.config.get("service_id_default") or "balance_topup"), timeout_seconds=int(config.get("default_timeout_seconds") or server.alipay.config.get("default_timeout_seconds", 1800)))
+                    service_id = server.alipay.config.get("balance_topup_service_id")
+                    if not isinstance(service_id, str) or not service_id.strip():
+                        raise ValueError("balance_topup_service_id is required")
+                    service_id = service_id.strip()
+                    order = server.alipay_store.create_order(request_id=request_id, kind="balance_topup", amount_fen=amount_fen, resource_id=resource_id, goods_name=f"Provider balance top-up {amount}", pay_before="", service_id=service_id, buyer_id=buyer_id)
+                    bill = server.alipay.create_payment_needed(out_trade_no=order["out_trade_no"], amount=amount, goods_name=f"Provider balance top-up {amount}", resource_id=resource_id, service_id=service_id, timeout_seconds=int(config.get("default_timeout_seconds") or server.alipay.config.get("default_timeout_seconds", 1800)))
                     server.alipay_store.db.execute("UPDATE alipay_orders SET pay_before=?,updated_at=? WHERE out_trade_no=?", (bill["pay_before"], datetime.now(timezone.utc).isoformat(), order["out_trade_no"]))
                 except Exception:
                     return self._send_json(500, {"code": "alipay_config_invalid", "error": "Unable to create Alipay top-up bill"})
@@ -836,14 +847,20 @@ class MoltsPayServer:
                 alipay_config = skill.config.alipay
                 amount = str(alipay_config.get("price_cny", ""))
                 resource_id = str(alipay_config.get("resource_id") or f"/execute?service={quote(skill.id, safe='')}")
-                service_id = str(alipay_config.get("service_id") or server.alipay.config.get("service_id_default") or skill.id)
+                service_id = alipay_config.get("service_id")
+                if not isinstance(service_id, str) or not service_id.strip():
+                    return self._send_json(500, {
+                        "code": "alipay_config_invalid",
+                        "error": f"Alipay service_id is required for service '{skill.id}'",
+                    })
+                service_id = service_id.strip()
                 try:
                     from decimal import Decimal
                     amount_fen = int(Decimal(normalize_cny_amount(amount)) * 100)
                     order = server.alipay_store.create_order(
                         request_id=request_id or f"req_{secrets.token_hex(12)}", kind="service", amount_fen=amount_fen,
                         resource_id=resource_id, goods_name=str(alipay_config.get("goods_name") or skill.config.name),
-                        pay_before="", service_id=skill.id,
+                        pay_before="", service_id=service_id,
                     )
                     bill = server.alipay.create_payment_needed(
                         out_trade_no=order["out_trade_no"], amount=amount,
@@ -879,6 +896,8 @@ class MoltsPayServer:
                 order = server.alipay_store.get(out_trade_no)
                 if not order:
                     return self._send_json(404, {"code": "alipay_order_not_found", "error": "Alipay order was not found"})
+                if str(verified.get("service_id") or "") != str(order.get("service_id") or ""):
+                    return self._send_json(403, {"code": "alipay_service_mismatch", "error": "Alipay service does not match the order"})
                 try:
                     amount_matches = normalize_cny_amount(verified.get("amount")) == f"{order['amount_fen'] / 100:.2f}"
                 except Exception:

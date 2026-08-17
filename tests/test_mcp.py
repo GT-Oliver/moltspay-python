@@ -81,6 +81,35 @@ class FakeClient:
         expired.status = "expired"
         return [pending, expired]
 
+    def start_alipay_payment(self, *args, **kwargs):
+        self.calls.append(("alipay_start", args, kwargs))
+        return SimpleNamespace(
+            payment_session_id="mpay_alipay_1",
+            business_session_id=kwargs["business_session_id"],
+            amount="1.00", currency="CNY", status="pending",
+            request_id=kwargs.get("request_id") or "req-1",
+            resource_url="https://provider.test/execute", method="POST",
+            out_shake_no=None, trade_no=None, out_trade_no="MPA1",
+            created_at="now", updated_at="now", expires_at="later",
+            last_error_code=None, last_error=None, result=None,
+        )
+
+    def check_alipay_wallet(self):
+        return {"ready": True, "bound": True}
+
+    def get_alipay_payment_status(self, identifier):
+        return self.start_alipay_payment(
+            "https://provider.test", "svc", business_session_id="runtime-session"
+        )
+
+    def resume_alipay_payment(self, identifier):
+        session = self.get_alipay_payment_status(identifier)
+        session.status = "completed"
+        return session
+
+    def list_alipay_payment_sessions(self, **kwargs):
+        return [self.get_alipay_payment_status("mpay_alipay_1")]
+
     def pay(self, *args, **kwargs):
         self.calls.append(("pay", args, kwargs))
         return {"success": True}
@@ -150,6 +179,22 @@ def test_fastmcp_registration_exposes_constrained_tools():
     assert result.structuredContent["ok"] is True
 
 
+def test_alipay_start_forwards_real_business_session_and_returns_quote():
+    client = FakeClient()
+    result = MoltsPayMCP(client).alipay_start(
+        "https://provider.test", "pong",
+        "d52e3b71-d00e-4a51-bc16-169cba465bc9",
+        confirmed=True,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["businessSessionId"] == "d52e3b71-d00e-4a51-bc16-169cba465bc9"
+    assert result["data"]["amount"] == "1.00"
+    assert result["data"]["currency"] == "CNY"
+    call = next(call for call in client.calls if call[0] == "alipay_start")
+    assert call[2]["business_session_id"] == "d52e3b71-d00e-4a51-bc16-169cba465bc9"
+
+
 def test_balance_topup_order_returns_qr_image_content():
     pytest.importorskip("mcp")
     from moltspay.mcp import create_mcp_server
@@ -217,6 +262,11 @@ def test_fastmcp_registration_documents_optional_parameters_options_and_ranges()
         "pending", "paid", "completed", "expired", "cancelled", "failed", "unknown",
     ]
 
+    alipay_start = by_name["moltspay_alipay_start"]
+    assert "sessionId" in alipay_start.inputSchema["required"]
+    assert "real current framework" in alipay_start.inputSchema["properties"]["sessionId"]["description"].lower()
+    assert "mpay_alipay_*" in alipay_start.description
+
 
 def test_unified_pay_rejects_configured_interactive_preference():
     client = FakeClient()
@@ -269,6 +319,14 @@ def test_adapter_exposes_all_read_and_lifecycle_paths(monkeypatch):
     assert adapter.wechat_fulfill("WX1", confirmed=True)["data"]["status"] == "completed"
     assert adapter.wechat_cancel("WX1")["data"]["status"] == "cancelled"
     assert len(adapter.wechat_list(includeExpired=False)["data"]["sessions"]) == 1
+
+    assert adapter.alipay_check_wallet()["ok"]
+    assert adapter.alipay_start(
+        "https://provider.test", "svc", "runtime-session", dryRun=True,
+    )["data"]["sessionId"] == "runtime-session"
+    assert adapter.alipay_status("mpay_alipay_1")["ok"]
+    assert adapter.alipay_resume("mpay_alipay_1", confirmed=True)["data"]["status"] == "completed"
+    assert len(adapter.alipay_list()["data"]["sessions"]) == 1
 
     assert adapter.pay("https://provider.test", "svc", {}, dryRun=True)["data"]["intent"] == "pay"
     assert adapter.pay("https://provider.test", "svc", {}, rail="balance", confirmed=True)["ok"]

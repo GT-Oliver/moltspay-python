@@ -155,14 +155,21 @@ def http_response(status, body):
 def test_balance_client_query_topup_confirm_and_transactions():
     http = FakeBalanceHttp([
         http_response(404, {}),
-        http_response(200, {"balance": "3.00", "spent_today": "1.00"}),
+        http_response(200, {
+            "balance": "3.00", "spent_today": "1.00",
+            "topupPacks": ["0.01", "10.00", "20.00"],
+            "customTopupMax": "100.00",
+        }),
         http_response(200, {"transactions": [{"id": "tx1"}]}),
         http_response(200, {"out_trade_no": "WX1"}),
         http_response(400, {"error": "not paid"}),
         http_response(200, {"credited": True}),
     ])
     client = BalanceClient(buyer_id="buyer", http_client=http)
-    assert client.get_balance("https://provider.test/").balance == "3.00"
+    balance = client.get_balance("https://provider.test/")
+    assert balance.balance == "3.00"
+    assert balance.topup_packs == ["0.01", "10.00", "20.00"]
+    assert balance.custom_topup_max == "100.00"
     assert client.list_transactions("https://provider.test") == [{"id": "tx1"}]
     assert client.create_topup_order("https://provider.test", pack="2.00")["out_trade_no"] == "WX1"
     assert client.confirm_topup("https://provider.test", "WX1")["credited"] is False

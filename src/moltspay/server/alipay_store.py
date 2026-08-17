@@ -114,10 +114,19 @@ class AlipayOrderStore:
     def create_order(self, *, request_id: str, kind: str, amount_fen: int, resource_id: str, goods_name: str,
                      pay_before: str, service_id: Optional[str] = None, buyer_id: Optional[str] = None,
                      out_trade_no: Optional[str] = None, currency: str = "CNY") -> Dict[str, Any]:
-        if kind not in {"service", "balance_topup"} or amount_fen <= 0:
+        if kind not in {"service", "balance_topup"} or amount_fen <= 0 or not isinstance(service_id, str) or not service_id.strip():
             raise ValueError("invalid Alipay order")
+        service_id = service_id.strip()
         existing = self.get_by_request(request_id, kind, resource_id)
         if existing:
+            immutable = {
+                "service_id": service_id,
+                "amount_fen": amount_fen,
+                "currency": currency,
+                "buyer_id": buyer_id,
+            }
+            if any(existing.get(key) != value for key, value in immutable.items()):
+                raise ValueError("Alipay idempotency key conflicts with the existing order")
             return existing
         trade = out_trade_no or ("MPA" if kind == "service" else "MPT") + uuid.uuid4().hex[:26].upper()
         now = utc_now()

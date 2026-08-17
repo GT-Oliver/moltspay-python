@@ -22,6 +22,7 @@ class Service(BaseModel):
     available: bool = True
     provider: Optional[Dict[str, Any]] = None
     endpoint: Optional[str] = None
+    payment_rails: Dict[str, Any] = Field(default_factory=dict, alias="paymentRails")
 
     model_config = ConfigDict(populate_by_name=True, extra="allow")
     
@@ -113,6 +114,8 @@ class BuyerBalance(BaseModel):
     single_limit: Optional[str] = None
     daily_limit: Optional[str] = None
     status: str = "active"
+    topup_packs: List[str] = Field(default_factory=list)
+    custom_topup_max: Optional[str] = None
 
 
 class BalanceTopupSession(BaseModel):

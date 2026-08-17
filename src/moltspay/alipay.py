@@ -28,6 +28,8 @@ from .exceptions import (
     AlipayPaymentStateUnknown,
     AlipayPaymentTimeout,
     AlipayProtocolError,
+    AlipayRequestContextInvalid,
+    AlipayRequestContextMissing,
     AlipayWalletNotReady,
 )
 
@@ -96,6 +98,9 @@ class AlipayPaymentSession(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     payment_session_id: str
+    business_session_id: str = ""
+    amount: Optional[str] = None
+    currency: Optional[str] = None
     status: Literal["created", "pending", "processing", "completed", "rejected", "expired", "unknown"] = "created"
     request_id: str = ""
     resource_url: str = ""
@@ -119,18 +124,30 @@ class AlipayPaymentSession(BaseModel):
 
 
 def _json_objects(lines: Iterable[str]) -> List[Dict[str, Any]]:
-    """Extract complete JSON objects from structured CLI output."""
+    """Extract JSON objects from compact or pretty-printed CLI output.
+
+    The official CLI writes indented JSON and may surround it with diagnostic
+    lines.  Decode from each opening brace so formatting and log prefixes do
+    not hide the final structured result.
+    """
+    raw = "\n".join(str(line) for line in lines)
+    if len(raw.encode("utf-8", "replace")) > MAX_OUTPUT_BYTES:
+        return []
+    decoder = json.JSONDecoder()
     objects: List[Dict[str, Any]] = []
-    for line in lines:
-        text = str(line).strip()
-        if not text or len(text.encode("utf-8", "replace")) > MAX_OUTPUT_BYTES:
-            continue
+    offset = 0
+    while offset < len(raw):
+        start = raw.find("{", offset)
+        if start < 0:
+            break
         try:
-            item = json.loads(text)
-        except (TypeError, json.JSONDecodeError):
+            item, end = decoder.raw_decode(raw, start)
+        except json.JSONDecodeError:
+            offset = start + 1
             continue
         if isinstance(item, dict):
             objects.append(item)
+        offset = end
     return objects
 
 
@@ -225,7 +242,7 @@ class AlipayBuyerClient:
         self.config_dir = Path(config_dir).expanduser() if config_dir else Path.home() / ".moltspay"
         self.session_dir = self.config_dir / "alipay-sessions"
         self.executable = executable
-        self.framework = framework
+        self.framework = os.environ.get("AIPAY_FRAMEWORK") or framework
         self.runner = runner or self._run
 
     def _run(self, args: Sequence[str]) -> Sequence[str]:
@@ -317,22 +334,58 @@ class AlipayBuyerClient:
 
     def check_wallet(self) -> Dict[str, Any]:
         try:
-            lines = self.runner(["check-wallet"])
+            lines = list(self.runner(["check-wallet"]))
         except AlipayCliNotFound:
             raise
-        parsed = parse_alipay_cli_output(list(lines))
+        parsed = parse_alipay_cli_output(lines)
         raw = parsed.get("raw", "").upper()
-        objects = _json_objects(list(lines))
-        structured_ready = any(
-            obj.get("ready") is True or obj.get("success") is True or obj.get("code") in (200, "200") or (obj.get("opened") is True and obj.get("bound") is True)
-            for obj in objects
+        objects = _json_objects(lines)
+        result = objects[-1] if objects else {}
+        code = result.get("code")
+        message = str(result.get("message") or "")
+        status = str(result.get("status") or "")
+
+        # The official CLI uses code=200 for both a bound wallet and the
+        # applied-but-unbound state.  Treat only an explicit bound contract as
+        # ready; a successful status code alone is never sufficient.
+        ready = (
+            (code in (200, "200") and message == "已开启支付宝支付功能")
+            or (
+                result.get("ready") is True
+                and result.get("bound") is True
+            )
+            or (result.get("opened") is True and result.get("bound") is True)
+            or "已开启支付宝支付功能" in raw
         )
-        ready = structured_ready or parsed.get("normalized_status") == "completed" or any(
-            marker in raw for marker in ("READY", "OPENED", "BOUND", "SUCCESS", "已开通", "已绑定")
+        if ready:
+            return {"ready": True, "opened": True, "bound": True, "status": "bound"}
+        if code in (200, "200") and status == "applied_unbound":
+            raise AlipayWalletNotReady(
+                "Alipay AI wallet application is waiting for authorization",
+                details={"status": "applied_unbound", "reason": "waiting_for_authorization"},
+            )
+        if code in (500, "500") and message == "未开通":
+            raise AlipayWalletNotReady(
+                "Alipay AI wallet is not opened",
+                details={"status": "not_opened"},
+            )
+        raise AlipayWalletNotReady(
+            "Alipay AI wallet readiness could not be confirmed",
+            details={"status": status or "unknown"},
         )
-        if not ready:
-            raise AlipayWalletNotReady("Alipay AI wallet is not opened or bound")
-        return {"ready": True, "opened": True, "bound": True}
+
+    @staticmethod
+    def _business_session_id(value: Optional[str]) -> str:
+        session_id = str(value or os.environ.get("AIPAY_SESSION_ID") or "").strip()
+        if not session_id:
+            raise AlipayRequestContextMissing(
+                "A real runtime business session ID is required for Alipay payments"
+            )
+        if not SAFE_IDENTIFIER_RE.fullmatch(session_id) or session_id.startswith("mpay_alipay_"):
+            raise AlipayRequestContextInvalid(
+                "The Alipay business session ID is invalid or refers to a local payment session"
+            )
+        return session_id
 
     def start_402(
         self,
@@ -345,6 +398,7 @@ class AlipayBuyerClient:
         method: str = "POST",
         request_body: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        business_session_id: Optional[str] = None,
         intent_summary: str = "Alipay payment",
         timeout: float = 1800,
         context: Optional[Dict[str, Any]] = None,
@@ -355,11 +409,18 @@ class AlipayBuyerClient:
             request_body = data
         if not isinstance(payment_needed, str) or not payment_needed or len(payment_needed) > MAX_HEADER_BYTES * 2:
             raise AlipayProtocolError("Payment-Needed is missing or too large")
+        requirement_data = decode_a402_json(payment_needed, name="Payment-Needed")
+        protocol = requirement_data.get("protocol") if isinstance(requirement_data.get("protocol"), dict) else {}
+        amount = str(protocol.get("amount")) if protocol.get("amount") is not None else None
+        currency = str(protocol.get("currency")) if protocol.get("currency") is not None else None
+        business_session_id = self._business_session_id(business_session_id)
         request_id = request_id or f"req_{uuid.uuid4().hex}"
         _safe_identifier(request_id, "request ID")
         now = time.time()
         session = AlipayPaymentSession(
-            payment_session_id=f"mpay_alipay_{uuid.uuid4().hex}", status="pending",
+            payment_session_id=f"mpay_alipay_{uuid.uuid4().hex}",
+            business_session_id=business_session_id, amount=amount, currency=currency,
+            status="pending",
             request_id=request_id, resource_url=resource_url, method=method.upper(),
             request_body=request_body, data=request_body, request_headers=headers or {}, intent_summary=intent_summary,
             context=context or {}, created_at=_iso(now), updated_at=_iso(now), expires_at=_iso(now + timeout),
@@ -382,13 +443,13 @@ class AlipayBuyerClient:
         session = self._update(session, challenge_path=str(challenge_path))
         try:
             self.runner([
-                "payment-intent", "--session-id", session.payment_session_id,
+                "payment-intent", "--session-id", business_session_id,
                 "--intent-summary", intent_summary, "--framework", self.framework,
             ])
             self.check_wallet()
             args = [
                 "402-buyer-pay", "--file", str(challenge_path), "--resource-url", resource_url,
-                "--resource-type", "http", "--session-id", session.payment_session_id,
+                "--resource-type", "http", "--session-id", business_session_id,
                 "--intent-summary", intent_summary, "--framework", self.framework,
             ]
             if method:

@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from moltspay.cli import build_parser, cmd_limits, cmd_pay, cmd_status, configure_stdio, cmd_wechat
+from moltspay.cli import build_parser, client_for, cmd_limits, cmd_pay, cmd_status, configure_stdio, cmd_wechat
 from moltspay.models import Balance, Limits, PaymentResult
 
 
@@ -157,3 +157,46 @@ def test_pay_passes_repeat_policy_and_prints_each_balance_topup_qr(monkeypatch, 
     assert json.loads(captured.out)["success"] is True
     assert captured.err.count("Provider balance top-up required: CNY 10") == 2
     assert shown == ["weixin://pay/topup-1", "weixin://pay/topup-2"]
+
+
+def test_pay_forwards_alipay_runtime_session_and_framework(monkeypatch, capsys):
+    observed = {}
+
+    class FakeClient:
+        def pay(self, server, service, **kwargs):
+            observed.update(server=server, service=service, kwargs=kwargs)
+            return PaymentResult(
+                success=True, amount=1.0, token="CNY", service_id=service,
+                result={"ok": True},
+            )
+
+    monkeypatch.setattr("moltspay.cli.client_for", lambda args: FakeClient())
+    args = build_parser().parse_args([
+        "pay", "https://provider.test", "pong", "--rail", "alipay",
+        "--session-id", "d52e3b71-d00e-4a51-bc16-169cba465bc9",
+        "--framework", "openclaw",
+    ])
+
+    assert args.framework == "openclaw"
+    assert cmd_pay(args) == 0
+    assert observed["kwargs"]["rail_options"]["business_session_id"] == (
+        "d52e3b71-d00e-4a51-bc16-169cba465bc9"
+    )
+    assert json.loads(capsys.readouterr().out)["token"] == "CNY"
+
+
+def test_client_for_passes_alipay_framework(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeMoltsPay:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("moltspay.cli.MoltsPay", FakeMoltsPay)
+    args = type("Args", (), {
+        "config_dir": str(tmp_path), "chain": "base", "framework": "openclaw",
+    })()
+
+    client_for(args)
+
+    assert captured["alipay_framework"] == "openclaw"

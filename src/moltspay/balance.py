@@ -295,6 +295,8 @@ class BalanceClient:
             spent_today=str(data.get("spent_today", data.get("today_spent", "0.00"))),
             single_limit=data.get("single_limit"), daily_limit=data.get("daily_limit"),
             status=data.get("status", "active"),
+            topup_packs=[str(item) for item in data.get("topupPacks", data.get("topup_packs", []))],
+            custom_topup_max=data.get("customTopupMax", data.get("custom_topup_max")),
         )
 
     def list_transactions(self, server_url: str, buyer_id: Optional[str] = None, limit: int = 20, offset: int = 0) -> list[Dict[str, Any]]:

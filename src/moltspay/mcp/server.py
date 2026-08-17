@@ -42,6 +42,16 @@ Identifier = Annotated[
         ),
     ),
 ]
+BusinessSessionId = Annotated[
+    str,
+    Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+        description=(
+            "Real current framework conversation/session ID passed to alipay-bot; usually a UUID. "
+            "Never pass a local mpay_alipay_* payment session ID."
+        ),
+    ),
+]
 OutTradeNo = Annotated[
     str,
     Field(
@@ -212,6 +222,9 @@ def _alipay_session(session: Any) -> Dict[str, Any]:
     """Serialize only safe recoverability metadata; never expose proof/challenge."""
     return _camel({
         "payment_session_id": session.payment_session_id,
+        "business_session_id": session.business_session_id,
+        "amount": session.amount,
+        "currency": session.currency,
         "status": session.status,
         "request_id": session.request_id,
         "resource_url": session.resource_url,
@@ -380,12 +393,15 @@ class MoltsPayMCP:
     def alipay_check_wallet(self, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         return self._run(self.client.check_alipay_wallet, requestId)
 
-    def alipay_start(self, serverUrl: HttpUrl, service: ServiceId, params: Optional[ServiceParams] = None, intentSummary: Optional[IntentSummary] = None, timeoutSeconds: Optional[PositiveSeconds] = None, confirmed: Confirmed = False, dryRun: DryRun = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
+    def alipay_start(self, serverUrl: HttpUrl, service: ServiceId, sessionId: BusinessSessionId, params: Optional[ServiceParams] = None, intentSummary: Optional[IntentSummary] = None, timeoutSeconds: Optional[PositiveSeconds] = None, confirmed: Confirmed = False, dryRun: DryRun = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         def call():
             if dryRun:
-                return {"intent": "start_alipay_payment", "serverUrl": serverUrl, "service": service, "params": params or {}, "intentSummary": intentSummary, "timeoutSeconds": timeoutSeconds}
+                return {"intent": "start_alipay_payment", "serverUrl": serverUrl, "service": service, "sessionId": sessionId, "params": params or {}, "intentSummary": intentSummary, "timeoutSeconds": timeoutSeconds}
             self._confirm(confirmed)
-            return _alipay_session(self.client.start_alipay_payment(serverUrl, service, params or {}, intent_summary=intentSummary, timeout=timeoutSeconds, request_id=requestId))
+            return _alipay_session(self.client.start_alipay_payment(
+                serverUrl, service, params or {}, business_session_id=sessionId,
+                intent_summary=intentSummary, timeout=timeoutSeconds, request_id=requestId,
+            ))
         return self._run(call, requestId)
 
     def alipay_status(self, identifier: Identifier, requestId: Optional[RequestId] = None) -> ToolEnvelope:
@@ -490,7 +506,9 @@ TOOL_DESCRIPTIONS = {
     "alipay_check_wallet": "Read-only check of the official Alipay AI wallet readiness; never pays or changes local state.",
     "alipay_start": (
         "Start a recoverable Alipay A402 service payment. This creates an interactive payment session and may "
-        "invoke the official alipay-bot; dryRun=true performs no network, subprocess, or local write."
+        "invoke the official alipay-bot. sessionId is required and must be the real current framework "
+        "conversation/session ID (usually a UUID), never the returned local mpay_alipay_* paymentSessionId. "
+        "dryRun=true performs no network, subprocess, or local write."
     ),
     "alipay_status": "Read one local Alipay session without contacting Alipay, invoking alipay-bot, or retrying the provider.",
     "alipay_resume": "Resume an Alipay session; this is side-effectful and may query payment, retry the resource, and confirm fulfillment.",
@@ -571,6 +589,7 @@ def create_mcp_server(client: Optional[MoltsPay] = None):
             def alipay_start_tool(
                 serverUrl: HttpUrl,
                 service: ServiceId,
+                sessionId: BusinessSessionId,
                 params: Optional[ServiceParams] = None,
                 intentSummary: Optional[IntentSummary] = None,
                 timeoutSeconds: Optional[PositiveSeconds] = None,
@@ -578,7 +597,10 @@ def create_mcp_server(client: Optional[MoltsPay] = None):
                 dryRun: DryRun = False,
                 requestId: Optional[RequestId] = None,
             ):
-                result = adapter.alipay_start(serverUrl, service, params, intentSummary, timeoutSeconds, confirmed, dryRun, requestId)
+                result = adapter.alipay_start(
+                    serverUrl, service, sessionId, params, intentSummary,
+                    timeoutSeconds, confirmed, dryRun, requestId,
+                )
                 result_text = json.dumps(result, ensure_ascii=False, default=str)
                 return CallToolResult(content=[TextContent(type="text", text=result_text)], structuredContent=result)
 

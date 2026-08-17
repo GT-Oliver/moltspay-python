@@ -5,6 +5,7 @@
                      "wallet":  "0xea595b4459593e9Fe76fFad3C47e5B77C04a5348",
                      "chains":  [
                                     "wechat",
+                                    "alipay",
                                     "balance"
                                 ],
                      "balance":  {
@@ -13,7 +14,9 @@
                                      "single_limit":  "50.00",
                                      "daily_limit":  "200.00",
                                      "topup_packs":  [
-                                                         "10.00",
+                                                        "0.01",
+                                                         "0.10",
+                                                        "10.00",
                                                          "20.00",
                                                          "50.00",
                                                          "100.00"
@@ -28,7 +31,14 @@
                                     "private_key_path":  "cert/apiclient_key.pem",
                                     "apiv3_key":  "wYa1e3cxyWWkHfSlRG4l8VPbV451288t",
                                     "notify_url":  "https://sr007.com/notify"
-                                }
+                                },
+                     "alipay": {
+                                    "seller_id": "2088641494699428",
+                                    "app_id": "2021006150642142",
+                                    "seller_name": "上海超响应数字科技有限公司",
+                                    "balance_topup_service_id": "API_0EA6DC4FC99A4DF7",
+                                    "private_key_path": "cert/alipay/ALIPAY_PRIVATE_KEY.pem",
+                                    "public_key_path": "cert/alipay/ALIPAY_APP_PUBLIC_KEY.pem"                                    }
                  },
     "services":  [
                      {
@@ -42,11 +52,17 @@
 
                                    },
                          "output":  {
-
+                                        "result":  "pong"
                                     },
                          "balance":  {
                                          "price":  "0.01"
                                      },
+                         "alipay":  {
+                                        "service_id": "API_0EA6DC4FC99A4DF7",
+                                        "price_cny": "0.01",
+                                        "goods_name": "Ping",
+                                        "resource_id": "/execute?service=ping"
+                                    },
                          "wechat":  {
                                         "price_cny":  "0.01",
                                         "description":  "Local CNY balance test service"
@@ -63,11 +79,17 @@
 
                                    },
                          "output":  {
-
+                                        "result":  "ping"
                                     },
                          "balance":  {
                                          "price":  "1"
                                      },
+                         "alipay":  {
+                                        "service_id": "API_0EA6DC4FC99A4DF7",
+                                        "price_cny": "1.00",
+                                        "goods_name": "Pong",
+                                        "resource_id": "/execute?service=pong"
+                                    },
                          "wechat":  {
                                         "price_cny":  "1",
                                         "description":  "Local CNY balance test service"

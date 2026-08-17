@@ -22,6 +22,7 @@ def config_dir(args) -> Path:
 
 def client_for(args, **kwargs) -> MoltsPay:
     root = config_dir(args)
+    kwargs.setdefault("alipay_framework", getattr(args, "framework", None))
     return MoltsPay(
         chain=getattr(args, "chain", None) or "base",
         config_dir=str(root),
@@ -148,6 +149,7 @@ def cmd_pay(args) -> int:
             "topup_rail": getattr(args, "topup_rail", "wechat"),
             "on_topup_required": show_topup,
             "intent_summary": getattr(args, "intent_summary", None),
+            "business_session_id": getattr(args, "session_id", None),
             "timeout": getattr(args, "timeout", None),
             "poll_interval": getattr(args, "poll_interval", 3.0),
         },
@@ -379,6 +381,17 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--topup-poll-interval", type=float, default=2.0)
     command.add_argument("--topup-rail", choices=["wechat", "alipay"], default="wechat")
     command.add_argument("--intent-summary", help="Human-readable purpose passed to the official Alipay CLI")
+    command.add_argument(
+        "--session-id",
+        help=(
+            "Real runtime business session ID for Alipay; defaults to AIPAY_SESSION_ID. "
+            "Local mpay_alipay_* IDs are rejected."
+        ),
+    )
+    command.add_argument(
+        "--framework",
+        help="Runtime framework name for Alipay; defaults to AIPAY_FRAMEWORK or moltspay",
+    )
     command.add_argument("--timeout", type=float, help="Maximum Alipay interaction time in seconds")
     command.add_argument("--poll-interval", type=float, default=3.0, help="Alipay resume polling interval")
     command.add_argument("--config-dir", default=config_default)
