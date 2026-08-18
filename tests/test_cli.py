@@ -4,7 +4,8 @@ import json
 
 import pytest
 
-from moltspay.cli import build_parser, client_for, cmd_limits, cmd_pay, cmd_status, configure_stdio, cmd_wechat
+from moltspay.cli import build_parser, client_for, cmd_alipay, cmd_limits, cmd_pay, cmd_status, configure_stdio, cmd_wechat
+from moltspay.exceptions import InteractiveRailRequiresLifecycle
 from moltspay.models import Balance, Limits, PaymentResult
 
 
@@ -159,30 +160,54 @@ def test_pay_passes_repeat_policy_and_prints_each_balance_topup_qr(monkeypatch, 
     assert shown == ["weixin://pay/topup-1", "weixin://pay/topup-2"]
 
 
-def test_pay_forwards_alipay_runtime_session_and_framework(monkeypatch, capsys):
-    observed = {}
-
-    class FakeClient:
-        def pay(self, server, service, **kwargs):
-            observed.update(server=server, service=service, kwargs=kwargs)
-            return PaymentResult(
-                success=True, amount=1.0, token="CNY", service_id=service,
-                result={"ok": True},
-            )
-
-    monkeypatch.setattr("moltspay.cli.client_for", lambda args: FakeClient())
+def test_pay_rejects_blocking_alipay_lifecycle_in_openclaw(monkeypatch):
+    monkeypatch.setenv("AIPAY_FRAMEWORK", "openclaw")
+    monkeypatch.setattr(
+        "moltspay.cli.client_for",
+        lambda args: (_ for _ in ()).throw(AssertionError("must reject before provider request")),
+    )
     args = build_parser().parse_args([
         "pay", "https://provider.test", "pong", "--rail", "alipay",
         "--session-id", "d52e3b71-d00e-4a51-bc16-169cba465bc9",
-        "--framework", "openclaw",
     ])
 
-    assert args.framework == "openclaw"
-    assert cmd_pay(args) == 0
-    assert observed["kwargs"]["rail_options"]["business_session_id"] == (
-        "d52e3b71-d00e-4a51-bc16-169cba465bc9"
-    )
-    assert json.loads(capsys.readouterr().out)["token"] == "CNY"
+    with pytest.raises(InteractiveRailRequiresLifecycle) as error:
+        cmd_pay(args)
+
+    assert error.value.details == {"command": "moltspay alipay start"}
+
+
+def test_alipay_start_is_nonblocking_and_emits_media(monkeypatch, capsys):
+    observed = {}
+
+    class Session:
+        status = "pending"
+        media_paths = ["/tmp/alipay-payment.png"]
+
+        def model_dump(self):
+            return {
+                "status": self.status,
+                "media_paths": self.media_paths,
+                "payment_session_id": "mpay_alipay_1",
+            }
+
+    class FakeClient:
+        def start_alipay_payment(self, server, service, params, **kwargs):
+            observed.update(server=server, service=service, params=params, kwargs=kwargs)
+            return Session()
+
+    monkeypatch.setattr("moltspay.cli.client_for", lambda args: FakeClient())
+    args = build_parser().parse_args([
+        "alipay", "start", "https://provider.test", "pong", '{"x":1}',
+        "--session-id", "d52e3b71-d00e-4a51-bc16-169cba465bc9",
+        "--framework", "openclaw", "--intent-summary", "原始请求：购买 pong 服务",
+    ])
+
+    assert cmd_alipay(args) == 0
+    output = capsys.readouterr().out
+    assert '"status": "pending"' in output
+    assert "MEDIA: /tmp/alipay-payment.png" in output
+    assert observed["kwargs"]["business_session_id"] == "d52e3b71-d00e-4a51-bc16-169cba465bc9"
 
 
 def test_client_for_passes_alipay_framework(monkeypatch, tmp_path):

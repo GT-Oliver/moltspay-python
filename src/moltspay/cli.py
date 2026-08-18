@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,7 @@ from . import __version__
 from .chains import CHAINS, is_testnet, list_chains
 from .client import MoltsPay
 from .wallet import DEFAULT_WALLET_PATH, Wallet
-from .exceptions import MoltsPayError
+from .exceptions import InteractiveRailRequiresLifecycle, MoltsPayError
 
 DEFAULT_CONFIG_DIR = DEFAULT_WALLET_PATH.parent
 
@@ -120,6 +121,13 @@ def cmd_faucet(args) -> int:
 
 
 def cmd_pay(args) -> int:
+    framework = getattr(args, "framework", None) or os.environ.get("AIPAY_FRAMEWORK")
+    if args.rail == "alipay" and str(framework or "").lower() == "openclaw":
+        raise InteractiveRailRequiresLifecycle(
+            "Interactive Alipay payments in OpenClaw require the non-blocking "
+            "'moltspay alipay start' lifecycle",
+            details={"command": "moltspay alipay start"},
+        )
     params = json.loads(args.params or "{}") if isinstance(args.params, str) else (args.params or {})
     if args.image is not None:
         params["image"] = args.image
@@ -161,6 +169,23 @@ def cmd_pay(args) -> int:
 def cmd_alipay(args) -> int:
     client = client_for(args)
     command = args.alipay_command
+    if command == "start":
+        params = json.loads(args.params or "{}") if isinstance(args.params, str) else (args.params or {})
+        if not isinstance(params, dict):
+            raise ValueError("params must contain a JSON object")
+        session = client.start_alipay_payment(
+            args.server,
+            args.service,
+            params,
+            intent_summary=args.intent_summary,
+            timeout=args.timeout,
+            request_id=args.request_id,
+            business_session_id=args.session_id,
+        )
+        output(session)
+        for media_path in session.media_paths:
+            print(f"MEDIA: {media_path}")
+        return 0 if session.status in {"pending", "processing", "completed"} else 1
     if command == "check-wallet":
         output(client.check_alipay_wallet())
     elif command == "status":
@@ -519,6 +544,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     command = sub.add_parser("alipay", help="Manage Alipay A402 payments", description="Start and recover Alipay AI Pay sessions")
     children = command.add_subparsers(dest="alipay_command", required=True)
+    child = children.add_parser("start", help="Start one recoverable Alipay payment without polling")
+    child.add_argument("server")
+    child.add_argument("service")
+    child.add_argument("params", nargs="?")
+    child.add_argument("--session-id", help="Real runtime business session ID; defaults to AIPAY_SESSION_ID")
+    child.add_argument("--framework", help="Runtime framework name; defaults to AIPAY_FRAMEWORK or moltspay")
+    child.add_argument("--intent-summary")
+    child.add_argument("--timeout", type=float)
+    child.add_argument("--request-id")
+    child.add_argument("--config-dir", default=config_default)
+    child.add_argument("--json", action="store_true")
     child = children.add_parser("check-wallet", help="Read official Alipay AI wallet readiness")
     child.add_argument("--config-dir", default=config_default)
     child.add_argument("--json", action="store_true")

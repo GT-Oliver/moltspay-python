@@ -7,6 +7,7 @@ import io
 import json
 import os
 import uuid
+from pathlib import Path
 from typing import Annotated, Any, Callable, Dict, Literal, Optional, Union
 
 import httpx
@@ -232,6 +233,7 @@ def _alipay_session(session: Any) -> Dict[str, Any]:
         "out_shake_no": session.out_shake_no,
         "trade_no": session.trade_no,
         "out_trade_no": session.out_trade_no,
+        "media_paths": getattr(session, "media_paths", []),
         "created_at": session.created_at,
         "updated_at": session.updated_at,
         "expires_at": session.expires_at,
@@ -552,6 +554,30 @@ def create_mcp_server(client: Optional[MoltsPay] = None):
             content.append(ImageContent(type="image", data=qr["data"], mimeType="image/png"))
         return CallToolResult(content=content, structuredContent=result)
 
+    def alipay_image_result(result: Dict[str, Any]) -> Any:
+        content = [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, default=str))]
+        media_paths = result.get("data", {}).get("mediaPaths", []) if result.get("ok") else []
+        if not isinstance(media_paths, list):
+            media_paths = []
+        for value in media_paths:
+            try:
+                path = Path(value)
+                if path.suffix.lower() != ".png" or path.is_symlink() or not path.is_file():
+                    continue
+                if path.stat().st_size > 10 * 1024 * 1024:
+                    continue
+                payload = path.read_bytes()
+                if len(payload) > 10 * 1024 * 1024 or not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+                    continue
+                content.append(ImageContent(
+                    type="image",
+                    data=base64.b64encode(payload).decode("ascii"),
+                    mimeType="image/png",
+                ))
+            except (OSError, TypeError, ValueError):
+                continue
+        return CallToolResult(content=content, structuredContent=result)
+
     for name, description in TOOL_DESCRIPTIONS.items():
         if name == "balance_topup_order":
             def balance_topup_order_tool(
@@ -601,8 +627,7 @@ def create_mcp_server(client: Optional[MoltsPay] = None):
                     serverUrl, service, sessionId, params, intentSummary,
                     timeoutSeconds, confirmed, dryRun, requestId,
                 )
-                result_text = json.dumps(result, ensure_ascii=False, default=str)
-                return CallToolResult(content=[TextContent(type="text", text=result_text)], structuredContent=result)
+                return alipay_image_result(result)
 
             alipay_start_tool.__annotations__["return"] = Annotated[CallToolResult, ToolEnvelope]
             handler = alipay_start_tool

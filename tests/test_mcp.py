@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -193,6 +194,35 @@ def test_alipay_start_forwards_real_business_session_and_returns_quote():
     assert result["data"]["currency"] == "CNY"
     call = next(call for call in client.calls if call[0] == "alipay_start")
     assert call[2]["business_session_id"] == "d52e3b71-d00e-4a51-bc16-169cba465bc9"
+
+
+def test_alipay_start_returns_current_qr_as_image_content(tmp_path: Path):
+    pytest.importorskip("mcp")
+    from moltspay.mcp import create_mcp_server
+
+    image_path = tmp_path / "payment.png"
+    image_bytes = b"\x89PNG\r\n\x1a\ncurrent-payment-image"
+    image_path.write_bytes(image_bytes)
+    client = FakeClient()
+    original = client.start_alipay_payment
+
+    def start_with_media(*args, **kwargs):
+        session = original(*args, **kwargs)
+        session.media_paths = [str(image_path)]
+        return session
+
+    client.start_alipay_payment = start_with_media
+    server = create_mcp_server(client)
+    result = asyncio.run(server.call_tool("moltspay_alipay_start", {
+        "serverUrl": "https://provider.test",
+        "service": "pong",
+        "sessionId": "d52e3b71-d00e-4a51-bc16-169cba465bc9",
+        "confirmed": True,
+    }))
+
+    image = next(item for item in result.content if getattr(item, "type", None) == "image")
+    assert base64.b64decode(image.data) == image_bytes
+    assert result.structuredContent["data"]["mediaPaths"] == [str(image_path)]
 
 
 def test_balance_topup_order_returns_qr_image_content():

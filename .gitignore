@@ -22,3 +22,4 @@ build/
 htmlcov/                                                                                                     
 *.log                                                                                                        
 .DS_Store
+/.alipay-sandbox.json

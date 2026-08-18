@@ -40,6 +40,9 @@ MAX_HEADER_BYTES = 16 * 1024
 MAX_OUTPUT_BYTES = 256 * 1024
 SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TRADE_NO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# 8282 is the documented query-number family; alipay-bot 0.4.0 emits the
+# successor 8283 family. Both retain the same 32-digit recovery contract.
+OUT_SHAKE_NO_RE = re.compile(r"^\d{10}828[23]\d{18}$")
 
 
 def _iso(timestamp: float) -> str:
@@ -112,6 +115,7 @@ class AlipayPaymentSession(BaseModel):
     trade_no: Optional[str] = None
     out_trade_no: Optional[str] = None
     payment_url: Optional[str] = None
+    media_paths: List[str] = Field(default_factory=list)
     challenge_path: Optional[str] = None
     intent_summary: str = "Alipay payment"
     context: Dict[str, Any] = Field(default_factory=dict)
@@ -187,6 +191,43 @@ def parse_alipay_cli_output(lines: Sequence[str]) -> Dict[str, Any]:
         if found:
             result[key] = found
     raw = _flatten_cli(lines)
+    media_paths = [
+        match.group(1).strip()
+        for match in re.finditer(r"(?m)^MEDIA:\s*(\S.*?)\s*$", raw)
+        if match.group(1).strip()
+    ]
+    if media_paths:
+        result["media_paths"] = media_paths
+    if not result.get("out_shake_no"):
+        # The official CLI's interactive output uses customer-facing Chinese
+        # labels rather than JSON in some channels. Only accept an unambiguous
+        # 32-digit value directly following an approved recovery label; never
+        # infer a query number from a URL or unrelated digits.
+        candidates = {
+            match.group(1)
+            for match in re.finditer(
+                r"(?:订单号|查询单号)\s*[:：=]\s*(\d{32})(?!\d)", raw
+            )
+            if OUT_SHAKE_NO_RE.fullmatch(match.group(1))
+        }
+        if len(candidates) == 1:
+            result["out_shake_no"] = candidates.pop()
+    if not result.get("out_shake_no") and media_paths:
+        # alipay-bot 0.4.0 can emit only a MEDIA line for polling-pay QR
+        # responses. Its official payment PNG basename is the outShakeNo.
+        # Limit this compatibility path to the current command output, the
+        # exact official temporary directory, and one unambiguous valid ID.
+        candidates = set()
+        for media_path in media_paths:
+            match = re.fullmatch(
+                r"/(?:private/)?tmp/openclaw/alipay-bot-cli/qrcode/"
+                r"payment_(\d{32})\.png",
+                media_path,
+            )
+            if match and OUT_SHAKE_NO_RE.fullmatch(match.group(1)):
+                candidates.add(match.group(1))
+        if len(candidates) == 1:
+            result["out_shake_no"] = candidates.pop()
     if not result.get("trade_no"):
         match = re.search(r"(?:交易号|trade[_ -]?no)\s*[:：=]\s*([A-Za-z0-9._-]+)", raw, re.I)
         if match and TRADE_NO_RE.fullmatch(match.group(1)):
@@ -467,7 +508,7 @@ class AlipayBuyerClient:
         except Exception as exc:
             return self._update(session, status="unknown", last_error_code="alipay_payment_state_unknown", last_error="Alipay payment result is unknown")
         changes: Dict[str, Any] = {}
-        for key in ("out_shake_no", "trade_no", "out_trade_no", "payment_url"):
+        for key in ("out_shake_no", "trade_no", "out_trade_no", "payment_url", "media_paths"):
             if parsed.get(key):
                 changes[key] = parsed[key]
         changes["status"] = "completed" if parsed.get("normalized_status") == "completed" else "pending"

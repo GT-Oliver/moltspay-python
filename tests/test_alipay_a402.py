@@ -7,7 +7,12 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from moltspay.alipay import AlipayBuyerClient, decode_a402_json, encode_a402_json
+from moltspay.alipay import (
+    AlipayBuyerClient,
+    decode_a402_json,
+    encode_a402_json,
+    parse_alipay_cli_output,
+)
 from moltspay.client import MoltsPay
 from moltspay.exceptions import (
     AlipayRequestContextInvalid,
@@ -110,13 +115,18 @@ def test_facilitator_rejects_verified_service_mismatch():
 
 def test_buyer_session_persists_and_resumes_without_proof(tmp_path):
     calls = []
+    out_shake_no = "12345678908282123456789012345678"
 
     def runner(args):
         calls.append(list(args))
         if args[0] == "check-wallet":
             return ['{"ready":true,"opened":true,"bound":true}']
         if args[0] == "402-buyer-pay":
-            return ['{"status":"pending","tradeNo":"trade-1","outTradeNo":"MPA1"}']
+            return [
+                "请使用支付宝完成支付",
+                "MEDIA: /tmp/openclaw/alipay-bot-cli/qrcode/"
+                f"payment_{out_shake_no}.png",
+            ]
         if args[0] == "402-query-payment-status":
             return ['{"status":"completed","tradeNo":"trade-1","result":{"ok":true}}']
         return ['{"ok":true}']
@@ -128,8 +138,15 @@ def test_buyer_session_persists_and_resumes_without_proof(tmp_path):
         business_session_id="d52e3b71-d00e-4a51-bc16-169cba465bc9",
     )
     assert session.status == "pending"
+    assert session.out_shake_no == out_shake_no
+    assert session.media_paths == [
+        "/tmp/openclaw/alipay-bot-cli/qrcode/"
+        f"payment_{out_shake_no}.png"
+    ]
     completed = client.resume(session.payment_session_id)
     assert completed.status == "completed"
+    query = next(call for call in calls if call[0] == "402-query-payment-status")
+    assert query[query.index("--out-shake-no") + 1] == out_shake_no
     persisted = (tmp_path / "alipay-sessions" / f"{session.payment_session_id}.json").read_text()
     assert "Payment-Proof" not in persisted
     assert all("payment_proof" not in " ".join(call) for call in calls)
@@ -137,6 +154,37 @@ def test_buyer_session_persists_and_resumes_without_proof(tmp_path):
         "mpay_alipay_" not in call[call.index("--session-id") + 1]
         for call in calls if "--session-id" in call
     )
+
+
+@pytest.mark.parametrize("label", ["订单号", "查询单号"])
+@pytest.mark.parametrize("family", ["8282", "8283"])
+def test_cli_output_parses_labeled_recovery_number(label, family):
+    out_shake_no = f"1234567890{family}123456789012345678"
+
+    parsed = parse_alipay_cli_output([
+        f"- {label}：{out_shake_no}",
+        "MEDIA: /tmp/openclaw/alipay-bot-cli/qrcode/payment_ignored.png",
+    ])
+
+    assert parsed["out_shake_no"] == out_shake_no
+
+
+def test_cli_output_parses_recovery_number_from_official_current_media_path():
+    out_shake_no = "12345678908283123456789012345678"
+    parsed = parse_alipay_cli_output([
+        "MEDIA: /tmp/openclaw/alipay-bot-cli/qrcode/"
+        f"payment_{out_shake_no}.png",
+    ])
+
+    assert parsed["out_shake_no"] == out_shake_no
+
+
+def test_cli_output_does_not_infer_recovery_number_from_arbitrary_media_path():
+    parsed = parse_alipay_cli_output([
+        "MEDIA: /tmp/untrusted/payment_12345678908282123456789012345678.png",
+    ])
+
+    assert "out_shake_no" not in parsed
 
 
 def test_wallet_code_200_applied_unbound_is_not_ready():
