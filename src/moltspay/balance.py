@@ -337,19 +337,19 @@ class BalanceClient:
     def topup_balance(
         self, server_url: str, amount: str, rail: str, buyer_id: Optional[str] = None,
         tx_hash: Optional[str] = None, chain: Optional[str] = None,
-        trade_no: Optional[str] = None, out_trade_no: Optional[str] = None,
+        out_trade_no: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Report an externally settled payment for ledger credit (Node parity)."""
+        if str(rail).lower() == "alipay":
+            raise PaymentError("Alipay balance top-ups are not supported")
         body: Dict[str, Any] = {"buyer_id": self._buyer(buyer_id), "amount": str(amount), "rail": rail}
         if tx_hash:
             body["tx_hash"] = tx_hash
         if chain:
             body["chain"] = chain
-        if trade_no:
-            body["trade_no"] = trade_no
         if out_trade_no:
             body["out_trade_no"] = out_trade_no
-        body["external_ref"] = tx_hash or trade_no or out_trade_no or f"{rail}:{amount}"
+        body["external_ref"] = tx_hash or out_trade_no or f"{rail}:{amount}"
         response = self.http.post(f"{server_url.rstrip('/')}/balance/topup", json=body)
         data = response.json()
         if not response.is_success:

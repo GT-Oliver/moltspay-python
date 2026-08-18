@@ -39,9 +39,8 @@ class AlipayOrderStore:
         CREATE TABLE IF NOT EXISTS alipay_orders (
           out_trade_no TEXT PRIMARY KEY,
           request_id TEXT NOT NULL,
-          kind TEXT NOT NULL CHECK(kind IN ('service','balance_topup')),
+          kind TEXT NOT NULL CHECK(kind = 'service'),
           service_id TEXT,
-          buyer_id TEXT,
           amount_fen INTEGER NOT NULL,
           currency TEXT NOT NULL DEFAULT 'CNY',
           resource_id TEXT NOT NULL,
@@ -52,7 +51,6 @@ class AlipayOrderStore:
           status TEXT NOT NULL,
           result_json TEXT,
           error_code TEXT,
-          ledger_tx_id TEXT UNIQUE,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           completed_at TEXT,
@@ -112,9 +110,9 @@ class AlipayOrderStore:
         return self._row(self.db.execute("SELECT * FROM alipay_orders WHERE proof_hash=?", (digest,)).fetchone())
 
     def create_order(self, *, request_id: str, kind: str, amount_fen: int, resource_id: str, goods_name: str,
-                     pay_before: str, service_id: Optional[str] = None, buyer_id: Optional[str] = None,
+                     pay_before: str, service_id: Optional[str] = None,
                      out_trade_no: Optional[str] = None, currency: str = "CNY") -> Dict[str, Any]:
-        if kind not in {"service", "balance_topup"} or amount_fen <= 0 or not isinstance(service_id, str) or not service_id.strip():
+        if kind != "service" or amount_fen <= 0 or not isinstance(service_id, str) or not service_id.strip():
             raise ValueError("invalid Alipay order")
         service_id = service_id.strip()
         existing = self.get_by_request(request_id, kind, resource_id)
@@ -123,19 +121,18 @@ class AlipayOrderStore:
                 "service_id": service_id,
                 "amount_fen": amount_fen,
                 "currency": currency,
-                "buyer_id": buyer_id,
             }
             if any(existing.get(key) != value for key, value in immutable.items()):
                 raise ValueError("Alipay idempotency key conflicts with the existing order")
             return existing
-        trade = out_trade_no or ("MPA" if kind == "service" else "MPT") + uuid.uuid4().hex[:26].upper()
+        trade = out_trade_no or "MPA" + uuid.uuid4().hex[:26].upper()
         now = utc_now()
         with self._transaction():
             self.db.execute(
                 """INSERT INTO alipay_orders
-                (out_trade_no,request_id,kind,service_id,buyer_id,amount_fen,currency,resource_id,goods_name,pay_before,status,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?, ?, ?)""",
-                (trade, request_id, kind, service_id, buyer_id, amount_fen, currency, resource_id, goods_name, pay_before, "offered", now, now),
+                (out_trade_no,request_id,kind,service_id,amount_fen,currency,resource_id,goods_name,pay_before,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (trade, request_id, kind, service_id, amount_fen, currency, resource_id, goods_name, pay_before, "offered", now, now),
             )
         return self.get(trade) or {}
 
@@ -179,7 +176,7 @@ class AlipayOrderStore:
         with self._transaction():
             self.db.execute("UPDATE alipay_orders SET trade_no=?,proof_hash=?,status='verified',updated_at=? WHERE out_trade_no=? AND status='offered'", (trade_no, digest, utc_now(), out_trade_no))
 
-    def complete(self, out_trade_no: str, result: Any, *, ledger_tx_id: Optional[str] = None) -> Dict[str, Any]:
+    def complete(self, out_trade_no: str, result: Any) -> Dict[str, Any]:
         now = utc_now()
         encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         with self._transaction():
@@ -187,7 +184,7 @@ class AlipayOrderStore:
             if not row:
                 raise KeyError("Alipay order not found")
             if row["status"] != "completed":
-                self.db.execute("UPDATE alipay_orders SET status='completed',result_json=?,ledger_tx_id=COALESCE(?,ledger_tx_id),updated_at=?,completed_at=? WHERE out_trade_no=?", (encoded, ledger_tx_id, now, now, out_trade_no))
+                self.db.execute("UPDATE alipay_orders SET status='completed',result_json=?,updated_at=?,completed_at=? WHERE out_trade_no=?", (encoded, now, now, out_trade_no))
             trade_no = row["trade_no"]
             if trade_no:
                 self.db.execute("INSERT OR IGNORE INTO alipay_fulfillment_outbox(trade_no,out_trade_no,status,next_attempt_at,created_at,updated_at) VALUES(?,?, 'pending', ?, ?, ?)", (trade_no, out_trade_no, now, now, now))

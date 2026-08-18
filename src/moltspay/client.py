@@ -240,6 +240,8 @@ class MoltsPay:
         return self._get_balance_client().list_transactions(server_url, buyer_id, limit, offset)
 
     def topup_balance(self, server_url: str, amount: str, rail: str, buyer_id: str = None, **kwargs: Any):
+        if str(rail).lower() == "alipay":
+            raise UnsupportedRail("Alipay is only supported for A402 service purchases, not balance top-ups")
         return self._get_balance_client().topup_balance(server_url, amount, rail, buyer_id=buyer_id, **kwargs)
 
     def create_balance_topup_order(
@@ -249,7 +251,7 @@ class MoltsPay:
         """Create and persist a recoverable balance top-up order."""
         buyer = buyer_id or self._buyer_id
         if rail == "alipay":
-            return self._create_alipay_topup_order(server_url, pack=pack, buyer_id=buyer, context=context)
+            raise UnsupportedRail("Alipay is only supported for A402 service purchases, not balance top-ups")
         if rail != "wechat":
             raise UnsupportedRail(f"Unsupported top-up rail: {rail}")
         data = self._get_balance_client().create_topup_order(
@@ -274,41 +276,6 @@ class MoltsPay:
                 "maxTimeoutSeconds": int(timeout_seconds),
                 "buyerId": session.buyer_id, "status": session.status,
                 "createdAt": session.created_at, "expiresAt": session.expires_at}
-
-    def _create_alipay_topup_order(self, server_url: str, pack: Optional[str], buyer_id: Optional[str], context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        if not buyer_id:
-            raise PaymentError("Balance top-up requires buyer_id")
-        pack = str(pack or "")
-        request_id = (context or {}).get("request_id") or f"req_{uuid.uuid4().hex}"
-        body = {"buyer_id": buyer_id, "pack": pack, "request_id": request_id, "signer_address": self.get_balance_signer_address()}
-        response = httpx.post(f"{server_url.rstrip('/')}/balance/topup/alipay", json=body, headers={"Accept-Payment-Rail": "alipay", "Idempotency-Key": request_id}, timeout=self._timeout)
-        if response.status_code != 402:
-            data = response.json() if response.content else {}
-            raise PaymentError(str(data.get("error") or "Alipay top-up order failed"))
-        needed = response.headers.get("Payment-Needed")
-        if not needed:
-            raise PaymentError("alipay_payment_needed_missing")
-        decoded = decode_a402_json(needed, name="Payment-Needed")
-        out_trade_no = str((decoded.get("protocol") or {}).get("out_trade_no") or "")
-        if not out_trade_no:
-            raise PaymentError("alipay_challenge_invalid")
-        session = self._get_alipay_client().start_402(
-            f"{server_url.rstrip('/')}/balance/topup/alipay", needed, request_id=request_id,
-            method="POST", request_body=json.dumps(body, ensure_ascii=False, separators=(",", ":")),
-            headers={"Content-Type": "application/json", "Accept-Payment-Rail": "alipay", "Idempotency-Key": request_id},
-            intent_summary=(context or {}).get("intent_summary") or f"为 Provider 余额充值 {pack} CNY",
-            timeout=float((context or {}).get("timeout") or self._timeout or 1800),
-            context={**(context or {}), "kind": "balance_topup", "buyer_id": buyer_id, "pack": pack},
-        )
-        now = time.time()
-        expires_at = session.expires_at
-        topup = BalanceTopupSession(
-            out_trade_no=out_trade_no, buyer_id=buyer_id, pack=pack, server_url=server_url.rstrip("/"),
-            code_url="", rail="alipay", payment_session_id=session.payment_session_id,
-            created_at=session.created_at, expires_at=expires_at, context=context or {},
-        )
-        self._save_balance_topup_session(topup)
-        return {"outTradeNo": out_trade_no, "pack": pack, "rail": "alipay", "paymentSessionId": session.payment_session_id, "status": session.status, "createdAt": topup.created_at, "expiresAt": topup.expires_at}
 
     def _balance_topup_dir(self) -> Path:
         return self._config_dir / "balance-topup-sessions"
@@ -362,15 +329,6 @@ class MoltsPay:
         url = server_url or (session.server_url if session else None)
         if not url:
             return {"credited": False, "reason": f"No server URL for {out_trade_no}: pass server_url or run topup-order first"}
-        if session and session.rail == "alipay" and session.payment_session_id:
-            observed = self.resume_alipay_payment(session.payment_session_id)
-            if observed.status == "completed" and isinstance(observed.result, dict) and observed.result.get("credited"):
-                session.status = "credited"
-                session.tx_id = observed.result.get("tx_id") or observed.result.get("txId")
-                session.balance = observed.result.get("balance")
-                self._save_balance_topup_session(session)
-                return {"credited": True, "balance": session.balance, "txId": session.tx_id, "replayed": observed.result.get("replayed", False)}
-            return {"credited": False, "pending": observed.status in {"pending", "processing", "unknown"}, "reason": observed.last_error}
         data = self._get_balance_client().confirm_topup(url, out_trade_no)
         if data.get("credited") and session:
             session.status = "credited"

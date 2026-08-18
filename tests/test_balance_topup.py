@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from moltspay.client import MoltsPay
-from moltspay.exceptions import InsufficientBalance
+from moltspay.exceptions import InsufficientBalance, UnsupportedRail
 from moltspay.models import PaymentResult, Service
 
 
@@ -76,6 +76,27 @@ def test_balance_topup_uses_provider_order_timestamps(tmp_path: Path):
 
     assert order["createdAt"] == "2026-08-13T02:42:16Z"
     assert order["expiresAt"] == "2026-08-13T02:47:16Z"
+
+
+def test_alipay_is_not_available_for_balance_topups(tmp_path: Path):
+    client = MoltsPay(
+        private_key="0x" + "11" * 32,
+        config_dir=str(tmp_path),
+        buyer_id="buyer",
+    )
+    fake = FakeBalanceClient()
+    client._balance_client = fake
+
+    with pytest.raises(UnsupportedRail, match="only supported for A402 service purchases"):
+        client.create_balance_topup_order(
+            "https://provider.test", pack="10.00", rail="alipay"
+        )
+    with pytest.raises(UnsupportedRail, match="only supported for A402 service purchases"):
+        client.topup_balance(
+            "https://provider.test", "10.00", "alipay", out_trade_no="trade-1"
+        )
+
+    assert fake.calls == []
 
 
 def test_balance_topup_rejects_unsafe_identifier(tmp_path: Path):

@@ -185,8 +185,9 @@ These are local SDK policy controls, not on-chain allowances. They protect calls
 | Rail | Select with | Behavior |
 |---|---|---|
 | Crypto | Omit `rail` | Uses `chain` and `token` to complete the provider's 402 challenge |
-| Provider balance | `rail="balance"` | Deducts from a provider-managed buyer balance; supports recoverable top-ups |
+| Provider balance | `rail="balance"` | Deducts from a provider-managed buyer balance; recoverable top-ups use WeChat only |
 | WeChat Pay | `rail="wechat"` | Creates a Native payment QR session, polls it, then fulfills the service |
+| Alipay A402 | `rail="alipay"` | Purchases the requested AI service through the Alipay A402 lifecycle |
 
 Example using a provider balance:
 
@@ -206,6 +207,8 @@ result = client.pay(
 ```
 
 Interactive WeChat flows persist recoverable sessions locally. See [Node.js compatibility and fiat rails](docs/NODE-PARITY.md) for the session and provider contracts.
+
+Alipay is not a provider-balance top-up rail. `create_balance_topup_order()`, `topup_balance_pack()`, CLI balance top-up commands, and MCP balance top-up tools accept WeChat only. Alipay remains available for direct service purchases with `pay(..., rail="alipay")`; see [Alipay A402 design](docs/ALIPAY-A402-DESIGN.md).
 
 ## Core API
 

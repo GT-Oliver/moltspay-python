@@ -106,16 +106,19 @@ PaymentRail = Union[
     Annotated[Literal["alipay"], Field(description="Use the explicit Alipay A402 lifecycle.")],
 ]
 AlipayStatus = Annotated[
-    Literal["created", "pending", "processing", "completed", "rejected", "expired", "unknown"],
+    Literal[
+        "created", "pending", "processing", "paid", "fulfilling",
+        "completed", "rejected", "expired", "unknown",
+    ],
     Field(description="Optional Alipay session status filter."),
 ]
 TopupStatus = Annotated[
     Literal["pending", "credited", "expired"],
     Field(description="Optional top-up status filter: pending, credited, or expired."),
 ]
-TopupRail = Union[
-    Annotated[Literal["wechat"], Field(description="Use the existing WeChat Native top-up flow.")],
-    Annotated[Literal["alipay"], Field(description="Use the Alipay A402 top-up lifecycle.")],
+TopupRail = Annotated[
+    Literal["wechat"],
+    Field(description="Use the WeChat Native top-up flow."),
 ]
 WechatStatus = Annotated[
     Literal["pending", "paid", "completed", "expired", "cancelled", "failed", "unknown"],
@@ -233,6 +236,14 @@ def _alipay_session(session: Any) -> Dict[str, Any]:
         "out_shake_no": session.out_shake_no,
         "trade_no": session.trade_no,
         "out_trade_no": session.out_trade_no,
+        "pay_before": getattr(session, "pay_before", None),
+        "service_id": getattr(session, "service_id", None),
+        "resource_id": getattr(session, "resource_id", None),
+        "provider_status": getattr(session, "provider_status", None),
+        "provider_code": getattr(session, "provider_code", None),
+        "provider_message": getattr(session, "provider_message", None),
+        "resource_status_code": getattr(session, "resource_status_code", None),
+        "fulfillment_status": getattr(session, "fulfillment_status", None),
         "media_paths": getattr(session, "media_paths", []),
         "created_at": session.created_at,
         "updated_at": session.updated_at,
@@ -323,8 +334,6 @@ class MoltsPayMCP:
             if dryRun:
                 return {"intent": "create_balance_topup_order", "serverUrl": serverUrl, "pack": pack, "buyerId": buyerId, "rail": rail}
             self._confirm(confirmed)
-            if rail == "alipay":
-                return self.client.create_balance_topup_order(serverUrl, pack, buyerId, rail="alipay")
             return self.client.create_balance_topup_order(serverUrl, pack, buyerId)
         return self._run(call, requestId)
 
@@ -467,7 +476,7 @@ TOOL_DESCRIPTIONS = {
         "confirmation gate is enabled. Returns codeUrl plus a PNG QR image for scanning. This does not itself "
         "confirm or credit the top-up."
     ),
-    "balance_topup_resume": "Resume a locally persisted WeChat or Alipay balance top-up; this may contact the provider and credit the account.",
+    "balance_topup_resume": "Resume a locally persisted WeChat top-up; this may contact the provider and credit the account.",
     "balance_topup_confirm": (
         "Ask the provider to confirm an existing top-up order; a paid order may be credited to the provider "
         "balance and the local session may be updated. outTradeNo is required. serverUrl is optional when the "

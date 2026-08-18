@@ -43,6 +43,21 @@ TRADE_NO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # 8282 is the documented query-number family; alipay-bot 0.4.0 emits the
 # successor 8283 family. Both retain the same 32-digit recovery contract.
 OUT_SHAKE_NO_RE = re.compile(r"^\d{10}828[23]\d{18}$")
+A402_PROVIDER_STATUS = {
+    "INIT": "pending",
+    "OPEN_LINK_CREATED": "pending",
+    "TRADE_CREATED": "pending",
+    "PAYING": "processing",
+    "BIND": "processing",
+    "PAID": "paid",
+    "SUCCESS": "paid",
+    "FAILED": "rejected",
+    "EXPIRED": "expired",
+    "CLOSED": "rejected",
+}
+SENSITIVE_REPLAY_HEADERS = {
+    "authorization", "proxy-authorization", "payment-proof", "cookie", "set-cookie",
+}
 
 
 def _iso(timestamp: float) -> str:
@@ -92,6 +107,55 @@ def _safe_identifier(value: Any, label: str) -> str:
     return value
 
 
+def _bounded_protocol_text(value: Any, label: str, limit: int = 1024) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > limit or any(ord(char) < 32 for char in value):
+        raise AlipayProtocolError(f"Invalid {label}")
+    return value
+
+
+def _bill_metadata(protocol: Dict[str, Any]) -> Dict[str, str]:
+    metadata: Dict[str, str] = {}
+    out_trade_no = protocol.get("out_trade_no") or protocol.get("outTradeNo")
+    if out_trade_no is not None:
+        if not isinstance(out_trade_no, str) or not TRADE_NO_RE.fullmatch(out_trade_no):
+            raise AlipayProtocolError("Invalid Alipay merchant order number")
+        metadata["out_trade_no"] = out_trade_no
+    for field, limit in (("pay_before", 128), ("service_id", 256), ("resource_id", 1024)):
+        value = _bounded_protocol_text(protocol.get(field), f"Alipay {field}", limit)
+        if value is not None:
+            metadata[field] = value
+    return metadata
+
+
+def _safe_replay_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    safe: Dict[str, str] = {}
+    for key, value in (headers or {}).items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        if key.strip().lower() in SENSITIVE_REPLAY_HEADERS:
+            continue
+        safe[key] = value
+    return safe
+
+
+def _sanitize_diagnostic(value: Any, limit: int = 512) -> Optional[str]:
+    if not isinstance(value, (str, int, float)):
+        return None
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    if not text:
+        return None
+    text = re.sub(
+        r"(?i)\b(authorization|payment-proof|access[_-]?token|refresh[_-]?token|"
+        r"wallet[_-]?(?:token|credential|secret))\s*[:=]\s*[^\s,;]+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", text)
+    return text[:limit]
+
+
 class AlipayPaymentSession(BaseModel):
     """Recoverable local A402 session.
 
@@ -104,7 +168,10 @@ class AlipayPaymentSession(BaseModel):
     business_session_id: str = ""
     amount: Optional[str] = None
     currency: Optional[str] = None
-    status: Literal["created", "pending", "processing", "completed", "rejected", "expired", "unknown"] = "created"
+    status: Literal[
+        "created", "pending", "processing", "paid", "fulfilling",
+        "completed", "rejected", "expired", "unknown",
+    ] = "created"
     request_id: str = ""
     resource_url: str = ""
     method: str = "POST"
@@ -114,6 +181,14 @@ class AlipayPaymentSession(BaseModel):
     out_shake_no: Optional[str] = None
     trade_no: Optional[str] = None
     out_trade_no: Optional[str] = None
+    pay_before: Optional[str] = None
+    service_id: Optional[str] = None
+    resource_id: Optional[str] = None
+    provider_status: Optional[str] = None
+    provider_code: Optional[str] = None
+    provider_message: Optional[str] = None
+    resource_status_code: Optional[int] = None
+    fulfillment_status: Optional[str] = None
     payment_url: Optional[str] = None
     media_paths: List[str] = Field(default_factory=list)
     challenge_path: Optional[str] = None
@@ -190,6 +265,11 @@ def parse_alipay_cli_output(lines: Sequence[str]) -> Dict[str, Any]:
         found = _value(objects, *aliases)
         if found:
             result[key] = found
+    if result.get("out_shake_no") and not OUT_SHAKE_NO_RE.fullmatch(str(result["out_shake_no"])):
+        result.pop("out_shake_no", None)
+    for key in ("trade_no", "out_trade_no"):
+        if result.get(key) and not TRADE_NO_RE.fullmatch(str(result[key])):
+            result.pop(key, None)
     raw = _flatten_cli(lines)
     media_paths = [
         match.group(1).strip()
@@ -232,24 +312,96 @@ def parse_alipay_cli_output(lines: Sequence[str]) -> Dict[str, Any]:
         match = re.search(r"(?:交易号|trade[_ -]?no)\s*[:：=]\s*([A-Za-z0-9._-]+)", raw, re.I)
         if match and TRADE_NO_RE.fullmatch(match.group(1)):
             result["trade_no"] = match.group(1)
-    status = str(result.get("status", "")).upper()
-    upper = raw.upper()
-    if any(marker in status for marker in ("SUCCESS", "PAID", "COMPLETED", "FULFILLED")) or any(
-        marker in upper for marker in ("TRADE_SUCCESS", "RESOURCE RESPONSE STATUS 200")
-    ):
-        result["normalized_status"] = "completed"
-    elif any(marker in status for marker in ("REJECT", "CANCEL", "CLOSED", "FAIL", "EXPIRE")) or any(
-        marker in upper for marker in ("REJECT", "CANCEL", "CLOSED", "FAIL", "EXPIRE")
-    ):
-        result["normalized_status"] = "rejected"
-    elif any(marker in status for marker in ("PENDING", "WAIT", "PROCESS", "UNPAID")) or any(
-        marker in upper for marker in ("PENDING", "WAIT", "UNPAID", "PROCESS")
-    ):
-        result["normalized_status"] = "pending"
-    else:
-        result["normalized_status"] = "unknown"
+    provider_status = str(result.get("status", "")).strip().upper()
+    if provider_status:
+        result["provider_status"] = provider_status
+    result["normalized_status"] = A402_PROVIDER_STATUS.get(provider_status, "unknown")
+    provider_code = _value(objects, "errorCode", "error_code", "subCode", "sub_code", "code")
+    provider_message = _value(objects, "errorMessage", "error_message", "message", "msg", "error")
+    if provider_code:
+        result["provider_code"] = _sanitize_diagnostic(provider_code, 128)
+    if provider_message:
+        result["provider_message"] = _sanitize_diagnostic(provider_message)
     result["raw"] = raw
     return result
+
+
+def _resource_outcome(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract explicit resource/receipt evidence without retaining CLI output."""
+    objects = _json_objects([str(parsed.get("raw") or "")])
+    response: Any = None
+    fulfillment_status: Optional[str] = None
+    candidates: List[Dict[str, Any]] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            candidates.append(value)
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect(nested)
+
+    for item in objects:
+        collect(item)
+    for obj in reversed(candidates):
+        for key in ("fulfillmentStatus", "fulfillment_status", "ackStatus", "ack_status"):
+            value = obj.get(key)
+            if isinstance(value, str) and value:
+                fulfillment_status = value.strip().upper()
+                break
+        for key in ("resourceResponse", "resource_response"):
+            if key in obj:
+                response = obj[key]
+                break
+        if response is not None:
+            break
+
+    raw = str(parsed.get("raw") or "")
+    upper = raw.upper()
+    explicit_ack_failure = bool(re.search(r"FULFILLMENT\s+ACK\s+FAIL", upper)) or "履约回执失败" in raw
+    if fulfillment_status in {"FAILED", "FAIL", "ERROR", "REJECTED"}:
+        explicit_ack_failure = True
+
+    attempted = response is not None
+    status_code: Optional[int] = None
+    body: Any = None
+    success_flag = False
+    if isinstance(response, dict):
+        for key in ("statusCode", "status_code", "httpStatus", "http_status", "status"):
+            value = response.get(key)
+            try:
+                status_code = int(value)
+            except (TypeError, ValueError):
+                continue
+            break
+        for key in ("body", "result", "data", "content"):
+            if key in response:
+                body = response[key]
+                break
+        success_flag = response.get("success") is True or response.get("ok") is True
+    elif response is not None:
+        body = response
+
+    marker = re.search(r"RESOURCE\s+RESPONSE\s+STATUS\s*[:=]?\s*(\d{3})", upper)
+    if marker:
+        attempted = True
+        status_code = int(marker.group(1))
+    has_body = body not in (None, "", b"", {}, [])
+    resource_succeeded = has_body and (
+        (status_code is not None and 200 <= status_code < 300) or success_flag
+    )
+    fulfillment_succeeded = resource_succeeded and not explicit_ack_failure
+    if fulfillment_status in {"SUCCESS", "SUCCEEDED", "COMPLETED", "ACKED"}:
+        fulfillment_succeeded = resource_succeeded
+    return {
+        "attempted": attempted,
+        "resource_succeeded": resource_succeeded,
+        "fulfillment_succeeded": fulfillment_succeeded,
+        "result": body,
+        "resource_status_code": status_code,
+        "fulfillment_status": fulfillment_status,
+    }
 
 
 def parse_trade_no(lines: Sequence[str]) -> Optional[str]:
@@ -265,7 +417,10 @@ def parse_payment_url(lines: Sequence[str]) -> Optional[str]:
 
 
 def parse_status(lines: Sequence[str]) -> str:
-    return {"completed": "paid", "rejected": "rejected", "pending": "pending", "unknown": "unknown"}.get(
+    return {
+        "paid": "paid", "rejected": "rejected", "expired": "rejected",
+        "pending": "pending", "processing": "pending", "unknown": "unknown",
+    }.get(
         parse_alipay_cli_output(lines).get("normalized_status", "unknown"), "unknown"
     )
 
@@ -336,7 +491,10 @@ class AlipayBuyerClient:
     def _update(self, session: AlipayPaymentSession, **changes: Any) -> AlipayPaymentSession:
         updated = session.model_copy(update={**changes, "updated_at": _iso(time.time())})
         self._save(updated)
-        if updated.status in {"completed", "rejected", "expired"} and updated.challenge_path:
+        provider_expired = updated.status == "expired" and updated.provider_status == "EXPIRED"
+        if updated.status in {"completed", "rejected"} or provider_expired:
+            if not updated.challenge_path:
+                return updated
             try:
                 challenge = Path(updated.challenge_path)
                 if challenge.is_file() and not challenge.is_symlink():
@@ -362,7 +520,9 @@ class AlipayBuyerClient:
         return sorted(items, key=lambda item: item.created_at, reverse=True)[: max(1, min(limit, 100))]
 
     def _expire(self, session: AlipayPaymentSession) -> AlipayPaymentSession:
-        if session.status in {"completed", "rejected", "expired"}:
+        # Once payment is confirmed, the checkout deadline must not erase the
+        # ability to recover an idempotent resource delivery.
+        if session.status in {"paid", "fulfilling", "completed", "rejected", "expired"}:
             return session
         try:
             expired = datetime.fromisoformat(session.expires_at.replace("Z", "+00:00")).timestamp() <= time.time()
@@ -428,6 +588,135 @@ class AlipayBuyerClient:
             )
         return session_id
 
+    def _recover_bill_metadata(self, session: AlipayPaymentSession) -> AlipayPaymentSession:
+        """Backfill safe bill fields for sessions created before they were persisted."""
+        if all((session.out_trade_no, session.pay_before, session.service_id, session.resource_id)):
+            return session
+        challenge = self.config_dir / "alipay-challenges" / f"{session.payment_session_id}.needed"
+        try:
+            if not challenge.is_file() or challenge.is_symlink() or challenge.stat().st_size > MAX_HEADER_BYTES * 2:
+                return session
+            needed = decode_a402_json(challenge.read_text(encoding="utf-8"), name="Payment-Needed")
+            protocol = needed.get("protocol") if isinstance(needed.get("protocol"), dict) else {}
+            recovered = _bill_metadata(protocol)
+        except (OSError, UnicodeError, AlipayProtocolError):
+            return session
+        changes = {
+            key: value for key, value in recovered.items()
+            if getattr(session, key, None) in (None, "")
+        }
+        return self._update(session, **changes) if changes else session
+
+    def _mark_query_unknown(
+        self, session: AlipayPaymentSession, payment_message: str,
+    ) -> AlipayPaymentSession:
+        if session.status in {"paid", "fulfilling"}:
+            return self._update(
+                session, status=session.status,
+                last_error_code="alipay_fulfillment_state_unknown",
+                last_error="Alipay payment is confirmed but fulfillment state is unknown",
+            )
+        return self._update(
+            session, status="unknown", last_error_code="alipay_payment_state_unknown",
+            last_error=payment_message,
+        )
+
+    def _apply_cli_result(
+        self, session: AlipayPaymentSession, parsed: Dict[str, Any], *, initiation: bool = False,
+    ) -> AlipayPaymentSession:
+        changes: Dict[str, Any] = {}
+        for key in ("out_shake_no", "trade_no", "out_trade_no"):
+            value = parsed.get(key)
+            current = getattr(session, key)
+            if value and current and value != current:
+                return self._update(
+                    session, status="unknown", provider_status=parsed.get("provider_status"),
+                    last_error_code="alipay_order_mismatch",
+                    last_error=f"Alipay returned a conflicting {key}",
+                )
+            if value and not current:
+                changes[key] = value
+        for key in ("payment_url", "media_paths", "provider_status", "provider_code", "provider_message"):
+            if parsed.get(key) is not None:
+                changes[key] = parsed[key]
+
+        outcome = _resource_outcome(parsed)
+        if outcome["resource_status_code"] is not None:
+            changes["resource_status_code"] = outcome["resource_status_code"]
+        if outcome["fulfillment_status"] is not None:
+            changes["fulfillment_status"] = outcome["fulfillment_status"]
+
+        status = parsed.get("normalized_status", "unknown")
+        if outcome["fulfillment_succeeded"]:
+            # A non-empty 2xx resource response from the official query command
+            # is stronger completion evidence than a missing wrapper status.
+            changes.update(
+                status="completed", result=outcome["result"],
+                last_error_code=None, last_error=None,
+            )
+        elif status in {"pending", "processing"}:
+            if session.status in {"paid", "fulfilling"}:
+                changes.update(
+                    status=session.status, last_error_code="alipay_fulfillment_state_unknown",
+                    last_error="Alipay payment is confirmed but fulfillment did not advance",
+                )
+            else:
+                next_status = "processing" if session.status == "processing" else status
+                changes.update(status=next_status, last_error_code=None, last_error=None)
+        elif status == "rejected":
+            if session.status in {"paid", "fulfilling"}:
+                changes.update(
+                    status=session.status, last_error_code="alipay_fulfillment_state_unknown",
+                    last_error=parsed.get("provider_message")
+                    or "Alipay returned a terminal state after payment was confirmed",
+                )
+            else:
+                changes.update(
+                    status="rejected", last_error_code="alipay_payment_rejected",
+                    last_error=parsed.get("provider_message") or "Alipay payment was rejected",
+                )
+        elif status == "expired":
+            if session.status in {"paid", "fulfilling"}:
+                changes.update(
+                    status=session.status, last_error_code="alipay_fulfillment_state_unknown",
+                    last_error=parsed.get("provider_message")
+                    or "Alipay returned an expired state after payment was confirmed",
+                )
+            else:
+                changes.update(
+                    status="expired", last_error_code="alipay_payment_timeout",
+                    last_error=parsed.get("provider_message") or "Alipay payment expired",
+                )
+        elif status == "paid":
+            if outcome["attempted"]:
+                changes.update(
+                    status="fulfilling", last_error_code="alipay_fulfillment_incomplete",
+                    last_error=parsed.get("provider_message")
+                    or "Alipay payment is confirmed but resource fulfillment is incomplete",
+                )
+            else:
+                changes.update(
+                    status="fulfilling" if session.status == "fulfilling" else "paid",
+                    last_error_code=None, last_error=None,
+                )
+        elif initiation and any(parsed.get(key) for key in ("out_shake_no", "trade_no", "payment_url", "media_paths")):
+            # Some alipay-bot versions emit only the customer-facing QR/link on
+            # initiation. That is a valid pending state, not an unknown state.
+            changes.update(status="pending", last_error_code=None, last_error=None)
+        else:
+            if session.status in {"paid", "fulfilling"}:
+                changes.update(
+                    status=session.status, last_error_code="alipay_fulfillment_state_unknown",
+                    last_error=parsed.get("provider_message")
+                    or "Alipay payment is confirmed but fulfillment state is unknown",
+                )
+            else:
+                changes.update(
+                    status="unknown", last_error_code="alipay_payment_state_unknown",
+                    last_error=parsed.get("provider_message") or "Alipay returned an unknown payment state",
+                )
+        return self._update(session, **changes)
+
     def start_402(
         self,
         resource_url: str,
@@ -454,6 +743,7 @@ class AlipayBuyerClient:
         protocol = requirement_data.get("protocol") if isinstance(requirement_data.get("protocol"), dict) else {}
         amount = str(protocol.get("amount")) if protocol.get("amount") is not None else None
         currency = str(protocol.get("currency")) if protocol.get("currency") is not None else None
+        bill_metadata = _bill_metadata(protocol)
         business_session_id = self._business_session_id(business_session_id)
         request_id = request_id or f"req_{uuid.uuid4().hex}"
         _safe_identifier(request_id, "request ID")
@@ -463,8 +753,9 @@ class AlipayBuyerClient:
             business_session_id=business_session_id, amount=amount, currency=currency,
             status="pending",
             request_id=request_id, resource_url=resource_url, method=method.upper(),
-            request_body=request_body, data=request_body, request_headers=headers or {}, intent_summary=intent_summary,
+            request_body=request_body, data=request_body, request_headers=_safe_replay_headers(headers), intent_summary=intent_summary,
             context=context or {}, created_at=_iso(now), updated_at=_iso(now), expires_at=_iso(now + timeout),
+            **bill_metadata,
         )
         self._save(session)
         challenge_dir = self.config_dir / "alipay-challenges"
@@ -507,24 +798,25 @@ class AlipayBuyerClient:
             raise
         except Exception as exc:
             return self._update(session, status="unknown", last_error_code="alipay_payment_state_unknown", last_error="Alipay payment result is unknown")
-        changes: Dict[str, Any] = {}
-        for key in ("out_shake_no", "trade_no", "out_trade_no", "payment_url", "media_paths"):
-            if parsed.get(key):
-                changes[key] = parsed[key]
-        changes["status"] = "completed" if parsed.get("normalized_status") == "completed" else "pending"
-        return self._update(session, **changes)
+        return self._apply_cli_result(session, parsed, initiation=True)
 
     def resume(self, identifier: str) -> AlipayPaymentSession:
-        session = self.get_session(identifier)
-        if session.status in {"completed", "rejected", "expired"}:
+        # Do not call get_session() here: its local display timeout is not an
+        # authoritative Alipay payment state. A user may pay near the deadline
+        # and still need the official query command to recover fulfillment.
+        session = self._load(identifier)
+        if session.status in {"completed", "rejected"}:
             return session
+        if session.status == "expired" and session.provider_status == "EXPIRED":
+            return session
+        session = self._recover_bill_metadata(session)
         query_args = ["402-query-payment-status"]
         if session.out_shake_no:
             query_args += ["--out-shake-no", session.out_shake_no]
         elif session.trade_no:
             query_args += ["--trade-no", session.trade_no]
         else:
-            return self._update(session, status="unknown", last_error_code="alipay_payment_state_unknown", last_error="Alipay session has no recoverable payment number")
+            return self._mark_query_unknown(session, "Alipay session has no recoverable payment number")
         query_args += ["--resource-url", session.resource_url, "--resource-type", "http"]
         if session.method:
             query_args += ["--method", session.method]
@@ -536,19 +828,8 @@ class AlipayBuyerClient:
         try:
             parsed = parse_alipay_cli_output(list(self.runner(query_args)))
         except (AlipayCliNotFound, AlipayCliFailed):
-            return self._update(session, status="unknown", last_error_code="alipay_payment_state_unknown", last_error="Alipay payment result is unknown")
-        status = parsed.get("normalized_status")
-        if status == "pending":
-            return self._update(session, status="pending", last_error_code=None, last_error=None)
-        if status == "rejected":
-            return self._update(session, status="rejected", last_error_code="alipay_payment_rejected", last_error="Alipay payment was rejected")
-        if status != "completed":
-            return self._update(session, status="unknown", last_error_code="alipay_payment_state_unknown", last_error="Alipay returned an unknown payment state")
-        result: Any = None
-        objects = _json_objects([parsed.get("raw", "")])
-        if objects:
-            result = objects[-1].get("result", objects[-1].get("data", objects[-1]))
-        return self._update(session, status="completed", result=result, last_error_code=None, last_error=None)
+            return self._mark_query_unknown(session, "Alipay payment result is unknown")
+        return self._apply_cli_result(session, parsed)
 
     def resume_alipay_payment(self, identifier: str) -> AlipayPaymentSession:
         """Deprecated compatibility alias."""

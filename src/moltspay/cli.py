@@ -185,7 +185,7 @@ def cmd_alipay(args) -> int:
         output(session)
         for media_path in session.media_paths:
             print(f"MEDIA: {media_path}")
-        return 0 if session.status in {"pending", "processing", "completed"} else 1
+        return 0 if session.status in {"pending", "processing", "paid", "fulfilling", "completed"} else 1
     if command == "check-wallet":
         output(client.check_alipay_wallet())
     elif command == "status":
@@ -193,7 +193,7 @@ def cmd_alipay(args) -> int:
     elif command == "resume":
         session = client.resume_alipay_payment(args.identifier)
         output(session)
-        return 0 if session.status in {"completed", "pending", "processing"} else 1
+        return 0 if session.status in {"completed", "pending", "processing", "paid", "fulfilling"} else 1
     elif command == "list":
         output(client.list_alipay_payment_sessions(limit=args.limit))
     return 0
@@ -321,11 +321,11 @@ def cmd_balance(args) -> int:
     elif args.balance_command == "topup":
         output(client.topup_balance(args.server, args.amount, args.rail, buyer_id=args.buyer,
                                     tx_hash=args.tx_hash, chain=args.chain,
-                                    trade_no=args.trade_no, out_trade_no=args.out_trade_no))
+                                    out_trade_no=args.out_trade_no))
     elif args.balance_command == "topup-order":
         result = client.create_balance_topup_order(args.server, pack=args.pack, buyer_id=args.buyer, rail=getattr(args, "rail", "wechat"))
         output({"status": "topup_required", "out_trade_no": result["outTradeNo"],
-                "code_url": result.get("codeUrl"), "payment_session_id": result.get("paymentSessionId"), "rail": result.get("rail", "wechat"), "pack": result["pack"], "server_url": args.server})
+                "code_url": result.get("codeUrl"), "rail": "wechat", "pack": result["pack"], "server_url": args.server})
     elif args.balance_command == "topup-confirm":
         output(client.confirm_balance_topup(args.id, server_url=getattr(args, "server", None)))
     elif args.balance_command == "topup-status":
@@ -404,7 +404,7 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--no-auto-topup", action="store_true")
     command.add_argument("--max-topup-attempts", type=int, default=10)
     command.add_argument("--topup-poll-interval", type=float, default=2.0)
-    command.add_argument("--topup-rail", choices=["wechat", "alipay"], default="wechat")
+    command.add_argument("--topup-rail", choices=["wechat"], default="wechat")
     command.add_argument("--intent-summary", help="Human-readable purpose passed to the official Alipay CLI")
     command.add_argument(
         "--session-id",
@@ -478,9 +478,8 @@ def build_parser() -> argparse.ArgumentParser:
     child.add_argument("--buyer")
     child.add_argument("--tx-hash")
     child.add_argument("--chain", default="base", choices=chain_choices)
-    child.add_argument("--trade-no")
     child.add_argument("--out-trade-no")
-    child.add_argument("--rail", required=True)
+    child.add_argument("--rail", choices=["wechat"], default="wechat")
     child.add_argument("--config-dir", default=config_default)
     child.add_argument("--json", action="store_true")
     child = children.add_parser("transactions")
@@ -497,7 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
     child.add_argument("server")
     child.add_argument("--pack")
     child.add_argument("--buyer")
-    child.add_argument("--rail", choices=["wechat", "alipay"], default="wechat")
+    child.add_argument("--rail", choices=["wechat"], default="wechat")
     child.add_argument("--config-dir", default=config_default)
     child.add_argument("--json", action="store_true")
     child = children.add_parser("topup-confirm")
@@ -517,7 +516,7 @@ def build_parser() -> argparse.ArgumentParser:
     child.add_argument("server")
     child.add_argument("--pack")
     child.add_argument("--buyer")
-    child.add_argument("--rail", choices=["wechat", "alipay"], default="wechat")
+    child.add_argument("--rail", choices=["wechat"], default="wechat")
     child.add_argument("--config-dir", default=config_default)
     child.add_argument("--json", action="store_true")
 

@@ -286,6 +286,7 @@ def test_fastmcp_registration_documents_optional_parameters_options_and_ranges()
     topup = by_name["moltspay_balance_topup_order"].inputSchema["properties"]
     assert topup["pack"]["anyOf"][0]["maxLength"] == 64
     assert "pattern" in topup["pack"]["anyOf"][0]
+    assert topup["rail"]["const"] == "wechat"
 
     wechat_list = by_name["moltspay_wechat_list"].inputSchema["properties"]
     assert wechat_list["status"]["anyOf"][0]["enum"] == [

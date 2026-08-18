@@ -87,6 +87,21 @@ def test_order_store_rejects_service_change_for_same_idempotency_key():
         raise AssertionError("service_id changes must not reuse an existing order")
 
 
+def test_a402_order_store_rejects_balance_topup_orders():
+    store = AlipayOrderStore(":memory:")
+
+    with pytest.raises(ValueError, match="invalid Alipay order"):
+        store.create_order(
+            request_id="req-topup",
+            kind="balance_topup",
+            amount_fen=1000,
+            resource_id="/balance/topup/alipay",
+            goods_name="Balance top-up",
+            pay_before="",
+            service_id="API_TOPUP",
+        )
+
+
 def test_facilitator_rejects_verified_service_mismatch():
     private, public = _keys()
     facilitator = AlipayFacilitator({
@@ -128,7 +143,10 @@ def test_buyer_session_persists_and_resumes_without_proof(tmp_path):
                 f"payment_{out_shake_no}.png",
             ]
         if args[0] == "402-query-payment-status":
-            return ['{"status":"completed","tradeNo":"trade-1","result":{"ok":true}}']
+            return [
+                '{"status":"SUCCESS","tradeNo":"trade-1",'
+                '"outTradeNo":"MPA1","resourceResponse":{"status":200,"body":{"ok":true}}}'
+            ]
         return ['{"ok":true}']
 
     client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
@@ -139,6 +157,7 @@ def test_buyer_session_persists_and_resumes_without_proof(tmp_path):
     )
     assert session.status == "pending"
     assert session.out_shake_no == out_shake_no
+    assert session.out_trade_no == "MPA1"
     assert session.media_paths == [
         "/tmp/openclaw/alipay-bot-cli/qrcode/"
         f"payment_{out_shake_no}.png"
@@ -154,6 +173,262 @@ def test_buyer_session_persists_and_resumes_without_proof(tmp_path):
         "mpay_alipay_" not in call[call.index("--session-id") + 1]
         for call in calls if "--session-id" in call
     )
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "normalized"),
+    [
+        ("INIT", "pending"),
+        ("OPEN_LINK_CREATED", "pending"),
+        ("TRADE_CREATED", "pending"),
+        ("PAYING", "processing"),
+        ("BIND", "processing"),
+        ("PAID", "paid"),
+        ("SUCCESS", "paid"),
+        ("FAILED", "rejected"),
+        ("EXPIRED", "expired"),
+        ("CLOSED", "rejected"),
+    ],
+)
+def test_cli_output_maps_official_a402_statuses_explicitly(provider_status, normalized):
+    parsed = parse_alipay_cli_output([json.dumps({"status": provider_status})])
+
+    assert parsed["provider_status"] == provider_status
+    assert parsed["normalized_status"] == normalized
+
+
+def test_cli_output_does_not_fuzzily_map_unofficial_status_words():
+    parsed = parse_alipay_cli_output([
+        '{"status":"payment_successful_someday","message":"not failed"}'
+    ])
+
+    assert parsed["normalized_status"] == "unknown"
+
+
+def test_paid_is_not_completed_until_resource_delivery_succeeds(tmp_path):
+    out_shake_no = "12345678908282123456789012345678"
+    queries = iter([
+        '{"status":"PAID","tradeNo":"trade-1","outTradeNo":"MPA1"}',
+        '{"status":"SUCCESS","tradeNo":"trade-1","outTradeNo":"MPA1",'
+        '"resourceResponse":{"statusCode":200,"body":{"result":"delivered"}},'
+        '"fulfillmentStatus":"ACKED"}',
+    ])
+    query_count = 0
+
+    def runner(args):
+        nonlocal query_count
+        if args[0] == "check-wallet":
+            return ['{"ready":true,"opened":true,"bound":true}']
+        if args[0] == "402-buyer-pay":
+            return [f"查询单号：{out_shake_no}"]
+        if args[0] == "402-query-payment-status":
+            query_count += 1
+            return [next(queries)]
+        return ['{"ok":true}']
+
+    client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    started = client.start_402(
+        "https://provider.test/execute",
+        encode_a402_json({"protocol": {"out_trade_no": "MPA1"}}),
+        request_id="req-paid", business_session_id="business-paid",
+    )
+
+    paid = client.resume(started.payment_session_id)
+    assert paid.status == "paid"
+    assert paid.provider_status == "PAID"
+    completed = client.resume(started.payment_session_id)
+    assert completed.status == "completed"
+    assert completed.result == {"result": "delivered"}
+    assert completed.resource_status_code == 200
+    assert completed.fulfillment_status == "ACKED"
+
+    replay = client.resume(started.payment_session_id)
+    assert replay.status == "completed"
+    assert query_count == 2
+
+
+def test_paid_resource_failure_stays_recoverable_as_fulfilling(tmp_path):
+    out_shake_no = "12345678908282123456789012345678"
+
+    def runner(args):
+        if args[0] == "check-wallet":
+            return ['{"ready":true,"opened":true,"bound":true}']
+        if args[0] == "402-buyer-pay":
+            return [f"查询单号：{out_shake_no}"]
+        if args[0] == "402-query-payment-status":
+            return [
+                '{"status":"SUCCESS","tradeNo":"trade-1",'
+                '"resourceResponse":{"status":503,"body":{"error":"unavailable"}}}'
+            ]
+        return ['{"ok":true}']
+
+    client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    started = client.start_402(
+        "https://provider.test/execute",
+        encode_a402_json({"protocol": {"out_trade_no": "MPA1"}}),
+        request_id="req-fulfill", business_session_id="business-fulfill",
+    )
+    observed = client.resume(started.payment_session_id)
+
+    assert observed.status == "fulfilling"
+    assert observed.resource_status_code == 503
+    assert observed.last_error_code == "alipay_fulfillment_incomplete"
+
+
+def test_resume_queries_provider_after_local_session_timeout(tmp_path):
+    out_shake_no = "12345678908282123456789012345678"
+    query_count = 0
+
+    def runner(args):
+        nonlocal query_count
+        if args[0] == "check-wallet":
+            return ['{"ready":true,"opened":true,"bound":true}']
+        if args[0] == "402-buyer-pay":
+            return [f"查询单号：{out_shake_no}"]
+        if args[0] == "402-query-payment-status":
+            query_count += 1
+            return [
+                '{"status":"SUCCESS","tradeNo":"trade-late","outTradeNo":"MPA-LATE",'
+                '"resourceResponse":{"status":200,"body":{"result":"late-delivery"}}}'
+            ]
+        return ['{"ok":true}']
+
+    client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    started = client.start_402(
+        "https://provider.test/execute",
+        encode_a402_json({"protocol": {"out_trade_no": "MPA-LATE"}}),
+        request_id="req-late", business_session_id="business-late", timeout=-1,
+    )
+    locally_expired = client.get_session(started.payment_session_id)
+
+    assert locally_expired.status == "expired"
+    assert locally_expired.provider_status is None
+    assert locally_expired.challenge_path
+    assert (tmp_path / "alipay-challenges" / f"{started.payment_session_id}.needed").exists()
+
+    recovered = client.resume(started.payment_session_id)
+
+    assert recovered.status == "completed"
+    assert recovered.trade_no == "trade-late"
+    assert recovered.result == {"result": "late-delivery"}
+    assert query_count == 1
+
+
+def test_provider_confirmed_expired_session_is_terminal(tmp_path):
+    out_shake_no = "12345678908282123456789012345678"
+    query_count = 0
+
+    def runner(args):
+        nonlocal query_count
+        if args[0] == "check-wallet":
+            return ['{"ready":true,"opened":true,"bound":true}']
+        if args[0] == "402-buyer-pay":
+            return [f"查询单号：{out_shake_no}"]
+        if args[0] == "402-query-payment-status":
+            query_count += 1
+            return ['{"status":"EXPIRED","outTradeNo":"MPA-EXPIRED"}']
+        return ['{"ok":true}']
+
+    client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    started = client.start_402(
+        "https://provider.test/execute",
+        encode_a402_json({"protocol": {"out_trade_no": "MPA-EXPIRED"}}),
+        request_id="req-expired", business_session_id="business-expired",
+    )
+
+    expired = client.resume(started.payment_session_id)
+    replay = client.resume(started.payment_session_id)
+
+    assert expired.status == "expired"
+    assert expired.provider_status == "EXPIRED"
+    assert replay.status == "expired"
+    assert query_count == 1
+
+
+def test_session_persists_bill_metadata_and_sanitized_diagnostics(tmp_path):
+    out_shake_no = "12345678908282123456789012345678"
+    secret = "secret-wallet-token"
+
+    def runner(args):
+        if args[0] == "check-wallet":
+            return ['{"ready":true,"opened":true,"bound":true}']
+        if args[0] == "402-buyer-pay":
+            return [f"查询单号：{out_shake_no}"]
+        if args[0] == "402-query-payment-status":
+            return [json.dumps({
+                "status": "PAYING", "code": "10000",
+                "message": f"authorization=Bearer-{secret}",
+            })]
+        return ['{"ok":true}']
+
+    client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    started = client.start_402(
+        "https://provider.test/execute",
+        encode_a402_json({"protocol": {
+            "amount": "0.10", "currency": "CNY", "out_trade_no": "MPA1",
+            "pay_before": "2026-08-18T12:00:00+00:00", "service_id": "API_SVC",
+            "resource_id": "/execute?service=svc",
+        }}),
+        request_id="req-safe", business_session_id="business-safe",
+        headers={
+            "Content-Type": "application/json", "Authorization": "Bearer top-secret",
+            "Payment-Proof": "proof-secret", "Cookie": "session=secret",
+        },
+    )
+    observed = client.resume(started.payment_session_id)
+    persisted = (
+        tmp_path / "alipay-sessions" / f"{started.payment_session_id}.json"
+    ).read_text(encoding="utf-8")
+
+    assert observed.status == "processing"
+    assert observed.out_trade_no == "MPA1"
+    assert observed.pay_before == "2026-08-18T12:00:00+00:00"
+    assert observed.service_id == "API_SVC"
+    assert observed.resource_id == "/execute?service=svc"
+    assert observed.provider_status == "PAYING"
+    assert observed.provider_code == "10000"
+    assert secret not in persisted
+    assert "top-secret" not in persisted
+    assert "proof-secret" not in persisted
+    assert "session=secret" not in persisted
+    assert "[REDACTED]" in persisted
+
+
+def test_legacy_unknown_session_recovers_bill_metadata_from_needed_file(tmp_path):
+    out_shake_no = "12345678908282123456789012345678"
+
+    def runner(args):
+        if args[0] == "check-wallet":
+            return ['{"ready":true,"opened":true,"bound":true}']
+        if args[0] == "402-buyer-pay":
+            return [f"查询单号：{out_shake_no}"]
+        if args[0] == "402-query-payment-status":
+            return ['{"status":"TRADE_CREATED"}']
+        return ['{"ok":true}']
+
+    client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    started = client.start_402(
+        "https://provider.test/execute",
+        encode_a402_json({"protocol": {
+            "out_trade_no": "MPA-LEGACY", "pay_before": "2026-08-18T12:00:00+00:00",
+            "service_id": "API_LEGACY", "resource_id": "/execute?service=legacy",
+        }}),
+        request_id="req-legacy", business_session_id="business-legacy",
+    )
+    session_path = tmp_path / "alipay-sessions" / f"{started.payment_session_id}.json"
+    legacy = json.loads(session_path.read_text(encoding="utf-8"))
+    for key in ("out_trade_no", "pay_before", "service_id", "resource_id"):
+        legacy.pop(key, None)
+    legacy["status"] = "unknown"
+    session_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    recovered = client.resume(started.payment_session_id)
+
+    assert recovered.status == "pending"
+    assert recovered.out_trade_no == "MPA-LEGACY"
+    assert recovered.pay_before == "2026-08-18T12:00:00+00:00"
+    assert recovered.service_id == "API_LEGACY"
+    assert recovered.resource_id == "/execute?service=legacy"
 
 
 @pytest.mark.parametrize("label", ["订单号", "查询单号"])

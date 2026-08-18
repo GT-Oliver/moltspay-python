@@ -36,7 +36,6 @@
                                     "seller_id": "2088641494699428",
                                     "app_id": "2021006150642142",
                                     "seller_name": "上海超响应数字科技有限公司",
-                                    "balance_topup_service_id": "API_0EA6DC4FC99A4DF7",
                                     "private_key_path": "cert/alipay/ALIPAY_PRIVATE_KEY.pem",
                                     "public_key_path": "cert/alipay/ALIPAY_APP_PUBLIC_KEY.pem"                                    }
                  },
@@ -47,7 +46,7 @@
                          "description":  "Local CNY balance test service",
                          "function":  "ping",
                          "price":  0.01,
-                         "currency":  "USDC",
+                         "currency":  "CNY",
                          "input":  {
 
                                    },
@@ -58,7 +57,7 @@
                                          "price":  "0.01"
                                      },
                          "alipay":  {
-                                        "service_id": "API_0EA6DC4FC99A4DF7",
+                                        "service_id": "API_538D4442D15D426C",
                                         "price_cny": "0.01",
                                         "goods_name": "Ping",
                                         "resource_id": "/execute?service=ping"
@@ -74,7 +73,7 @@
                          "description":  "Local CNY balance test service",
                          "function":  "pong",
                          "price":  1,
-                         "currency":  "USDC",
+                         "currency":  "CNY",
                          "input":  {
 
                                    },

@@ -125,8 +125,7 @@ class BalanceTopupSession(BaseModel):
     pack: str
     server_url: str
     code_url: str = ""
-    rail: str = "wechat"
-    payment_session_id: Optional[str] = None
+    rail: Literal["wechat"] = "wechat"
     status: Literal["pending", "credited", "expired"] = "pending"
     created_at: str
     expires_at: str

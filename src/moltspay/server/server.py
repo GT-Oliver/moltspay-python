@@ -500,8 +500,6 @@ class MoltsPayServer:
                     return self._handle_balance_topup_order(body)
                 elif parsed.path == "/balance/topup/confirm":
                     return self._handle_balance_topup_confirm(body)
-                elif parsed.path == "/balance/topup/alipay":
-                    return self._handle_balance_topup_alipay(body, payment_proof, idempotency_key)
                 elif parsed.path == "/balance/refund":
                     return self._handle_balance_refund(body)
                 else:
@@ -574,6 +572,8 @@ class MoltsPayServer:
                 facilitator = self._balance_facilitator()
                 if not facilitator:
                     return self._send_json(404, {"error": "Balance rail not configured"})
+                if isinstance(body, dict) and str(body.get("rail") or "").lower() == "alipay":
+                    return self._send_json(400, {"error": "Alipay balance top-ups are not supported"})
                 if not self._balance_admin_authorized():
                     return self._send_json(401, {"error": "Balance admin authorization required"})
                 try:
@@ -631,78 +631,6 @@ class MoltsPayServer:
                 }
                 server._balance_topup_orders[cache_key] = result
                 self._send_json(200, result)
-
-            def _handle_balance_topup_alipay(self, body: Dict[str, Any], payment_proof: Optional[str], idempotency_key: Optional[str]):
-                facilitator = self._balance_facilitator()
-                if not facilitator or not server.alipay or not server.alipay_store:
-                    return self._send_json(400, {"code": "alipay_not_configured", "error": "Alipay balance top-up is not configured"})
-                buyer_id = body.get("buyer_id") if isinstance(body, dict) else None
-                pack = body.get("pack") if isinstance(body, dict) else None
-                if not isinstance(buyer_id, str) or not buyer_id or not isinstance(pack, str):
-                    return self._send_json(422, {"code": "alipay_topup_binding_invalid", "error": "buyer_id and pack are required"})
-                config = server.provider.balance if server.provider and server.provider.balance else {}
-                try:
-                    from decimal import Decimal
-                    amount = normalize_cny_amount(pack)
-                    amount_fen = int(Decimal(amount) * 100)
-                except Exception:
-                    return self._send_json(422, {"code": "alipay_topup_binding_invalid", "error": "pack must be a valid positive CNY amount"})
-                packs = [str(item) for item in config.get("topup_packs", [])]
-                if packs and amount not in [normalize_cny_amount(item) for item in packs if str(item)]:
-                    return self._send_json(422, {"code": "alipay_topup_binding_invalid", "error": "pack is not offered by this provider"})
-                resource_id = "/balance/topup/alipay"
-                request_id = idempotency_key or str(body.get("request_id") or f"req_{secrets.token_hex(12)}")
-                if payment_proof:
-                    try:
-                        proof = server.alipay.parse_payment_proof(payment_proof)
-                        verified = server.alipay.verify_payment(proof)
-                    except Exception:
-                        return self._send_json(503, {"code": "alipay_verify_unavailable", "error": "Alipay verification is temporarily unavailable", "retryable": True})
-                    order = server.alipay_store.get(str(verified.get("out_trade_no") or ""))
-                    if not order:
-                        return self._send_json(404, {"code": "alipay_order_not_found", "error": "Alipay top-up order was not found"})
-                    if order.get("kind") != "balance_topup" or order.get("buyer_id") != buyer_id:
-                        return self._send_json(403, {"code": "alipay_topup_binding_invalid", "error": "Alipay proof is bound to another buyer or resource"})
-                    if str(verified.get("service_id") or "") != str(order.get("service_id") or ""):
-                        return self._send_json(403, {"code": "alipay_service_mismatch", "error": "Alipay service does not match the top-up order"})
-                    try:
-                        matches = normalize_cny_amount(verified.get("amount")) == f"{order['amount_fen'] / 100:.2f}"
-                    except Exception:
-                        matches = False
-                    if not matches or verified.get("active") is not True or verified.get("resource_id") != resource_id:
-                        return self._send_json(409, {"code": "alipay_amount_mismatch", "error": "Alipay top-up does not match the order"})
-                    trade_no = str(verified.get("trade_no") or proof["trade_no"])
-                    claimed = server.alipay_store.claim_execution(order["out_trade_no"], trade_no=trade_no, digest=proof_hash(payment_proof), resource_id=resource_id)
-                    if claimed["state"] == "completed":
-                        return self._send_json(200, {**(claimed["order"].get("result") or {}), "replayed": True})
-                    if claimed["state"] == "executing":
-                        return self._send_json(409, {"code": "alipay_execution_in_progress", "error": "Alipay top-up is already being credited", "retryable": True})
-                    if claimed["state"] != "claimed":
-                        return self._send_json(409, {"code": "alipay_replay_detected", "error": "Alipay top-up proof was replayed"})
-                    try:
-                        credited = facilitator.ledger.topup(buyer_id, order["amount_fen"], f"alipay:{trade_no}", description=f"Alipay top-up out_trade_no={order['out_trade_no']}")
-                        result = {"credited": True, "buyer_id": buyer_id, "rail": "alipay", "amount": f"{order['amount_fen'] / 100:.2f}", "currency": "CNY", "trade_no": trade_no, "out_trade_no": order["out_trade_no"], "tx_id": credited["tx_id"], "balance": from_sat(credited["balance_sat"]), "replayed": bool(credited.get("replayed"))}
-                        server.alipay_store.complete(order["out_trade_no"], result, ledger_tx_id=credited["tx_id"])
-                        try:
-                            server.alipay.confirm_fulfillment(trade_no)
-                            server.alipay_store.mark_outbox(trade_no, "confirmed")
-                        except Exception:
-                            pass
-                        return self._send_json(200, result, {"Payment-Validation": encode_a402_json({"trade_no": trade_no, "out_trade_no": order["out_trade_no"], "validated": True, "resource_id": resource_id})})
-                    except Exception:
-                        server.alipay_store.fail_delivery(order["out_trade_no"], "alipay_topup_credit_failed")
-                        return self._send_json(500, {"code": "alipay_topup_credit_failed", "error": "Alipay top-up credit failed"})
-                try:
-                    service_id = server.alipay.config.get("balance_topup_service_id")
-                    if not isinstance(service_id, str) or not service_id.strip():
-                        raise ValueError("balance_topup_service_id is required")
-                    service_id = service_id.strip()
-                    order = server.alipay_store.create_order(request_id=request_id, kind="balance_topup", amount_fen=amount_fen, resource_id=resource_id, goods_name=f"Provider balance top-up {amount}", pay_before="", service_id=service_id, buyer_id=buyer_id)
-                    bill = server.alipay.create_payment_needed(out_trade_no=order["out_trade_no"], amount=amount, goods_name=f"Provider balance top-up {amount}", resource_id=resource_id, service_id=service_id, timeout_seconds=int(config.get("default_timeout_seconds") or server.alipay.config.get("default_timeout_seconds", 1800)))
-                    server.alipay_store.db.execute("UPDATE alipay_orders SET pay_before=?,updated_at=? WHERE out_trade_no=?", (bill["pay_before"], datetime.now(timezone.utc).isoformat(), order["out_trade_no"]))
-                except Exception:
-                    return self._send_json(500, {"code": "alipay_config_invalid", "error": "Unable to create Alipay top-up bill"})
-                return self._send_json(402, {"code": "payment_needed", "message": "Payment is required for balance top-up", "resourceId": resource_id, "requestId": request_id}, {"Payment-Needed": bill["header"], "Cache-Control": "no-store"})
 
             def _handle_balance_topup_confirm(self, body):
                 facilitator = self._balance_facilitator()
