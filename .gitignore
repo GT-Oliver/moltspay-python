@@ -5,6 +5,8 @@ __pycache__/
 .env.*
 !.env.example
 
+data/
+
 # Certificates and private keys
 cert/
 alipay/
