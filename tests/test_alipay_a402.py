@@ -68,6 +68,53 @@ def test_order_store_claim_and_replay_are_idempotent():
     replay = store.claim_execution(order["out_trade_no"], trade_no="trade-1", digest="hash-1", resource_id=order["resource_id"])
     assert replay["state"] == "completed"
     assert replay["order"]["result"] == {"result": "ok"}
+    rotated_proof = store.claim_execution(
+        order["out_trade_no"], trade_no="trade-1", digest="hash-2",
+        resource_id=order["resource_id"],
+    )
+    assert rotated_proof["state"] == "completed"
+    wrong_trade = store.claim_execution(
+        order["out_trade_no"], trade_no="trade-2", digest="hash-2",
+        resource_id=order["resource_id"],
+    )
+    assert wrong_trade["state"] == "replay"
+    assert wrong_trade["reason"] == "trade_mismatch"
+
+
+def test_order_store_public_status_exposes_completion_without_proof_material():
+    store = AlipayOrderStore(":memory:")
+    order = store.create_order(
+        request_id="req-public", kind="service", amount_fen=1,
+        resource_id="/execute?service=ping", goods_name="Ping", pay_before="",
+        service_id="API_PING",
+    )
+    store.claim_execution(
+        order["out_trade_no"], trade_no="trade-public", digest="secret-proof-hash",
+        resource_id=order["resource_id"],
+    )
+    store.complete(order["out_trade_no"], {"ok": True})
+    store.mark_outbox("trade-public", "confirmed")
+
+    public = store.public_status(order["out_trade_no"])
+
+    assert public == {
+        "out_trade_no": order["out_trade_no"],
+        "trade_no": "trade-public",
+        "service": "ping",
+        "service_id": "API_PING",
+        "amount": "0.01",
+        "currency": "CNY",
+        "order_status": "completed",
+        "payment_status": "paid",
+        "fulfillment_status": "confirmed",
+        "result": {"ok": True},
+        "error_code": None,
+        "created_at": public["created_at"],
+        "updated_at": public["updated_at"],
+        "completed_at": public["completed_at"],
+    }
+    assert "proof_hash" not in public
+    assert "request_id" not in public
 
 
 def test_order_store_rejects_service_change_for_same_idempotency_key():
@@ -102,7 +149,7 @@ def test_a402_order_store_rejects_balance_topup_orders():
         )
 
 
-def test_facilitator_rejects_verified_service_mismatch():
+def test_facilitator_does_not_require_uncontracted_verified_service_id():
     private, public = _keys()
     facilitator = AlipayFacilitator({
         "app_id": "app", "seller_id": "seller", "seller_name": "Provider",
@@ -124,8 +171,7 @@ def test_facilitator_rejects_verified_service_mismatch():
             },
         },
     ))
-    assert not result.valid
-    assert result.error == "alipay_service_mismatch"
+    assert result.valid
 
 
 def test_buyer_session_persists_and_resumes_without_proof(tmp_path):
@@ -185,6 +231,7 @@ def test_buyer_session_persists_and_resumes_without_proof(tmp_path):
         ("BIND", "processing"),
         ("PAID", "paid"),
         ("SUCCESS", "paid"),
+        ("VALIDATED", "paid"),
         ("FAILED", "rejected"),
         ("EXPIRED", "expired"),
         ("CLOSED", "rejected"),
@@ -273,6 +320,154 @@ def test_paid_resource_failure_stays_recoverable_as_fulfilling(tmp_path):
     assert observed.status == "fulfilling"
     assert observed.resource_status_code == 503
     assert observed.last_error_code == "alipay_fulfillment_incomplete"
+
+
+def test_clean_cli_result_clears_stale_replay_diagnostics(tmp_path):
+    out_shake_no = "12345678908282123456789012345678"
+
+    def runner(args):
+        if args[0] == "check-wallet":
+            return ['{"ready":true,"opened":true,"bound":true}']
+        if args[0] == "402-buyer-pay":
+            return [f"查询单号：{out_shake_no}"]
+        if args[0] == "402-query-payment-status":
+            return ['{"status":"VALIDATED","tradeNo":"trade-clean","outTradeNo":"MPA-CLEAN"}']
+        return ['{"ok":true}']
+
+    client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    started = client.start_402(
+        "https://provider.test/execute",
+        encode_a402_json({"protocol": {"out_trade_no": "MPA-CLEAN"}}),
+        request_id="req-clean", business_session_id="business-clean",
+    )
+    client._update(
+        started, status="paid", provider_code="alipay_replay_detected",
+        provider_message="stale replay",
+    )
+
+    observed = client.resume(started.payment_session_id)
+
+    assert observed.status == "paid"
+    assert observed.provider_status == "VALIDATED"
+    assert observed.provider_code is None
+    assert observed.provider_message is None
+
+
+def test_provider_order_reconciliation_overrides_stale_local_replay(tmp_path):
+    out_shake_no = "12345678908282123456789012345678"
+
+    def runner(args):
+        if args[0] == "check-wallet":
+            return ['{"ready":true,"opened":true,"bound":true}']
+        if args[0] == "402-buyer-pay":
+            return [f"查询单号：{out_shake_no}"]
+        return ['{"ok":true}']
+
+    client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    started = client.start_402(
+        "https://provider.test/execute",
+        encode_a402_json({"protocol": {"out_trade_no": "MPA-RECONCILE"}}),
+        request_id="req-reconcile", business_session_id="business-reconcile",
+    )
+    stale = client._update(
+        started, status="paid", provider_status="VALIDATED",
+        provider_code="alipay_replay_detected", provider_message="stale replay",
+        last_error_code="alipay_fulfillment_state_unknown", last_error="unknown",
+    )
+
+    reconciled = client.reconcile_order(stale.out_trade_no, {
+        "outTradeNo": stale.out_trade_no,
+        "tradeNo": "trade-reconciled",
+        "orderStatus": "completed",
+        "paymentStatus": "paid",
+        "fulfillmentStatus": "confirmed",
+        "result": {"ok": True},
+    })
+
+    assert reconciled.status == "completed"
+    assert reconciled.result == {"ok": True}
+    assert reconciled.fulfillment_status == "confirmed"
+    assert reconciled.provider_code is None
+    assert reconciled.provider_message is None
+    assert reconciled.last_error_code is None
+    assert reconciled.last_error is None
+    assert reconciled.sync_source == "provider_order_api"
+    assert reconciled.last_synced_at
+
+
+def test_sdk_order_status_queries_provider_and_reconciles_local_session(tmp_path, monkeypatch):
+    out_shake_no = "12345678908282123456789012345678"
+
+    def runner(args):
+        if args[0] == "check-wallet":
+            return ['{"ready":true,"opened":true,"bound":true}']
+        if args[0] == "402-buyer-pay":
+            return [f"查询单号：{out_shake_no}"]
+        return ['{"ok":true}']
+
+    buyer = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    started = buyer.start_402(
+        "https://provider.test/execute",
+        encode_a402_json({"protocol": {"out_trade_no": "MPA-SDK"}}),
+        request_id="req-sdk", business_session_id="business-sdk",
+    )
+    sdk = object.__new__(MoltsPay)
+    sdk._timeout = 5
+    sdk._alipay_client = buyer
+    calls = []
+
+    class Response:
+        status_code = 200
+        is_success = True
+
+        @staticmethod
+        def json():
+            return {
+                "out_trade_no": "MPA-SDK", "trade_no": "trade-sdk",
+                "order_status": "completed", "payment_status": "paid",
+                "fulfillment_status": "confirmed", "result": {"ok": True},
+            }
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr("moltspay.client.httpx.get", fake_get)
+
+    order = sdk.get_alipay_order_status("https://provider.test", "MPA-SDK")
+
+    assert calls[0][0] == "https://provider.test/payments/alipay/MPA-SDK"
+    assert order["authoritative"] is True
+    assert order["reconciled"] is True
+    assert order["payment_session_id"] == started.payment_session_id
+    assert buyer.get_session(started.payment_session_id).status == "completed"
+
+
+def test_local_session_status_and_list_are_read_only_and_filter_effective_expiry(tmp_path):
+    out_shake_no = "12345678908282123456789012345678"
+
+    def runner(args):
+        if args[0] == "check-wallet":
+            return ['{"ready":true,"opened":true,"bound":true}']
+        if args[0] == "402-buyer-pay":
+            return [f"查询单号：{out_shake_no}"]
+        return ['{"ok":true}']
+
+    client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    started = client.start_402(
+        "https://provider.test/execute",
+        encode_a402_json({"protocol": {"out_trade_no": "MPA-READONLY"}}),
+        request_id="req-readonly", business_session_id="business-readonly", timeout=-1,
+    )
+    path = tmp_path / "alipay-sessions" / f"{started.payment_session_id}.json"
+    before = path.read_bytes()
+
+    observed = client.get_session(started.payment_session_id)
+    listed = client.list_sessions(status="expired")
+
+    assert observed.status == "expired"
+    assert [item.payment_session_id for item in listed] == [started.payment_session_id]
+    assert path.read_bytes() == before
 
 
 def test_resume_queries_provider_after_local_session_timeout(tmp_path):

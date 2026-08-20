@@ -57,7 +57,7 @@ OutTradeNo = Annotated[
     str,
     Field(
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
-        description="Provider top-up order number; 1-128 letters, digits, dots, underscores, or hyphens.",
+        description="Provider merchant order number; 1-128 letters, digits, dots, underscores, or hyphens.",
     ),
 ]
 TopupPack = Annotated[
@@ -111,6 +111,10 @@ AlipayStatus = Annotated[
         "completed", "rejected", "expired", "unknown",
     ],
     Field(description="Optional Alipay session status filter."),
+]
+AlipayOrderStatus = Annotated[
+    Literal["offered", "verified", "executing", "completed", "delivery_failed", "expired", "unknown"],
+    Field(description="Optional authoritative provider order-status filter."),
 ]
 TopupStatus = Annotated[
     Literal["pending", "credited", "expired"],
@@ -244,6 +248,9 @@ def _alipay_session(session: Any) -> Dict[str, Any]:
         "provider_message": getattr(session, "provider_message", None),
         "resource_status_code": getattr(session, "resource_status_code", None),
         "fulfillment_status": getattr(session, "fulfillment_status", None),
+        "order_status": getattr(session, "order_status", None),
+        "sync_source": getattr(session, "sync_source", None),
+        "last_synced_at": getattr(session, "last_synced_at", None),
         "media_paths": getattr(session, "media_paths", []),
         "created_at": session.created_at,
         "updated_at": session.updated_at,
@@ -251,6 +258,8 @@ def _alipay_session(session: Any) -> Dict[str, Any]:
         "last_error_code": session.last_error_code,
         "last_error": session.last_error,
         "result": session.result,
+        "source": "local_cache",
+        "authoritative": False,
     })
 
 
@@ -418,6 +427,9 @@ class MoltsPayMCP:
     def alipay_status(self, identifier: Identifier, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         return self._run(lambda: _alipay_session(self.client.get_alipay_payment_status(identifier)), requestId)
 
+    def alipay_session_status(self, identifier: Identifier, requestId: Optional[RequestId] = None) -> ToolEnvelope:
+        return self.alipay_status(identifier, requestId)
+
     def alipay_resume(self, identifier: Identifier, confirmed: Confirmed = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         def call():
             self._confirm(confirmed)
@@ -426,6 +438,15 @@ class MoltsPayMCP:
 
     def alipay_list(self, status: Optional[AlipayStatus] = None, limit: PageLimit = 100, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         return self._run(lambda: {"sessions": [_alipay_session(item) for item in self.client.list_alipay_payment_sessions(status=status, limit=limit)], "limit": limit}, requestId)
+
+    def alipay_session_list(self, status: Optional[AlipayStatus] = None, limit: PageLimit = 100, requestId: Optional[RequestId] = None) -> ToolEnvelope:
+        return self.alipay_list(status, limit, requestId)
+
+    def alipay_order_status(self, serverUrl: HttpUrl, outTradeNo: OutTradeNo, requestId: Optional[RequestId] = None) -> ToolEnvelope:
+        return self._run(lambda: self.client.get_alipay_order_status(serverUrl, outTradeNo), requestId)
+
+    def alipay_order_list(self, serverUrl: HttpUrl, status: Optional[AlipayOrderStatus] = None, limit: PageLimit = 100, requestId: Optional[RequestId] = None) -> ToolEnvelope:
+        return self._run(lambda: self.client.list_alipay_orders(serverUrl, status=status, limit=limit), requestId)
 
     def pay(self, url: HttpUrl, service: ServiceId, params: ServiceParams, chain: Optional[PaymentChain] = None, token: PaymentToken = "USDC", rail: Optional[PaymentRail] = None, confirmed: Confirmed = False, dryRun: DryRun = False, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         def call():
@@ -521,9 +542,35 @@ TOOL_DESCRIPTIONS = {
         "conversation/session ID (usually a UUID), never the returned local mpay_alipay_* paymentSessionId. "
         "dryRun=true performs no network, subprocess, or local write."
     ),
-    "alipay_status": "Read one local Alipay session without contacting Alipay, invoking alipay-bot, or retrying the provider.",
+    "alipay_status": (
+        "Deprecated compatibility name for moltspay_alipay_session_status. Reads only local recovery cache, "
+        "returns source=local_cache and authoritative=false, and must not be presented as provider order truth."
+    ),
+    "alipay_session_status": (
+        "Read one local Alipay recovery session without contacting Alipay or the provider. The response is "
+        "source=local_cache and authoritative=false. Use moltspay_alipay_order_status to determine whether "
+        "the provider executed and durably recorded the paid service. This read never modifies the session."
+    ),
     "alipay_resume": "Resume an Alipay session; this is side-effectful and may query payment, retry the resource, and confirm fulfillment.",
-    "alipay_list": "List local Alipay sessions without returning payment proofs, wallet credentials, or challenge contents.",
+    "alipay_list": (
+        "Deprecated compatibility name for moltspay_alipay_session_list. Lists only local recovery cache, "
+        "returns authoritative=false, and must not be used to claim delivery failure, replay, or refund need."
+    ),
+    "alipay_session_list": (
+        "List local Alipay recovery sessions without returning proofs or credentials. Every session is marked "
+        "source=local_cache and authoritative=false. This is read-only and filters after deriving effective "
+        "local expiry. Use moltspay_alipay_order_list for provider-side order and fulfillment state."
+    ),
+    "alipay_order_status": (
+        "Query one authoritative durable Alipay order from the provider using serverUrl and outTradeNo, then "
+        "reconcile its matching local recovery session. Returns paymentStatus, orderStatus, result and "
+        "fulfillmentStatus without proof data or credentials. Read-only on the provider; updates local cache."
+    ),
+    "alipay_order_list": (
+        "Query authoritative provider state for Alipay orders already known in local recovery sessions for "
+        "serverUrl. This intentionally does not enumerate arbitrary merchant orders. Returns source="
+        "provider_order_api, authoritative=true, and per-order query warnings; updates matching local cache."
+    ),
     "pay": (
         "Pay for and execute a provider service using only an on-chain payment or provider balance. params is "
         "required and may be empty. chain may be base, polygon, base_sepolia, bnb, bnb_testnet, "

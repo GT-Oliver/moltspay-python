@@ -111,6 +111,23 @@ class FakeClient:
     def list_alipay_payment_sessions(self, **kwargs):
         return [self.get_alipay_payment_status("mpay_alipay_1")]
 
+    def get_alipay_order_status(self, server_url, out_trade_no):
+        self.calls.append(("alipay_order_status", server_url, out_trade_no))
+        return {
+            "out_trade_no": out_trade_no, "trade_no": "trade-1",
+            "payment_status": "paid", "order_status": "completed",
+            "fulfillment_status": "confirmed", "result": {"ok": True},
+            "source": "provider_order_api", "authoritative": True,
+        }
+
+    def list_alipay_orders(self, server_url, *, status=None, limit=100):
+        self.calls.append(("alipay_order_list", server_url, status, limit))
+        return {
+            "orders": [self.get_alipay_order_status(server_url, "MPA1")],
+            "source": "provider_order_api", "authoritative": True,
+            "scope": "locally_known_orders", "warnings": [], "limit": limit,
+        }
+
     def pay(self, *args, **kwargs):
         self.calls.append(("pay", args, kwargs))
         return {"success": True}
@@ -169,6 +186,10 @@ def test_fastmcp_registration_exposes_constrained_tools():
     by_name = {tool.name: tool for tool in tools}
 
     assert "moltspay_wechat_start" in by_name
+    assert "moltspay_alipay_session_status" in by_name
+    assert "moltspay_alipay_session_list" in by_name
+    assert "moltspay_alipay_order_status" in by_name
+    assert "moltspay_alipay_order_list" in by_name
     schema = by_name["moltspay_balance_transactions"].inputSchema
     assert schema["properties"]["limit"]["maximum"] == 100
     assert schema["properties"]["offset"]["minimum"] == 0
@@ -356,8 +377,17 @@ def test_adapter_exposes_all_read_and_lifecycle_paths(monkeypatch):
         "https://provider.test", "svc", "runtime-session", dryRun=True,
     )["data"]["sessionId"] == "runtime-session"
     assert adapter.alipay_status("mpay_alipay_1")["ok"]
+    local = adapter.alipay_session_status("mpay_alipay_1")
+    assert local["data"]["source"] == "local_cache"
+    assert local["data"]["authoritative"] is False
     assert adapter.alipay_resume("mpay_alipay_1", confirmed=True)["data"]["status"] == "completed"
     assert len(adapter.alipay_list()["data"]["sessions"]) == 1
+    assert len(adapter.alipay_session_list()["data"]["sessions"]) == 1
+    order = adapter.alipay_order_status("https://provider.test", "MPA1")
+    assert order["data"]["authoritative"] is True
+    assert order["data"]["orderStatus"] == "completed"
+    orders = adapter.alipay_order_list("https://provider.test")
+    assert orders["data"]["scope"] == "locally_known_orders"
 
     assert adapter.pay("https://provider.test", "svc", {}, dryRun=True)["data"]["intent"] == "pay"
     assert adapter.pay("https://provider.test", "svc", {}, rail="balance", confirmed=True)["ok"]

@@ -107,17 +107,31 @@ Provider 为服务请求创建 `kind="service"` 的 A402 订单，并将下列�
 2. 支付宝平台签名或官方查询结果；
 3. `active=true`；
 4. `out_trade_no` 对应本地 service 订单；
-5. `service_id`；
-6. `resource_id`；
-7. 金额与币种；
-8. 有效期；
-9. `trade_no` 和 proof hash 未绑定其他订单。
+5. `resource_id`；
+6. 金额与币种；
+7. 有效期；
+8. `trade_no` 和 proof hash 未绑定其他订单。
+
+`service_id` 在创建订单时保存并受本地幂等约束保护，但官方验付响应契约不保证返回该字段，因此不得用响应中的 `service_id` 拒绝已经通过订单号、资源、金额及防重放校验的付款。
 
 验证成功后，`AlipayOrderStore.claim_execution()` 原子取得一次履约权。服务完成后保存结果，并通过 fulfillment outbox 调用支付宝履约确认。重复请求返回原结果，不重复执行服务。
 
 网络失败属于状态未知，不能被当成付款无效，也不能自动创建第二笔订单。
 
-## 6. 配置
+## 6. 订单查询与本地恢复状态
+
+`~/.moltspay/alipay-sessions/*.json` 是买方恢复缓存，不是 Provider 订单数据库。读取本地 session 时只派生有效状态，不写文件；本地结果必须标记 `source=local_cache`、`authoritative=false`，不能据此断言服务未执行、需要退款或 proof 被重放。
+
+Provider 通过 `GET /payments/alipay/{out_trade_no}` 返回单笔安全订单视图，包括订单号、交易号、金额、服务、支付状态、订单状态、履约状态和已保存的业务结果。响应不得包含 Payment-Proof、proof hash、钱包凭据或应用凭据。订单号是高熵 capability identifier；接口不提供未认证的全商户订单枚举。
+
+MCP 查询分为两组：
+
+- `alipay_session_status/list`：只读本地恢复缓存；旧 `alipay_status/list` 是兼容别名；
+- `alipay_order_status/list`：查询 Provider 权威状态并与匹配的本地 session 对账；list 只查询本地已知订单。
+
+权威完成态覆盖本地陈旧的 replay/unknown 诊断，写入已保存结果与履约状态，并记录同步来源和时间。任何记忆或对客结论在声称“未交付、需退款、proof 重复”前，都必须取得 Provider 权威状态。
+
+## 7. 配置
 
 ```json
 {
@@ -136,7 +150,7 @@ Provider 为服务请求创建 `kind="service"` 的 A402 订单，并将下列�
 
 配置中不应出现充值 service ID。生产环境必须使用已开通 AI 按量付费产品的真实应用、商户、服务 ID 和密钥。私钥不得提交仓库、写入日志或返回给客户端。
 
-## 7. 错误与恢复原则
+## 8. 错误与恢复原则
 
 | 场景 | 处理 |
 |---|---|
@@ -148,7 +162,7 @@ Provider 为服务请求创建 `kind="service"` 的 A402 订单，并将下列�
 | proof/trade 重放 | 返回原结果或重放冲突，不重复履约 |
 | 用户尝试支付宝余额充值 | SDK 拒绝、CLI/MCP 无该选项、旧服务端路径返回 404 |
 
-## 8. 验收标准
+## 9. 验收标准
 
 - `pay(..., rail="alipay")` 仍读取服务的 CNY 报价并进入 `_pay_alipay()`；
 - A402 start、resume、proof verification、幂等服务执行和履约确认无回归；

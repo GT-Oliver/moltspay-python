@@ -470,6 +470,8 @@ class MoltsPayServer:
                     return self._handle_balance_query(parsed)
                 elif parsed.path.startswith("/payments/wechat/"):
                     return self._handle_wechat_status(parsed.path)
+                elif parsed.path.startswith("/payments/alipay/"):
+                    return self._handle_alipay_status(parsed.path)
                 else:
                     self._send_json(404, {"error": "Not found"})
             
@@ -530,6 +532,24 @@ class MoltsPayServer:
                     "status": status, "tradeState": trade_state, "outTradeNo": trade_no,
                     "transactionId": result.get("transaction_id"),
                 })
+
+            def _handle_alipay_status(self, path: str):
+                """Read one durable provider order without exposing proof data."""
+                if not server.alipay_store:
+                    return self._send_json(404, {"error": "Alipay payment rail is not configured"})
+                out_trade_no = unquote(path.removeprefix("/payments/alipay/"))
+                if (
+                    not out_trade_no or len(out_trade_no) > 128
+                    or not all(ch.isalnum() or ch in "._-" for ch in out_trade_no)
+                ):
+                    return self._send_json(400, {"error": "Invalid Alipay merchant order number"})
+                order = server.alipay_store.public_status(out_trade_no)
+                if order is None:
+                    return self._send_json(404, {
+                        "code": "alipay_order_not_found",
+                        "error": "Alipay order was not found",
+                    })
+                return self._send_json(200, order, {"Cache-Control": "no-store"})
 
             def _handle_balance_query(self, parsed):
                 facilitator = self._balance_facilitator()
@@ -824,8 +844,6 @@ class MoltsPayServer:
                 order = server.alipay_store.get(out_trade_no)
                 if not order:
                     return self._send_json(404, {"code": "alipay_order_not_found", "error": "Alipay order was not found"})
-                if str(verified.get("service_id") or "") != str(order.get("service_id") or ""):
-                    return self._send_json(403, {"code": "alipay_service_mismatch", "error": "Alipay service does not match the order"})
                 try:
                     amount_matches = normalize_cny_amount(verified.get("amount")) == f"{order['amount_fen'] / 100:.2f}"
                 except Exception:
@@ -842,7 +860,17 @@ class MoltsPayServer:
                 if claimed["state"] == "executing":
                     return self._send_json(409, {"code": "alipay_execution_in_progress", "error": "Alipay execution is already in progress", "retryable": True})
                 if claimed["state"] == "replay":
-                    return self._send_json(409, {"code": "alipay_replay_detected", "error": "Alipay proof or trade number was replayed"})
+                    reason = claimed.get("reason") or "replay_detected"
+                    code = {
+                        "trade_mismatch": "alipay_trade_order_mismatch",
+                        "trade_used_by_other_order": "alipay_trade_reused",
+                        "proof_changed_before_completion": "alipay_proof_changed",
+                    }.get(reason, "alipay_replay_detected")
+                    return self._send_json(409, {
+                        "code": code,
+                        "error": "Alipay payment evidence conflicts with the durable order",
+                        "reason": reason,
+                    })
                 if claimed["state"] != "claimed":
                     return self._send_json(403, {"code": "alipay_resource_mismatch", "error": "Alipay order cannot be used for this resource"})
                 try:

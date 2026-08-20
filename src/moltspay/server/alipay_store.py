@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
+from urllib.parse import parse_qs, urlparse
 
 
 def utc_now() -> str:
@@ -109,6 +110,61 @@ class AlipayOrderStore:
     def get_by_proof_hash(self, digest: str) -> Optional[Dict[str, Any]]:
         return self._row(self.db.execute("SELECT * FROM alipay_orders WHERE proof_hash=?", (digest,)).fetchone())
 
+    def public_status(self, out_trade_no: str) -> Optional[Dict[str, Any]]:
+        """Return a proof-free, credential-free provider view of one order."""
+        order = self.get(out_trade_no)
+        if order is None:
+            return None
+        order_status = str(order.get("status") or "unknown")
+        payment_status = {
+            "offered": "pending",
+            "verified": "paid",
+            "executing": "paid",
+            "completed": "paid",
+            "delivery_failed": "paid",
+            "expired": "expired",
+        }.get(order_status, "unknown")
+        fulfillment_status = {
+            "offered": "not_started",
+            "verified": "not_started",
+            "executing": "executing",
+            "delivery_failed": "failed",
+            "expired": "not_started",
+        }.get(order_status, "unknown")
+        if order_status == "completed":
+            outbox = None
+            if order.get("trade_no"):
+                outbox = self.db.execute(
+                    "SELECT status FROM alipay_fulfillment_outbox WHERE trade_no=?",
+                    (order["trade_no"],),
+                ).fetchone()
+            outbox_status = str(outbox["status"]) if outbox else "confirmed"
+            fulfillment_status = {
+                "confirmed": "confirmed",
+                "pending": "confirmation_pending",
+                "retry_wait": "confirmation_pending",
+                "sending": "confirmation_pending",
+                "exhausted": "confirmation_failed",
+            }.get(outbox_status, "unknown")
+        resource_id = str(order.get("resource_id") or "")
+        service_values = parse_qs(urlparse(resource_id).query).get("service") or []
+        return {
+            "out_trade_no": order["out_trade_no"],
+            "trade_no": order.get("trade_no"),
+            "service": service_values[0] if service_values else None,
+            "service_id": order.get("service_id"),
+            "amount": f"{int(order['amount_fen']) / 100:.2f}",
+            "currency": order.get("currency") or "CNY",
+            "order_status": order_status,
+            "payment_status": payment_status,
+            "fulfillment_status": fulfillment_status,
+            "result": order.get("result"),
+            "error_code": order.get("error_code"),
+            "created_at": order.get("created_at"),
+            "updated_at": order.get("updated_at"),
+            "completed_at": order.get("completed_at"),
+        }
+
     def create_order(self, *, request_id: str, kind: str, amount_fen: int, resource_id: str, goods_name: str,
                      pay_before: str, service_id: Optional[str] = None,
                      out_trade_no: Optional[str] = None, currency: str = "CNY") -> Dict[str, Any]:
@@ -146,12 +202,18 @@ class AlipayOrderStore:
             if row["resource_id"] != resource_id:
                 return {"state": "resource_mismatch", "order": dict(row)}
             if row["trade_no"] and row["trade_no"] != trade_no:
-                return {"state": "replay", "order": dict(row)}
+                return {"state": "replay", "reason": "trade_mismatch", "order": dict(row)}
             other = self.db.execute("SELECT * FROM alipay_orders WHERE trade_no=? AND out_trade_no<>?", (trade_no, out_trade_no)).fetchone()
             if other is not None:
-                return {"state": "replay", "order": dict(other)}
+                return {"state": "replay", "reason": "trade_used_by_other_order", "order": dict(other)}
+            # Alipay may issue a fresh proof for the same trade when the buyer
+            # resumes. Once delivery is complete, the verified trade identity
+            # is the idempotency boundary; a rotated proof must return the
+            # cached result instead of being rejected as a replay.
+            if row["status"] == "completed":
+                return {"state": "completed", "order": self._row(row)}
             if row["proof_hash"] and row["proof_hash"] != digest:
-                return {"state": "replay", "order": dict(row)}
+                return {"state": "replay", "reason": "proof_changed_before_completion", "order": dict(row)}
             if row["pay_before"]:
                 try:
                     expiry = datetime.fromisoformat(row["pay_before"].replace("Z", "+00:00"))
@@ -160,8 +222,6 @@ class AlipayOrderStore:
                         return {"state": "expired", "order": self.get(out_trade_no)}
                 except ValueError:
                     return {"state": "rejected", "order": self._row(row)}
-            if row["status"] == "completed":
-                return {"state": "completed", "order": self._row(row)}
             if row["status"] == "executing":
                 return {"state": "executing", "order": self._row(row)}
             if row["status"] not in {"offered", "verified", "unknown"}:

@@ -287,13 +287,10 @@ class AlipayFacilitator(BaseFacilitator):
                 return VerifyResult(valid=False, error="alipay_amount_mismatch", details={"amount": response.get("amount")})
             if str(response.get("trade_no")) != str(proof.get("trade_no")):
                 return VerifyResult(valid=False, error="alipay_order_mismatch", details={"trade_no": response.get("trade_no")})
-            for key in ("out_trade_no", "service_id", "resource_id", "trade_no"):
+            for key in ("out_trade_no", "resource_id", "trade_no"):
                 expected_value = (requirements.get("extra") or {}).get(key) or requirements.get(key)
                 if expected_value and str(response.get(key)) != str(expected_value):
-                    error = {
-                        "out_trade_no": "alipay_order_mismatch",
-                        "service_id": "alipay_service_mismatch",
-                    }.get(key, "alipay_resource_mismatch")
+                    error = {"out_trade_no": "alipay_order_mismatch"}.get(key, "alipay_resource_mismatch")
                     return VerifyResult(valid=False, error=error, details={key: response.get(key)})
             return VerifyResult(valid=True, details={**response, "proof": proof})
         except (AlipayProofMalformed, AlipayResponseSignatureInvalid, AlipayVerifyUnavailable) as exc:

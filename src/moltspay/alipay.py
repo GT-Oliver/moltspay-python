@@ -51,6 +51,7 @@ A402_PROVIDER_STATUS = {
     "BIND": "processing",
     "PAID": "paid",
     "SUCCESS": "paid",
+    "VALIDATED": "paid",
     "FAILED": "rejected",
     "EXPIRED": "expired",
     "CLOSED": "rejected",
@@ -189,6 +190,9 @@ class AlipayPaymentSession(BaseModel):
     provider_message: Optional[str] = None
     resource_status_code: Optional[int] = None
     fulfillment_status: Optional[str] = None
+    order_status: Optional[str] = None
+    sync_source: Optional[str] = None
+    last_synced_at: Optional[str] = None
     payment_url: Optional[str] = None
     media_paths: List[str] = Field(default_factory=list)
     challenge_path: Optional[str] = None
@@ -514,12 +518,14 @@ class AlipayBuyerClient:
                 item = AlipayPaymentSession.model_validate_json(path.read_text(encoding="utf-8"))
             except Exception:
                 continue
+            item = self._effective_session(item)
             if status and item.status != status:
                 continue
-            items.append(self._expire(item))
+            items.append(item)
         return sorted(items, key=lambda item: item.created_at, reverse=True)[: max(1, min(limit, 100))]
 
-    def _expire(self, session: AlipayPaymentSession) -> AlipayPaymentSession:
+    def _effective_session(self, session: AlipayPaymentSession) -> AlipayPaymentSession:
+        """Derive local expiry for display without mutating persisted state."""
         # Once payment is confirmed, the checkout deadline must not erase the
         # ability to recover an idempotent resource delivery.
         if session.status in {"paid", "fulfilling", "completed", "rejected", "expired"}:
@@ -528,10 +534,83 @@ class AlipayBuyerClient:
             expired = datetime.fromisoformat(session.expires_at.replace("Z", "+00:00")).timestamp() <= time.time()
         except ValueError:
             expired = True
-        return self._update(session, status="expired", last_error_code="alipay_payment_timeout", last_error="Alipay payment session expired") if expired else session
+        return session.model_copy(update={
+            "status": "expired",
+            "last_error_code": "alipay_payment_timeout",
+            "last_error": "Alipay payment session expired",
+        }) if expired else session
 
     def get_session(self, identifier: str) -> AlipayPaymentSession:
-        return self._expire(self._load(identifier))
+        return self._effective_session(self._load(identifier))
+
+    def reconcile_order(
+        self, identifier: str, order: Dict[str, Any], *, source: str = "provider_order_api",
+    ) -> AlipayPaymentSession:
+        """Persist a safe provider-order observation into its local session."""
+        session = self._load(identifier)
+        out_trade_no = order.get("outTradeNo") or order.get("out_trade_no")
+        if not isinstance(out_trade_no, str) or out_trade_no != session.out_trade_no:
+            raise AlipayProtocolError("Provider returned a conflicting Alipay merchant order number")
+        trade_no = order.get("tradeNo") or order.get("trade_no")
+        if trade_no and session.trade_no and trade_no != session.trade_no:
+            raise AlipayProtocolError("Provider returned a conflicting Alipay trade number")
+
+        order_status = str(order.get("orderStatus") or order.get("order_status") or "unknown").lower()
+        payment_status = str(order.get("paymentStatus") or order.get("payment_status") or "unknown").lower()
+        fulfillment_status = order.get("fulfillmentStatus") or order.get("fulfillment_status")
+        result_present = "result" in order
+        changes: Dict[str, Any] = {
+            "order_status": order_status,
+            "sync_source": source,
+            "last_synced_at": _iso(time.time()),
+            "provider_code": None,
+            "provider_message": None,
+        }
+        if trade_no and not session.trade_no:
+            changes["trade_no"] = trade_no
+        if isinstance(fulfillment_status, str):
+            changes["fulfillment_status"] = fulfillment_status
+
+        if order_status == "completed":
+            changes.update(
+                status="completed",
+                last_error_code=None,
+                last_error=None,
+            )
+            if result_present:
+                changes["result"] = order.get("result")
+        elif order_status == "delivery_failed":
+            changes.update(
+                status="fulfilling",
+                last_error_code=order.get("errorCode") or order.get("error_code")
+                or "service_execution_failed_after_payment",
+                last_error="Provider confirmed that service delivery failed after payment",
+            )
+            if result_present:
+                changes["result"] = order.get("result")
+        elif order_status == "executing":
+            changes.update(
+                status="fulfilling",
+                last_error_code=None,
+                last_error=None,
+            )
+        elif order_status == "verified" or payment_status == "paid":
+            changes.update(status="paid", last_error_code=None, last_error=None)
+        elif order_status == "expired":
+            changes.update(
+                status="expired",
+                last_error_code="alipay_payment_timeout",
+                last_error="Provider order expired before payment was confirmed",
+            )
+        elif order_status == "offered" or payment_status == "pending":
+            changes.update(status="pending", last_error_code=None, last_error=None)
+        else:
+            changes.update(
+                status="unknown",
+                last_error_code="alipay_payment_state_unknown",
+                last_error="Provider order state is unknown",
+            )
+        return self._update(session, **changes)
 
     def check_wallet(self) -> Dict[str, Any]:
         try:
@@ -636,9 +715,13 @@ class AlipayBuyerClient:
                 )
             if value and not current:
                 changes[key] = value
-        for key in ("payment_url", "media_paths", "provider_status", "provider_code", "provider_message"):
+        for key in ("payment_url", "media_paths", "provider_status"):
             if parsed.get(key) is not None:
                 changes[key] = parsed[key]
+        # Diagnostics describe only the latest CLI response. A clean response
+        # must clear a replay/error left by an earlier query.
+        changes["provider_code"] = parsed.get("provider_code")
+        changes["provider_message"] = parsed.get("provider_message")
 
         outcome = _resource_outcome(parsed)
         if outcome["resource_status_code"] is not None:

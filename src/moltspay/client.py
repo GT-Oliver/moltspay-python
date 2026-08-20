@@ -469,6 +469,83 @@ class MoltsPay:
     def list_alipay_payment_sessions(self, **kwargs: Any) -> List[AlipayPaymentSession]:
         return self._get_alipay_client().list_sessions(**kwargs)
 
+    def get_alipay_order_status(self, server_url: str, out_trade_no: str) -> Dict[str, Any]:
+        """Query and reconcile one authoritative provider-side Alipay order."""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", out_trade_no or ""):
+            raise ValueError("Invalid Alipay merchant order number")
+        response = httpx.get(
+            f"{server_url.rstrip('/')}/payments/alipay/{out_trade_no}",
+            headers={"Accept": "application/json"},
+            timeout=self._timeout,
+        )
+        if response.status_code == 404:
+            raise PaymentError(f"Alipay order was not found: {out_trade_no}")
+        if not response.is_success:
+            raise PaymentError(f"Alipay order query failed: HTTP {response.status_code}")
+        try:
+            order = response.json()
+        except ValueError as exc:
+            raise PaymentError("Alipay order query returned invalid JSON") from exc
+        if not isinstance(order, dict):
+            raise PaymentError("Alipay order query returned an invalid response")
+        returned = order.get("out_trade_no") or order.get("outTradeNo")
+        if returned != out_trade_no:
+            raise PaymentError("Alipay order query returned a conflicting order number")
+        alipay_client = self._get_alipay_client()
+        local_session = next(
+            (item for item in alipay_client.list_sessions(limit=100) if item.out_trade_no == out_trade_no),
+            None,
+        )
+        session = (
+            alipay_client.reconcile_order(local_session.payment_session_id, order)
+            if local_session is not None else None
+        )
+        return {
+            **order,
+            "source": "provider_order_api",
+            "authoritative": True,
+            "reconciled": session is not None,
+            "payment_session_id": session.payment_session_id if session is not None else None,
+        }
+
+    def list_alipay_orders(
+        self, server_url: str, *, status: Optional[str] = None, limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Reconcile provider state for locally known orders only."""
+        base = server_url.rstrip("/")
+        sessions = self._get_alipay_client().list_sessions(limit=100)
+        known: List[str] = []
+        for session in sessions:
+            context_server = session.context.get("server_url") if isinstance(session.context, dict) else None
+            belongs = context_server.rstrip("/") == base if isinstance(context_server, str) else session.resource_url.startswith(base + "/")
+            if belongs and session.out_trade_no and session.out_trade_no not in known:
+                known.append(session.out_trade_no)
+        orders: List[Dict[str, Any]] = []
+        warnings: List[Dict[str, str]] = []
+        for out_trade_no in known:
+            try:
+                order = self.get_alipay_order_status(base, out_trade_no)
+            except Exception as exc:
+                warnings.append({
+                    "out_trade_no": out_trade_no,
+                    "code": "alipay_order_query_failed",
+                    "message": str(exc),
+                })
+                continue
+            order_status = order.get("order_status") or order.get("orderStatus")
+            if status is None or order_status == status:
+                orders.append(order)
+            if len(orders) >= max(1, min(limit, 100)):
+                break
+        return {
+            "orders": orders,
+            "limit": max(1, min(limit, 100)),
+            "source": "provider_order_api",
+            "authoritative": True,
+            "scope": "locally_known_orders",
+            "warnings": warnings,
+        }
+
     def _pay_alipay(
         self, service_url: str, service_id: str, params: Dict[str, Any],
         amount: float, currency: str = "CNY", **options: Any,
