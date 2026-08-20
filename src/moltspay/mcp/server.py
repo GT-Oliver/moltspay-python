@@ -326,6 +326,9 @@ class MoltsPayMCP:
             return result
         return self._run(call, requestId)
 
+    def services(self, serverUrl: HttpUrl, requestId: Optional[RequestId] = None) -> ToolEnvelope:
+        return self._run(lambda: self.client.get_services(serverUrl), requestId)
+
     def balance_query(self, serverUrl: HttpUrl, buyerId: Optional[BuyerId] = None, requestId: Optional[RequestId] = None) -> ToolEnvelope:
         return self._run(lambda: self.client.get_buyer_balance(serverUrl, buyerId), requestId)
 
@@ -477,6 +480,11 @@ TOOL_DESCRIPTIONS = {
         "Read wallet address, balances on every configured chain, spending limits, and the optional provider "
         "balance. serverUrl is optional; when omitted, fiatBalance is null. buyerId is optional and otherwise "
         "uses the local default. Read-only and never sends a payment."
+    ),
+    "services": (
+        "Discover the services currently advertised by one provider. serverUrl is required. Returns provider "
+        "metadata plus service IDs, names, descriptions, prices, currencies, parameters, availability, and "
+        "advertised payment rails. Read-only: it never creates an order, signs a payment, or executes a service."
     ),
     "balance_query": (
         "Query one provider-side buyer balance. serverUrl is required. buyerId is optional and otherwise uses "

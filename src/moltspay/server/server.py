@@ -244,6 +244,69 @@ class MoltsPayServer:
                 handler=handler,
             )
             print(f"[MoltsPay]   Registered: {service.id} -> {func_name}()")
+
+    def _service_chains(self, config: ServiceConfig) -> List[str]:
+        """Return blockchain chains on which this service can actually be paid."""
+        accepted = set(config.accepted_currencies)
+        chains = []
+        for chain in self.chains:
+            if chain.network in {"balance", "wechat", ALIPAY_NETWORK}:
+                continue
+            supported_tokens = set(chain.tokens).intersection(TOKEN_ADDRESSES.get(chain.network, {}))
+            if accepted.intersection(supported_tokens):
+                chains.append(chain.chain)
+        return chains
+
+    def _service_payment_rails(self, config: ServiceConfig) -> Dict[str, Dict[str, Any]]:
+        """Describe configured non-chain payment rails for service discovery."""
+        rails: Dict[str, Dict[str, Any]] = {}
+
+        balance = self.registry.get("balance")
+        if config.balance is not None and isinstance(balance, BalanceFacilitator):
+            rails["balance"] = {
+                "available": True,
+                "interactive": False,
+                "protocol": "x402",
+                "currency": balance.currency,
+                "amount": str(config.balance.get("price", config.price)),
+            }
+
+        wechat = self.registry.get("wechat")
+        if config.wechat is not None and isinstance(wechat, WechatFacilitator):
+            rails["wechat"] = {
+                "available": True,
+                "interactive": True,
+                "protocol": "x402",
+                "currency": "CNY",
+                "amount": normalize_cny_amount(config.wechat["price_cny"]),
+            }
+
+        if config.alipay is not None and self.alipay is not None:
+            rails["alipay"] = {
+                "available": True,
+                "interactive": True,
+                "protocol": "a402",
+                "currency": "CNY",
+                "amount": normalize_cny_amount(config.alipay["price_cny"]),
+            }
+
+        return rails
+
+    def _service_discovery_entry(self, config: ServiceConfig) -> Dict[str, Any]:
+        """Build the canonical service shape shared by both discovery endpoints."""
+        return {
+            "id": config.id,
+            "name": config.name,
+            "description": config.description,
+            "price": config.price,
+            "currency": config.currency,
+            "acceptedCurrencies": config.accepted_currencies,
+            "chains": self._service_chains(config),
+            "input": {key: value.model_dump() for key, value in config.input.items()},
+            "output": config.output,
+            "available": config.id in self.skills,
+            "paymentRails": self._service_payment_rails(config),
+        }
     
     def _build_payment_requirements(
         self,
@@ -707,21 +770,11 @@ class MoltsPayServer:
             
             def _handle_get_services(self):
                 """GET /services - List available services."""
-                all_services = []
-                for manifest in server.manifests:
-                    for svc in manifest.services:
-                        all_services.append({
-                            "id": svc.id,
-                            "name": svc.name,
-                            "description": svc.description,
-                            "price": svc.price,
-                            "currency": svc.currency,
-                            "acceptedCurrencies": svc.accepted_currencies,
-                            "input": {k: v.model_dump() for k, v in svc.input.items()},
-                            "output": svc.output,
-                            "available": svc.id in server.skills,
-                            "paymentRails": ({"alipay": {"available": True, "interactive": True, "protocol": "a402", "currency": "CNY", "amount": normalize_cny_amount(svc.alipay["price_cny"])}} if svc.alipay and server.alipay else {}),
-                        })
+                all_services = [
+                    server._service_discovery_entry(svc)
+                    for manifest in server.manifests
+                    for svc in manifest.services
+                ]
                 
                 self._send_json(200, {
                     "provider": {
@@ -740,19 +793,11 @@ class MoltsPayServer:
             
             def _handle_agent_services(self):
                 """GET /.well-known/agent-services.json - Standard discovery."""
-                all_services = []
-                for manifest in server.manifests:
-                    for svc in manifest.services:
-                        all_services.append({
-                            "id": svc.id,
-                            "name": svc.name,
-                            "description": svc.description,
-                            "price": svc.price,
-                            "currency": svc.currency,
-                            "acceptedCurrencies": svc.accepted_currencies,
-                            "available": svc.id in server.skills,
-                            "paymentRails": ({"alipay": {"available": True, "interactive": True, "protocol": "a402", "currency": "CNY", "amount": normalize_cny_amount(svc.alipay["price_cny"])}} if svc.alipay and server.alipay else {}),
-                        })
+                all_services = [
+                    server._service_discovery_entry(svc)
+                    for manifest in server.manifests
+                    for svc in manifest.services
+                ]
                 
                 self._send_json(200, {
                     "version": "1.0",

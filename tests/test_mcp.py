@@ -21,6 +21,16 @@ class FakeClient:
     def get_all_balances(self):
         return {"base": {"USDC": 1.0}}
 
+    def get_services(self, server_url):
+        self.calls.append(("services", server_url))
+        return {
+            "provider": {"name": "Test Provider"},
+            "services": [{
+                "id": "ping", "name": "Ping", "price": 0.01, "currency": "CNY",
+                "available": True, "payment_rails": {"alipay": {"available": True}},
+            }],
+        }
+
     def get_buyer_balance(self, server_url, buyer_id=None):
         self.calls.append(("balance", server_url, buyer_id))
         if "down" in server_url:
@@ -141,6 +151,19 @@ def test_status_preserves_partial_result_when_provider_is_down():
     assert result["data"]["warnings"][0]["code"] == "fiat_balance_unavailable"
 
 
+def test_services_delegates_to_public_discovery_without_payment_side_effects():
+    client = FakeClient()
+
+    result = MoltsPayMCP(client).services("https://provider.test", requestId="services-1")
+
+    assert result["ok"] is True
+    assert result["requestId"] == "services-1"
+    assert result["data"]["provider"]["name"] == "Test Provider"
+    assert result["data"]["services"][0]["id"] == "ping"
+    assert result["data"]["services"][0]["paymentRails"]["alipay"]["available"] is True
+    assert client.calls == [("services", "https://provider.test")]
+
+
 def test_dry_run_is_side_effect_free_and_does_not_require_confirmation(monkeypatch):
     monkeypatch.setenv("MOLTSPAY_MCP_REQUIRE_CONFIRM", "1")
     client = FakeClient()
@@ -185,11 +208,14 @@ def test_fastmcp_registration_exposes_constrained_tools():
     tools = asyncio.run(server.list_tools())
     by_name = {tool.name: tool for tool in tools}
 
+    assert "moltspay_services" in by_name
     assert "moltspay_wechat_start" in by_name
     assert "moltspay_alipay_session_status" in by_name
     assert "moltspay_alipay_session_list" in by_name
     assert "moltspay_alipay_order_status" in by_name
     assert "moltspay_alipay_order_list" in by_name
+    services_schema = by_name["moltspay_services"].inputSchema
+    assert services_schema["required"] == ["serverUrl"]
     schema = by_name["moltspay_balance_transactions"].inputSchema
     assert schema["properties"]["limit"]["maximum"] == 100
     assert schema["properties"]["offset"]["minimum"] == 0

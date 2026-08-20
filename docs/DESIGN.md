@@ -261,11 +261,11 @@ QR tool is not required for WeChat payment. Balance top-up still returns its
 `codeUrl` for the host/UI to render. The CLI may render a terminal QR code. The
 MCP adapter does not return private keys, signatures, or payment credentials.
 
-The implemented tool groups are wallet/status, balance, WeChat Native,
-unified payment, and configuration. A tool must not be documented as
-implemented unless it is registered by `mcp/server.py`; in particular,
-`moltspay_services` requires an explicit implementation before it can be part
-of the supported MCP contract.
+The implemented tool groups are wallet/status, read-only provider service
+discovery, balance, WeChat Native, unified payment, and configuration. A tool
+must not be documented as implemented unless it is registered by
+`mcp/server.py`. `moltspay_services` delegates to `MoltsPay.get_services()` and
+must not create an order or initiate payment while discovering services.
 
 ## 14. Reliability and verification
 

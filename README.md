@@ -325,7 +325,7 @@ pip install "moltspay[mcp]" pillow
 moltspay-mcp
 ```
 
-Pillow is required for the MCP server's PNG QR image output. The MCP adapter exposes namespaced tools such as `moltspay_status`, `moltspay_pay`, balance top-up tools, and recoverable WeChat session tools. Tool results use a stable envelope with `ok`, `data` or `error`, `requestId`, and `retried`.
+Pillow is required for the MCP server's PNG QR image output. The MCP adapter exposes namespaced tools such as `moltspay_status`, the read-only `moltspay_services` provider discovery tool, `moltspay_pay`, balance top-up tools, and recoverable WeChat session tools. Tool results use a stable envelope with `ok`, `data` or `error`, `requestId`, and `retried`.
 
 Require explicit confirmation for money-moving or fulfillment tools:
 

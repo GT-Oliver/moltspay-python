@@ -31,6 +31,7 @@ MCP 只能通过 `MoltsPay` 公共方法调用业务逻辑，不得直接访问 
 | Tool | 输入 | 输出重点 | 实际调用 | 链路 |
 |---|---|---|---|---|
 | `moltspay_status` | `serverUrl?`, `buyerId?` | 钱包地址、链上余额、限额、可选法币余额 | `get_all_balances()`、`get_config()`、`get_buyer_balance()` | 本地钱包/RPC + Provider 余额 |
+| `moltspay_services` | `serverUrl` | Provider 元数据、服务、价格、参数、可用状态、支付轨道 | `get_services()` | Provider 服务发现 API，只读 |
 | `moltspay_balance_query` | `serverUrl`, `buyerId?` | `BuyerBalance` | `get_buyer_balance()` | Provider 余额 API |
 | `moltspay_balance_transactions` | `serverUrl`, `buyerId?`, `limit`, `offset` | 交易列表及分页 | `list_balance_transactions()` | Provider 账本 API |
 | `moltspay_balance_set_buyer` | `buyerId` | buyer 配置 | `update_config(buyer_id=...)` | 本地配置持久化 |
@@ -488,4 +489,4 @@ moltspay_wechat_start
 - 增加每个 tool 到 `MoltsPay` public method 的 mock 映射测试。
 - 对微信商户证书、平台公钥、Native 扫码、支付确认和 Provider `/execute` 做真实环境测试。
 - 明确未知网络结果必须返回 `retryable=true` 或 `status="unknown"`，调用方应查询状态，不能盲目重复扣款。
-- 当前代码若未注册 `moltspay_services`，文档不得将其描述为已实现；服务发现应新增独立 tool 后再纳入契约。
+- `moltspay_services` 必须保持只读，并复用 `MoltsPay.get_services()`；不得为发现服务而创建订单或触发支付。
