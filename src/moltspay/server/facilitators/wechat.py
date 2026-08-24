@@ -33,6 +33,15 @@ def generate_out_trade_no() -> str:
     return "WX" + secrets.token_hex(15)
 
 
+def _load_wechat_platform_public_key(platform_public_key_pem: str):
+    try:
+        from cryptography.hazmat.primitives import serialization
+
+        return serialization.load_pem_public_key(platform_public_key_pem.encode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("WeChat platform public key is invalid") from exc
+
+
 def verify_wechat_response_signature(
     timestamp: str,
     nonce: str,
@@ -42,13 +51,13 @@ def verify_wechat_response_signature(
 ) -> bool:
     """Verify a WeChat Pay v3 API response signature."""
     try:
-        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
 
-        key = serialization.load_pem_public_key(platform_public_key_pem.encode())
+        key = _load_wechat_platform_public_key(platform_public_key_pem)
         message = f"{timestamp}\n{nonce}\n{body}\n".encode("utf-8")
         key.verify(
-            base64.b64decode(signature),
+            base64.b64decode(signature, validate=True),
             message,
             padding.PKCS1v15(),
             hashes.SHA256(),
@@ -68,6 +77,8 @@ class WechatFacilitator(BaseFacilitator):
             Path(platform_key_path).read_text(encoding="utf-8")
             if platform_key_path else ""
         )
+        if self.platform_public_key_pem:
+            _load_wechat_platform_public_key(self.platform_public_key_pem)
         self.api_base = self.config.get("api_base", "https://api.mch.weixin.qq.com").rstrip("/")
 
     @property
@@ -109,6 +120,9 @@ class WechatFacilitator(BaseFacilitator):
             timeout=30.0,
         )
         raw_response = response.text
+        # Response verification remains opt-in for compatibility with local
+        # test gateways. Production providers should configure the WeChat
+        # platform public key so every non-empty API response is authenticated.
         if self.platform_public_key_pem and raw_response:
             timestamp = response.headers.get("Wechatpay-Timestamp")
             nonce = response.headers.get("Wechatpay-Nonce")
@@ -150,7 +164,10 @@ class WechatFacilitator(BaseFacilitator):
             "scheme": WECHAT_SCHEME, "network": WECHAT_NETWORK, "asset": "CNY",
             "amount": price_cny, "payTo": self.config["mchid"],
             "maxTimeoutSeconds": expires_seconds,
-            "extra": {"code_url": code_url, "out_trade_no": trade_no},
+            "extra": {
+                "code_url": code_url, "out_trade_no": trade_no,
+                "expires_at": expire.isoformat().replace("+00:00", "Z"),
+            },
         }
 
     @staticmethod
@@ -178,8 +195,17 @@ class WechatFacilitator(BaseFacilitator):
             state = result.get("trade_state")
             if state != "SUCCESS":
                 return VerifyResult(valid=False, error=f"wechat trade_state {state or 'UNKNOWN'}", details=result)
+            if str(result.get("out_trade_no") or "") != trade_no:
+                return VerifyResult(valid=False, error="wechat out_trade_no mismatch", details=result)
+            if str(result.get("appid") or "") != str(self.config.get("appid") or ""):
+                return VerifyResult(valid=False, error="wechat appid mismatch", details=result)
+            if str(result.get("mchid") or "") != str(self.config.get("mchid") or ""):
+                return VerifyResult(valid=False, error="wechat mchid mismatch", details=result)
             expected = cny_to_fen(str(requirements["amount"]))
-            paid = int((result.get("amount") or {}).get("payer_total", (result.get("amount") or {}).get("total", 0)))
+            amount = result.get("amount") or {}
+            if str(amount.get("currency") or "CNY") != "CNY":
+                return VerifyResult(valid=False, error="wechat currency mismatch", details=result)
+            paid = int(amount.get("payer_total", amount.get("total", 0)))
             if paid < expected:
                 return VerifyResult(valid=False, error=f"wechat amount {paid} fen below expected {expected}", details=result)
             return VerifyResult(valid=True, details=result)

@@ -30,7 +30,7 @@ class MoltsPayInput(BaseModel):
     """Input schema for MoltsPay tool."""
     
     provider_url: str = Field(
-        description="Provider URL (e.g., 'https://juai8.com/zen7')"
+        description="Provider HTTP or HTTPS URL (e.g., 'https://juai8.com/zen7')"
     )
     service_id: str = Field(
         description="Service ID to call (e.g., 'text-to-video', 'image-to-video')"
@@ -76,7 +76,7 @@ class MoltsPayTool(BaseTool):
 - Call any paid AI service that accepts MoltsPay
 
 Input should include:
-- provider_url: The service provider URL (e.g., 'https://juai8.com/zen7')
+- provider_url: The service provider HTTP or HTTPS URL (e.g., 'https://juai8.com/zen7')
 - service_id: The service to call (e.g., 'text-to-video')
 - prompt: Description or instructions for the service
 
@@ -134,7 +134,7 @@ class MoltsPayDiscoverTool(BaseTool):
     description: str = """Discover available services from a MoltsPay provider.
 Use this to see what services are available and their prices before paying.
 
-Input: provider_url (e.g., 'https://juai8.com/zen7')
+Input: provider_url (e.g., 'https://juai8.com/zen7' or 'http://localhost:8402')
 
 Returns a list of available services with names, descriptions, and prices."""
     

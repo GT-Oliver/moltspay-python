@@ -4,7 +4,7 @@ import base64
 import json
 import os
 import time
-from typing import Any, Optional, List, Callable
+from typing import Any, Optional, List, Callable, Iterable
 from dataclasses import dataclass
 
 import httpx
@@ -13,6 +13,12 @@ from eth_account.messages import encode_typed_data
 
 from .models import Service, ServicesResponse, ProviderInfo
 from .exceptions import PaymentError
+from .provider_origin import (
+    ProviderAsyncHTTPTransport,
+    ProviderHTTPTransport,
+    ProviderOrigin,
+    ProviderURLPolicyError,
+)
 
 
 @dataclass
@@ -367,10 +373,33 @@ def build_payment_payload(
 class X402Client:
     """Low-level x402 protocol client."""
     
-    def __init__(self, timeout: float = None):
+    def __init__(self, timeout: float = None, resolver: Optional[Callable[[str, int], Iterable[str]]] = None):
         """Initialize X402 client. timeout=None means no timeout (like Node.js fetch)."""
         self.timeout = timeout
-        self._client = httpx.Client(timeout=timeout)
+        self._resolver = resolver
+        self._client = httpx.Client(
+            timeout=timeout,
+            transport=ProviderHTTPTransport(),
+            follow_redirects=False,
+            trust_env=False,
+        )
+
+    def provider_origin(self, base_url: str) -> ProviderOrigin:
+        """Create a validated origin for a provider base URL."""
+        return ProviderOrigin.from_url(base_url, resolver=self._resolver)
+
+    @property
+    def http_client(self) -> httpx.Client:
+        """Return the policy-configured client for provider-bound integrations."""
+        return self._client
+
+    def request(self, method: str, url: str, *, origin: Optional[ProviderOrigin] = None, **kwargs: Any) -> httpx.Response:
+        """Make one policy-checked provider request without automatic redirects."""
+        checked_origin = origin or self.provider_origin(url)
+        checked_origin.validate_request_url(url, resolve=True)
+        response = getattr(self._client, method.lower())(url, **kwargs)
+        checked_origin.validate_response(url, response)
+        return response
     
     def close(self):
         """Close the HTTP client."""
@@ -382,16 +411,18 @@ class X402Client:
     def __exit__(self, *args):
         self.close()
     
-    def discover_services(self, base_url: str) -> List[Service]:
+    def discover_services(self, base_url: str, *, origin: Optional[ProviderOrigin] = None) -> List[Service]:
         """Discover available services from a provider."""
-        return self.get_services(base_url).services
+        return self.get_services(base_url, origin=origin).services
 
-    def get_services(self, base_url: str) -> ServicesResponse:
+    def get_services(self, base_url: str, *, origin: Optional[ProviderOrigin] = None) -> ServicesResponse:
         """Try all discovery endpoints supported by the Node client."""
+        checked_origin = origin or self.provider_origin(base_url)
         normalized = base_url.rstrip("/")
         for suffix in ("/.well-known/agent-services.json", "/services", "/api/services", "/registry/services"):
             try:
-                response = self._client.get(normalized + suffix)
+                request_url = normalized + suffix
+                response = self.request("GET", request_url, origin=checked_origin)
                 if response.status_code >= 400:
                     continue
                 data = response.json()
@@ -400,6 +431,8 @@ class X402Client:
                 provider_data = data.get("provider") if isinstance(data, dict) else None
                 provider = ProviderInfo(**provider_data) if provider_data else None
                 return ServicesResponse(provider=provider, services=services)
+            except ProviderURLPolicyError:
+                raise
             except (httpx.HTTPError, ValueError, TypeError):
                 continue
         raise PaymentError(f"Failed to discover services at {base_url}")
@@ -411,6 +444,7 @@ class X402Client:
         params: dict,
         payment_header: Optional[str] = None,
         chain: str = None,
+        origin: Optional[ProviderOrigin] = None,
     ) -> httpx.Response:
         """Call a service endpoint."""
         url = f"{base_url.rstrip('/')}/execute"
@@ -422,7 +456,7 @@ class X402Client:
         if payment_header:
             headers["X-PAYMENT"] = payment_header
         
-        return self._client.post(url, json=body, headers=headers)
+        return self.request("POST", url, origin=origin, json=body, headers=headers)
     
     def pay_and_call(
         self,
@@ -432,6 +466,7 @@ class X402Client:
         account: Account,
         token: str = "USDC",
         chain: str = None,
+        origin: Optional[ProviderOrigin] = None,
     ) -> PaymentResponse:
         """
         Full payment flow: call, get 402, detect protocol, sign payment, retry.
@@ -453,7 +488,8 @@ class X402Client:
             PaymentResponse with result and transaction info
         """
         # First call - expect 402 (pass chain to get correct payment requirements)
-        response = self.call_service(base_url, service_id, params, chain=chain)
+        checked_origin = origin or self.provider_origin(base_url)
+        response = self.call_service(base_url, service_id, params, chain=chain, origin=checked_origin)
         
         # If not 402, return directly (free service or already paid)
         if response.status_code != 402:
@@ -590,7 +626,9 @@ class X402Client:
         payment_header = build_payment_payload(account, payment_req, token=token, chain=chain)
         
         # Retry with payment
-        response = self.call_service(base_url, service_id, params, payment_header, chain=chain)
+        response = self.call_service(
+            base_url, service_id, params, payment_header, chain=chain, origin=checked_origin,
+        )
         
         if response.status_code >= 400:
             raise PaymentError(f"Payment failed: {response.status_code} {response.text}")
@@ -601,10 +639,26 @@ class X402Client:
 class AsyncX402Client:
     """Async version of x402 protocol client."""
     
-    def __init__(self, timeout: float = None):
+    def __init__(self, timeout: float = None, resolver: Optional[Callable[[str, int], Iterable[str]]] = None):
         """Initialize async X402 client. timeout=None means no timeout (like Node.js fetch)."""
         self.timeout = timeout
-        self._client = httpx.AsyncClient(timeout=timeout)
+        self._resolver = resolver
+        self._client = httpx.AsyncClient(
+            timeout=timeout,
+            transport=ProviderAsyncHTTPTransport(),
+            follow_redirects=False,
+            trust_env=False,
+        )
+
+    def provider_origin(self, base_url: str) -> ProviderOrigin:
+        return ProviderOrigin.from_url(base_url, resolver=self._resolver)
+
+    async def request(self, method: str, url: str, *, origin: Optional[ProviderOrigin] = None, **kwargs: Any) -> httpx.Response:
+        checked_origin = origin or self.provider_origin(url)
+        checked_origin.validate_request_url(url, resolve=True)
+        response = await getattr(self._client, method.lower())(url, **kwargs)
+        checked_origin.validate_response(url, response)
+        return response
     
     async def close(self):
         """Close the HTTP client."""
@@ -616,12 +670,12 @@ class AsyncX402Client:
     async def __aexit__(self, *args):
         await self.close()
     
-    async def discover_services(self, base_url: str) -> List[Service]:
+    async def discover_services(self, base_url: str, *, origin: Optional[ProviderOrigin] = None) -> List[Service]:
         """Discover available services from a provider."""
+        checked_origin = origin or self.provider_origin(base_url)
         url = f"{base_url.rstrip('/')}/.well-known/agent-services.json"
-        
         try:
-            response = await self._client.get(url)
+            response = await self.request("GET", url, origin=checked_origin)
             response.raise_for_status()
             data = response.json()
             
@@ -653,6 +707,7 @@ class AsyncX402Client:
         params: dict,
         payment_header: Optional[str] = None,
         chain: str = None,
+        origin: Optional[ProviderOrigin] = None,
     ) -> httpx.Response:
         """Call a service endpoint."""
         url = f"{base_url.rstrip('/')}/execute"
@@ -664,7 +719,7 @@ class AsyncX402Client:
         if payment_header:
             headers["X-PAYMENT"] = payment_header
         
-        return await self._client.post(url, json=body, headers=headers)
+        return await self.request("POST", url, origin=origin, json=body, headers=headers)
     
     async def pay_and_call(
         self,
@@ -674,9 +729,13 @@ class AsyncX402Client:
         account: Account,
         token: str = "USDC",
         chain: str = None,
+        origin: Optional[ProviderOrigin] = None,
     ) -> PaymentResponse:
         """Full x402 flow (async version)."""
-        response = await self.call_service(base_url, service_id, params, chain=chain)
+        checked_origin = origin or self.provider_origin(base_url)
+        response = await self.call_service(
+            base_url, service_id, params, chain=chain, origin=checked_origin,
+        )
         
         if response.status_code != 402:
             if response.status_code >= 400:
@@ -686,7 +745,9 @@ class AsyncX402Client:
         payment_req = parse_402_response(response)
         payment_header = build_payment_payload(account, payment_req, token=token, chain=chain)
         
-        response = await self.call_service(base_url, service_id, params, payment_header, chain=chain)
+        response = await self.call_service(
+            base_url, service_id, params, payment_header, chain=chain, origin=checked_origin,
+        )
         
         if response.status_code >= 400:
             raise PaymentError(f"Payment failed: {response.status_code} {response.text}")

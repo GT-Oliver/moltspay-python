@@ -96,16 +96,81 @@ def verify_alipay_response_signature(signed_content: str, signature: str, platfo
         return False
 
 
+def _parse_top_level_response(raw: str):
+    """Parse top-level JSON members while retaining each value's raw span."""
+    decoder = json.JSONDecoder()
+    members = []
+    position = 0
+
+    def skip_whitespace(index: int) -> int:
+        while index < len(raw) and raw[index] in " \t\r\n":
+            index += 1
+        return index
+
+    position = skip_whitespace(position)
+    if position >= len(raw) or raw[position] != "{":
+        raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is malformed")
+    position = skip_whitespace(position + 1)
+    if position < len(raw) and raw[position] == "}":
+        if skip_whitespace(position + 1) != len(raw):
+            raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is malformed")
+        return members
+
+    while True:
+        try:
+            key, key_end = decoder.raw_decode(raw, position)
+        except json.JSONDecodeError as exc:
+            raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is malformed") from exc
+        if not isinstance(key, str):
+            raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is malformed")
+        position = skip_whitespace(key_end)
+        if position >= len(raw) or raw[position] != ":":
+            raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is malformed")
+        value_start = skip_whitespace(position + 1)
+        try:
+            value, value_end = decoder.raw_decode(raw, value_start)
+        except json.JSONDecodeError as exc:
+            raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is malformed") from exc
+        members.append((key, value, value_start, value_end))
+        position = skip_whitespace(value_end)
+        if position >= len(raw):
+            raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is malformed")
+        if raw[position] == "}":
+            position = skip_whitespace(position + 1)
+            if position != len(raw):
+                raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is malformed")
+            return members
+        if raw[position] != ",":
+            raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is malformed")
+        position = skip_whitespace(position + 1)
+
+
+def _signed_response_parts(raw: str, response_key: str):
+    members = _parse_top_level_response(raw)
+    response_members = [member for member in members if member[0] == response_key]
+    sign_members = [member for member in members if member[0] == "sign"]
+    if len(response_members) != 1:
+        message = "missing" if not response_members else "duplicate"
+        raise AlipayResponseSignatureInvalid(f"Alipay response signature wrapper is {message}")
+    if len(sign_members) != 1:
+        message = "missing" if not sign_members else "duplicate"
+        raise AlipayResponseSignatureInvalid(f"Alipay OpenAPI response sign field is {message}")
+    _, response_obj, start, end = response_members[0]
+    signature = sign_members[0][1]
+    if not isinstance(response_obj, dict) or not signature:
+        raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is missing signed fields")
+    return raw[start:end], response_obj, signature
+
+
 def _extract_signed_response_content(raw: str, response_key: str) -> str:
-    match = re.search(r'"' + re.escape(response_key) + r'"\s*:\s*', raw)
-    if not match:
-        raise AlipayResponseSignatureInvalid("Alipay response signature wrapper is missing")
-    start = match.end()
-    try:
-        _, length = json.JSONDecoder().raw_decode(raw[start:])
-    except json.JSONDecodeError as exc:
-        raise AlipayResponseSignatureInvalid("Alipay response wrapper is malformed") from exc
-    return raw[start:start + length]
+    """Return the exact JSON bytes represented by the unique response wrapper."""
+    members = _parse_top_level_response(raw)
+    response_members = [member for member in members if member[0] == response_key]
+    if len(response_members) != 1:
+        message = "missing" if not response_members else "duplicate"
+        raise AlipayResponseSignatureInvalid(f"Alipay response signature wrapper is {message}")
+    _, _, start, end = response_members[0]
+    return raw[start:end]
 
 
 class AlipayFacilitator(BaseFacilitator):
@@ -250,16 +315,13 @@ class AlipayFacilitator(BaseFacilitator):
             raw = response.text
             if not response.is_success:
                 raise AlipayVerifyUnavailable("Alipay OpenAPI request failed")
-            data = json.loads(raw)
         except AlipayVerifyUnavailable:
             raise
-        except (httpx.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        except (httpx.HTTPError, TimeoutError, OSError) as exc:
             raise AlipayVerifyUnavailable("Alipay OpenAPI response is unavailable") from exc
         wrapper = f"{method.replace('.', '_')}_response"
-        response_obj = data.get(wrapper) if isinstance(data, dict) else None
-        if not isinstance(response_obj, dict) or not data.get("sign"):
-            raise AlipayResponseSignatureInvalid("Alipay OpenAPI response is missing signed fields")
-        if not verify_alipay_response_signature(_extract_signed_response_content(raw, wrapper), str(data["sign"]), self.platform_public_key_pem):
+        signed_content, response_obj, signature = _signed_response_parts(raw, wrapper)
+        if not verify_alipay_response_signature(signed_content, str(signature), self.platform_public_key_pem):
             raise AlipayResponseSignatureInvalid("Alipay OpenAPI response signature is invalid")
         return response_obj
 

@@ -7,6 +7,15 @@ from moltspay.exceptions import InsufficientBalance, UnsupportedRail
 from moltspay.models import PaymentResult, Service
 
 
+@pytest.fixture(autouse=True)
+def mock_provider_dns(monkeypatch):
+    """Keep balance-flow tests off real DNS while exercising the URL policy."""
+    monkeypatch.setattr(
+        "moltspay.provider_origin._default_resolver",
+        lambda host, port: ["93.184.216.34"],
+    )
+
+
 class FakeBalanceClient:
     def __init__(self):
         self.buyer_id = "buyer-1"

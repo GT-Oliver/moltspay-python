@@ -45,7 +45,7 @@ def test_service_discovery_describes_configured_rails_and_supported_chains(tmp_p
         output={"result": "pong"},
         balance={"price": "0.01"},
         wechat={"price_cny": "0.1", "description": "Ping"},
-        alipay={"price_cny": "0.2"},
+        alipay={"price_cny": "0.2", "service_id": "API_PING", "pay_timeout_seconds": 600},
     )
 
     entry = server._service_discovery_entry(service)
@@ -65,6 +65,8 @@ def test_service_discovery_describes_configured_rails_and_supported_chains(tmp_p
         "alipay": {
             "available": True, "interactive": True, "protocol": "a402",
             "currency": "CNY", "amount": "0.20",
+            "serviceId": "API_PING", "resourceId": "/execute?service=ping",
+            "maxTimeoutSeconds": 600,
         },
     }
 

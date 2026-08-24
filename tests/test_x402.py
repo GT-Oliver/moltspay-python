@@ -11,6 +11,15 @@ from moltspay.models import Service
 from moltspay.exceptions import PaymentError
 
 
+@pytest.fixture(autouse=True)
+def mock_provider_dns(monkeypatch):
+    """Keep protocol tests entirely off real DNS/network."""
+    monkeypatch.setattr(
+        "moltspay.provider_origin._default_resolver",
+        lambda host, port: ["93.184.216.34"],
+    )
+
+
 class TestParse402Response:
     """Test 402 response parsing."""
     

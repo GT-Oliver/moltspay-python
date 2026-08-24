@@ -77,6 +77,29 @@ def test_call_verifies_raw_response_before_parsing(monkeypatch):
     assert facilitator._call("GET", "/test") == {"trade_state": "SUCCESS"}
 
 
+def test_call_allows_non_empty_response_without_platform_public_key(monkeypatch):
+    private_key, private_pem, _ = _keys()
+    body = json.dumps({"trade_state": "SUCCESS"}, separators=(",", ":"))
+    response = httpx.Response(
+        200,
+        content=body.encode(),
+        headers={
+            "Wechatpay-Timestamp": "100",
+            "Wechatpay-Nonce": "nonce",
+            "Wechatpay-Signature": _response_signature(private_key, "100", "nonce", body),
+        },
+        request=httpx.Request("GET", "https://api.mch.weixin.qq.com/test"),
+    )
+    monkeypatch.setattr("moltspay.server.facilitators.wechat.httpx.request", lambda *a, **k: response)
+    facilitator = WechatFacilitator({
+        "mchid": "mchid",
+        "serial_no": "serial",
+        "private_key_pem": private_pem,
+    })
+
+    assert facilitator._call("GET", "/test") == {"trade_state": "SUCCESS"}
+
+
 def test_call_rejects_missing_response_signature_headers(monkeypatch):
     _, private_pem, public_pem = _keys()
     response = httpx.Response(
@@ -96,6 +119,56 @@ def test_call_rejects_missing_response_signature_headers(monkeypatch):
         facilitator._call("GET", "/test")
 
 
+def test_call_rejects_invalid_response_signature(monkeypatch):
+    _, private_pem, public_pem = _keys()
+    body = json.dumps({"trade_state": "SUCCESS"}, separators=(",", ":"))
+    response = httpx.Response(
+        200,
+        content=body.encode(),
+        headers={
+            "Wechatpay-Timestamp": "100",
+            "Wechatpay-Nonce": "nonce",
+            "Wechatpay-Signature": base64.b64encode(b"invalid signature").decode(),
+        },
+        request=httpx.Request("GET", "https://api.mch.weixin.qq.com/test"),
+    )
+    monkeypatch.setattr("moltspay.server.facilitators.wechat.httpx.request", lambda *a, **k: response)
+    facilitator = WechatFacilitator({
+        "mchid": "mchid",
+        "serial_no": "serial",
+        "private_key_pem": private_pem,
+        "platform_public_key_pem": public_pem,
+    })
+
+    with pytest.raises(RuntimeError, match="signature verification failed"):
+        facilitator._call("GET", "/test")
+
+
+def test_call_rejects_tampered_response_body(monkeypatch):
+    private_key, private_pem, public_pem = _keys()
+    original_body = json.dumps({"trade_state": "SUCCESS"}, separators=(",", ":"))
+    response = httpx.Response(
+        200,
+        content=json.dumps({"trade_state": "REFUND"}, separators=(",", ":")).encode(),
+        headers={
+            "Wechatpay-Timestamp": "100",
+            "Wechatpay-Nonce": "nonce",
+            "Wechatpay-Signature": _response_signature(private_key, "100", "nonce", original_body),
+        },
+        request=httpx.Request("GET", "https://api.mch.weixin.qq.com/test"),
+    )
+    monkeypatch.setattr("moltspay.server.facilitators.wechat.httpx.request", lambda *a, **k: response)
+    facilitator = WechatFacilitator({
+        "mchid": "mchid",
+        "serial_no": "serial",
+        "private_key_pem": private_pem,
+        "platform_public_key_pem": public_pem,
+    })
+
+    with pytest.raises(RuntimeError, match="signature verification failed"):
+        facilitator._call("GET", "/test")
+
+
 def test_platform_public_key_path_is_loaded(tmp_path):
     _, private_pem, public_pem = _keys()
     key_path = tmp_path / "wechat-platform.pem"
@@ -109,3 +182,15 @@ def test_platform_public_key_path_is_loaded(tmp_path):
     })
 
     assert facilitator.platform_public_key_pem == public_pem
+
+
+def test_invalid_configured_platform_public_key_is_rejected_at_construction():
+    _, private_pem, _ = _keys()
+
+    with pytest.raises(RuntimeError, match="platform public key is invalid"):
+        WechatFacilitator({
+            "mchid": "mchid",
+            "serial_no": "serial",
+            "private_key_pem": private_pem,
+            "platform_public_key_pem": "not a PEM public key",
+        })

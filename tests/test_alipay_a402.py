@@ -3,13 +3,17 @@
 import asyncio
 import json
 import sqlite3
+from dataclasses import FrozenInstanceError
+from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from moltspay.alipay import (
     AlipayBuyerClient,
+    AlipayPaymentIntent,
     decode_a402_json,
     encode_a402_json,
     parse_alipay_cli_output,
@@ -18,13 +22,127 @@ from moltspay.client import MoltsPay
 from moltspay.exceptions import (
     AlipayRequestContextInvalid,
     AlipayRequestContextMissing,
+    AlipayProtocolError,
+    AlipayResponseSignatureInvalid,
     AlipayWalletNotReady,
 )
 from moltspay.server.alipay_store import AlipayOrderStore
 from moltspay.server.facilitators.alipay import AlipayFacilitator, normalize_cny_amount
 from moltspay.server.server import MoltsPayServer
 from moltspay.server.types import RegisteredSkill, ServiceConfig
-from moltspay.x402 import _service_from_dict
+from moltspay.provider_origin import ProviderOrigin
+from moltspay.x402 import X402Client, _service_from_dict
+
+
+@pytest.fixture(autouse=True)
+def mock_provider_dns(monkeypatch):
+    """Keep payment-flow tests off real DNS while exercising the URL policy."""
+    monkeypatch.setattr(
+        "moltspay.provider_origin._default_resolver",
+        lambda host, port: ["93.184.216.34"],
+    )
+
+
+def _future(seconds=300):
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+def _intent(
+    *, skill_id="svc", service_id="API_SVC", resource_id="/execute?service=svc",
+    amount="0.10", currency="CNY", max_expiry_seconds=600,
+):
+    return AlipayPaymentIntent(
+        provider_origin=ProviderOrigin.from_url("https://provider.test"),
+        skill_id=skill_id,
+        service_id=service_id,
+        resource_id=resource_id,
+        amount=amount,
+        currency=currency,
+        max_expiry_seconds=max_expiry_seconds,
+    )
+
+
+def _needed(
+    out_trade_no, *, service_id="API_SVC", resource_id="/execute?service=svc",
+    amount="0.10", currency="CNY", pay_before=None,
+):
+    return encode_a402_json({"protocol": {
+        "amount": amount,
+        "currency": currency,
+        "out_trade_no": out_trade_no,
+        "service_id": service_id,
+        "resource_id": resource_id,
+        "pay_before": pay_before or _future(),
+    }})
+
+
+def test_alipay_payment_intent_is_immutable():
+    intent = _intent()
+
+    with pytest.raises(FrozenInstanceError):
+        intent.amount = "999.00"
+
+
+def test_low_level_alipay_start_requires_an_intent(tmp_path):
+    client = AlipayBuyerClient(config_dir=str(tmp_path), runner=lambda _: [])
+
+    with pytest.raises(TypeError, match="intent"):
+        client.start_402(
+            "https://provider.test/execute", _needed("MPA-NO-INTENT"),
+            business_session_id="business-no-intent",
+        )
+
+
+@pytest.mark.parametrize(
+    ("changes", "error_text"),
+    [
+        ({"service_id": "API_OTHER"}, "service_id"),
+        ({"resource_id": "/execute?service=other"}, "resource_id"),
+        ({"out_trade_no": "bad/order"}, "merchant order"),
+        ({"pay_before": "2000-01-01T00:00:00+00:00"}, "expired"),
+        ({"pay_before": "2099-01-01T00:00:00"}, "timezone"),
+        ({"pay_before": "far-future"}, "expiry"),
+    ],
+)
+def test_alipay_intent_rejects_substituted_or_expired_bill_before_cli(
+    tmp_path, changes, error_text,
+):
+    calls = []
+    protocol = {
+        "amount": "0.10", "currency": "CNY", "out_trade_no": "MPA-BOUND",
+        "service_id": "API_SVC", "resource_id": "/execute?service=svc",
+        "pay_before": _future(),
+    }
+    protocol.update(changes)
+    if changes.get("pay_before") == "far-future":
+        protocol["pay_before"] = _future(700)
+    client = AlipayBuyerClient(
+        config_dir=str(tmp_path), runner=lambda args: calls.append(args) or [],
+    )
+
+    with pytest.raises(AlipayProtocolError, match=error_text):
+        client.start_402(
+            "https://provider.test/execute",
+            encode_a402_json({"protocol": protocol}),
+            intent=_intent(), business_session_id="business-bound",
+        )
+
+    assert calls == []
+
+
+def test_alipay_intent_rejects_cross_origin_resource_before_cli(tmp_path):
+    calls = []
+    client = AlipayBuyerClient(
+        config_dir=str(tmp_path), runner=lambda args: calls.append(args) or [],
+    )
+
+    with pytest.raises(AlipayProtocolError, match="authorized provider"):
+        client.start_402(
+            "https://attacker.test/execute", _needed("MPA-ORIGIN"),
+            intent=_intent(), business_session_id="business-origin",
+        )
+
+    assert calls == []
 
 
 def _keys():
@@ -243,6 +361,66 @@ def test_cny_and_payment_needed_are_canonical():
     assert decoded["protocol"]["amount"] == "0.10"
     assert decoded["protocol"]["service_id"] == "svc"
     assert decoded["protocol"]["seller_sign_type"] == "RSA2"
+
+
+def _alipay_gateway_facilitator(response_holder):
+    private, public = _keys()
+
+    def request(method, url, **kwargs):
+        return httpx.Response(
+            200, text=response_holder["raw"], request=httpx.Request(method, url),
+        )
+
+    return AlipayFacilitator({
+        "app_id": "app", "seller_id": "seller", "seller_name": "Provider",
+        "private_key_pem": private, "alipay_public_key_pem": public,
+        "allow_insecure_gateway": True,
+    }, request=request)
+
+
+def test_alipay_gateway_rejects_duplicate_response_wrapper_before_business_use():
+    response_holder = {}
+    facilitator = _alipay_gateway_facilitator(response_holder)
+    wrapper = "alipay_aipay_agent_payment_verify_response"
+    signed_content = '{"code":"10000","active":true}'
+    response_holder["raw"] = (
+        f'{{"{wrapper}":{signed_content},'
+        f'"{wrapper}":{{"code":"90000","active":false}},'
+        f'"sign":"{facilitator._sign(signed_content)}"}}'
+    )
+
+    with pytest.raises(AlipayResponseSignatureInvalid):
+        facilitator._call("alipay.aipay.agent.payment.verify", {})
+
+
+def test_alipay_gateway_accepts_one_signed_response_wrapper():
+    response_holder = {}
+    facilitator = _alipay_gateway_facilitator(response_holder)
+    wrapper = "alipay_aipay_agent_payment_verify_response"
+    signed_content = '{"code":"10000","active":true}'
+    response_holder["raw"] = (
+        f'{{"{wrapper}":{signed_content},'
+        f'"sign":"{facilitator._sign(signed_content)}"}}'
+    )
+
+    assert facilitator._call("alipay.aipay.agent.payment.verify", {}) == {
+        "code": "10000", "active": True,
+    }
+
+
+def test_alipay_gateway_rejects_duplicate_sign_field():
+    response_holder = {}
+    facilitator = _alipay_gateway_facilitator(response_holder)
+    wrapper = "alipay_aipay_agent_payment_verify_response"
+    signed_content = '{"code":"10000","active":true}'
+    signature = facilitator._sign(signed_content)
+    response_holder["raw"] = (
+        f'{{"{wrapper}":{signed_content},'
+        f'"sign":"{signature}","sign":"{signature}"}}'
+    )
+
+    with pytest.raises(AlipayResponseSignatureInvalid):
+        facilitator._call("alipay.aipay.agent.payment.verify", {})
 
 
 def test_order_store_claim_and_replay_are_idempotent():
@@ -472,7 +650,7 @@ def test_buyer_session_persists_and_resumes_without_proof(tmp_path):
 
     client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
     session = client.start_402(
-        "https://provider.test/execute", encode_a402_json({"protocol": {"out_trade_no": "MPA1"}}),
+        "https://provider.test/execute", _needed("MPA1"), intent=_intent(),
         intent_summary="Buy svc", request_id="req-1", request_body=json.dumps({"service": "svc"}),
         business_session_id="d52e3b71-d00e-4a51-bc16-169cba465bc9",
     )
@@ -551,7 +729,7 @@ def test_paid_is_not_completed_until_resource_delivery_succeeds(tmp_path):
     client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
     started = client.start_402(
         "https://provider.test/execute",
-        encode_a402_json({"protocol": {"out_trade_no": "MPA1"}}),
+        _needed("MPA1"), intent=_intent(),
         request_id="req-paid", business_session_id="business-paid",
     )
 
@@ -587,7 +765,7 @@ def test_paid_resource_failure_stays_recoverable_as_fulfilling(tmp_path):
     client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
     started = client.start_402(
         "https://provider.test/execute",
-        encode_a402_json({"protocol": {"out_trade_no": "MPA1"}}),
+        _needed("MPA1"), intent=_intent(),
         request_id="req-fulfill", business_session_id="business-fulfill",
     )
     observed = client.resume(started.payment_session_id)
@@ -612,7 +790,7 @@ def test_clean_cli_result_clears_stale_replay_diagnostics(tmp_path):
     client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
     started = client.start_402(
         "https://provider.test/execute",
-        encode_a402_json({"protocol": {"out_trade_no": "MPA-CLEAN"}}),
+        _needed("MPA-CLEAN"), intent=_intent(),
         request_id="req-clean", business_session_id="business-clean",
     )
     client._update(
@@ -641,7 +819,7 @@ def test_provider_order_reconciliation_overrides_stale_local_replay(tmp_path):
     client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
     started = client.start_402(
         "https://provider.test/execute",
-        encode_a402_json({"protocol": {"out_trade_no": "MPA-RECONCILE"}}),
+        _needed("MPA-RECONCILE"), intent=_intent(),
         request_id="req-reconcile", business_session_id="business-reconcile",
     )
     stale = client._update(
@@ -683,11 +861,13 @@ def test_sdk_order_status_queries_provider_and_reconciles_local_session(tmp_path
     buyer = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
     started = buyer.start_402(
         "https://provider.test/execute",
-        encode_a402_json({"protocol": {"out_trade_no": "MPA-SDK"}}),
+        _needed("MPA-SDK"), intent=_intent(),
         request_id="req-sdk", business_session_id="business-sdk",
     )
     sdk = object.__new__(MoltsPay)
     sdk._timeout = 5
+    sdk._x402 = X402Client(timeout=5, resolver=lambda host, port: ["93.184.216.34"])
+    sdk._provider_origins = {}
     sdk._alipay_client = buyer
     calls = []
 
@@ -703,11 +883,11 @@ def test_sdk_order_status_queries_provider_and_reconciles_local_session(tmp_path
                 "fulfillment_status": "confirmed", "result": {"ok": True},
             }
 
-    def fake_get(url, **kwargs):
+    def fake_get(_client, url, **kwargs):
         calls.append((url, kwargs))
         return Response()
 
-    monkeypatch.setattr("moltspay.client.httpx.get", fake_get)
+    monkeypatch.setattr("httpx.Client.get", fake_get)
 
     order = sdk.get_alipay_order_status("https://provider.test", "MPA-SDK")
 
@@ -731,7 +911,7 @@ def test_local_session_status_and_list_are_read_only_and_filter_effective_expiry
     client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
     started = client.start_402(
         "https://provider.test/execute",
-        encode_a402_json({"protocol": {"out_trade_no": "MPA-READONLY"}}),
+        _needed("MPA-READONLY"), intent=_intent(),
         request_id="req-readonly", business_session_id="business-readonly", timeout=-1,
     )
     path = tmp_path / "alipay-sessions" / f"{started.payment_session_id}.json"
@@ -766,7 +946,7 @@ def test_resume_queries_provider_after_local_session_timeout(tmp_path):
     client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
     started = client.start_402(
         "https://provider.test/execute",
-        encode_a402_json({"protocol": {"out_trade_no": "MPA-LATE"}}),
+        _needed("MPA-LATE"), intent=_intent(),
         request_id="req-late", business_session_id="business-late", timeout=-1,
     )
     locally_expired = client.get_session(started.payment_session_id)
@@ -802,7 +982,7 @@ def test_provider_confirmed_expired_session_is_terminal(tmp_path):
     client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
     started = client.start_402(
         "https://provider.test/execute",
-        encode_a402_json({"protocol": {"out_trade_no": "MPA-EXPIRED"}}),
+        _needed("MPA-EXPIRED"), intent=_intent(),
         request_id="req-expired", business_session_id="business-expired",
     )
 
@@ -832,13 +1012,10 @@ def test_session_persists_bill_metadata_and_sanitized_diagnostics(tmp_path):
         return ['{"ok":true}']
 
     client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    pay_before = _future()
     started = client.start_402(
         "https://provider.test/execute",
-        encode_a402_json({"protocol": {
-            "amount": "0.10", "currency": "CNY", "out_trade_no": "MPA1",
-            "pay_before": "2026-08-18T12:00:00+00:00", "service_id": "API_SVC",
-            "resource_id": "/execute?service=svc",
-        }}),
+        _needed("MPA1", pay_before=pay_before), intent=_intent(),
         request_id="req-safe", business_session_id="business-safe",
         headers={
             "Content-Type": "application/json", "Authorization": "Bearer top-secret",
@@ -852,7 +1029,7 @@ def test_session_persists_bill_metadata_and_sanitized_diagnostics(tmp_path):
 
     assert observed.status == "processing"
     assert observed.out_trade_no == "MPA1"
-    assert observed.pay_before == "2026-08-18T12:00:00+00:00"
+    assert observed.pay_before == pay_before
     assert observed.service_id == "API_SVC"
     assert observed.resource_id == "/execute?service=svc"
     assert observed.provider_status == "PAYING"
@@ -877,12 +1054,17 @@ def test_legacy_unknown_session_recovers_bill_metadata_from_needed_file(tmp_path
         return ['{"ok":true}']
 
     client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    pay_before = _future()
     started = client.start_402(
         "https://provider.test/execute",
-        encode_a402_json({"protocol": {
-            "out_trade_no": "MPA-LEGACY", "pay_before": "2026-08-18T12:00:00+00:00",
-            "service_id": "API_LEGACY", "resource_id": "/execute?service=legacy",
-        }}),
+        _needed(
+            "MPA-LEGACY", service_id="API_LEGACY",
+            resource_id="/execute?service=legacy", pay_before=pay_before,
+        ),
+        intent=_intent(
+            skill_id="legacy", service_id="API_LEGACY",
+            resource_id="/execute?service=legacy",
+        ),
         request_id="req-legacy", business_session_id="business-legacy",
     )
     session_path = tmp_path / "alipay-sessions" / f"{started.payment_session_id}.json"
@@ -896,7 +1078,7 @@ def test_legacy_unknown_session_recovers_bill_metadata_from_needed_file(tmp_path
 
     assert recovered.status == "pending"
     assert recovered.out_trade_no == "MPA-LEGACY"
-    assert recovered.pay_before == "2026-08-18T12:00:00+00:00"
+    assert recovered.pay_before == pay_before
     assert recovered.service_id == "API_LEGACY"
     assert recovered.resource_id == "/execute?service=legacy"
 
@@ -999,7 +1181,7 @@ def test_missing_business_session_fails_before_provider_request(tmp_path, monkey
         called = True
         raise AssertionError("provider request must not run")
 
-    monkeypatch.setattr("moltspay.client.httpx.post", unexpected_post)
+    monkeypatch.setattr("httpx.Client.post", unexpected_post)
     client = MoltsPay(
         config_dir=str(tmp_path), wallet_path=str(tmp_path / "wallet.json"),
         solana_wallet_path=str(tmp_path / "wallet-solana.json"),
@@ -1011,12 +1193,69 @@ def test_missing_business_session_fails_before_provider_request(tmp_path, monkey
     assert called is False
 
 
+def test_direct_alipay_start_accepts_http_loopback_and_builds_intent_from_discovery(tmp_path, monkeypatch):
+    service = _service_from_dict({
+        "id": "pong", "name": "Pong", "price": 1.0, "currency": "USDC",
+        "paymentRails": {"alipay": {
+            "amount": "1.00", "currency": "CNY", "serviceId": "API_PONG",
+            "resourceId": "/execute?service=pong", "maxTimeoutSeconds": 600,
+        }},
+    })
+    challenge = _needed(
+        "MPA-DIRECT", amount="1.00", service_id="API_PONG",
+        resource_id="/execute?service=pong",
+    )
+    cli_calls = []
+
+    def runner(args):
+        cli_calls.append(list(args))
+        if args[0] == "402-buyer-pay":
+            return ['{"status":"TRADE_CREATED","outTradeNo":"MPA-DIRECT"}']
+        return ['{"ready":true,"opened":true,"bound":true}']
+
+    def fake_post(_client, url, **kwargs):
+        return httpx.Response(
+            402, headers={"Payment-Needed": challenge},
+            request=httpx.Request("POST", url),
+        )
+
+    client = MoltsPay(
+        config_dir=str(tmp_path), wallet_path=str(tmp_path / "wallet.json"),
+        solana_wallet_path=str(tmp_path / "wallet-solana.json"),
+    )
+    client.discover = lambda _: [service]
+    client._alipay_client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    monkeypatch.setattr("httpx.Client.post", fake_post)
+
+    session = client.start_alipay_payment(
+        "http://127.0.0.1:8402", "pong",
+        business_session_id="d52e3b71-d00e-4a51-bc16-169cba465bc9",
+    )
+
+    assert session.status == "pending"
+    assert session.resource_url == "http://127.0.0.1:8402/execute"
+    assert session.context["alipay_intent"] == {
+        "provider_origin": "http://127.0.0.1:8402",
+        "skill_id": "pong",
+        "service_id": "API_PONG",
+        "resource_id": "/execute?service=pong",
+        "amount": "1.00",
+        "currency": "CNY",
+        "max_expiry_seconds": 600,
+    }
+    buyer_call = next(call for call in cli_calls if call[0] == "402-buyer-pay")
+    assert buyer_call[buyer_call.index("--resource-url") + 1] == "http://127.0.0.1:8402/execute"
+
+
 def test_service_discovery_and_alipay_pay_use_cny_rail_quote(tmp_path):
     service = _service_from_dict({
         "id": "pong", "name": "Pong", "price": 1.0, "currency": "USDC",
-        "paymentRails": {"alipay": {"amount": "1.00", "currency": "CNY"}},
+        "paymentRails": {"alipay": {
+            "amount": "1.00", "currency": "CNY", "serviceId": "API_PONG",
+            "resourceId": "/execute?service=pong", "maxTimeoutSeconds": 600,
+        }},
     })
-    assert service.payment_rails["alipay"] == {"amount": "1.00", "currency": "CNY"}
+    assert service.payment_rails["alipay"]["serviceId"] == "API_PONG"
 
     client = MoltsPay(
         config_dir=str(tmp_path), wallet_path=str(tmp_path / "wallet.json"),
@@ -1036,8 +1275,106 @@ def test_service_discovery_and_alipay_pay_use_cny_rail_quote(tmp_path):
     )
 
     assert result == "paid"
-    assert observed == {
-        "amount": 1.0,
-        "currency": "CNY",
-        "options": {"business_session_id": "d52e3b71-d00e-4a51-bc16-169cba465bc9"},
-    }
+    assert observed["amount"] == 1.0
+    assert observed["currency"] == "CNY"
+    assert observed["options"]["business_session_id"] == "d52e3b71-d00e-4a51-bc16-169cba465bc9"
+    assert observed["options"]["origin"].base_url == "https://provider.test"
+    assert observed["options"]["intent"].service_id == "API_PONG"
+
+
+@pytest.mark.parametrize(
+    ("challenge_amount", "challenge_currency", "error_text"),
+    [
+        ("100.00", "CNY", "amount"),
+        ("1.00", "USD", "currency"),
+    ],
+)
+def test_alipay_discovery_quote_rejects_mismatched_challenge_before_cli(
+    tmp_path, monkeypatch, challenge_amount, challenge_currency, error_text,
+):
+    calls = []
+
+    def runner(args):
+        calls.append(list(args))
+        return ['{"ready":true,"opened":true,"bound":true}']
+
+    client = MoltsPay(
+        config_dir=str(tmp_path), wallet_path=str(tmp_path / "wallet.json"),
+        solana_wallet_path=str(tmp_path / "wallet-solana.json"),
+    )
+    client._alipay_client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    challenge = _needed(
+        "MPA-QUOTE", amount=challenge_amount, currency=challenge_currency,
+        service_id="API_PONG", resource_id="/execute?service=pong",
+    )
+    intent = _intent(
+        skill_id="pong", service_id="API_PONG", resource_id="/execute?service=pong",
+        amount="1.00",
+    )
+
+    def fake_post(_client, url, **kwargs):
+        return httpx.Response(
+            402, headers={"Payment-Needed": challenge},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("httpx.Client.post", fake_post)
+
+    with pytest.raises(AlipayProtocolError, match=error_text):
+        client._pay_alipay(
+            "https://provider.test", "pong", {}, 1.0, "CNY",
+            intent=intent,
+            business_session_id="d52e3b71-d00e-4a51-bc16-169cba465bc9",
+        )
+
+    assert calls == []
+
+
+def test_alipay_matching_discovery_quote_reaches_payment_cli(tmp_path, monkeypatch):
+    calls = []
+    out_shake_no = "12345678908282123456789012345678"
+
+    def runner(args):
+        calls.append(list(args))
+        if args[0] == "402-buyer-pay":
+            return [f"查询单号：{out_shake_no}", '{"outTradeNo":"MPA-QUOTE","status":"TRADE_CREATED"}']
+        if args[0] == "402-query-payment-status":
+            return [
+                '{"status":"SUCCESS","tradeNo":"trade-quote","outTradeNo":"MPA-QUOTE",'
+                '"resourceResponse":{"status":200,"body":{"ok":true}}}',
+            ]
+        return ['{"ready":true,"opened":true,"bound":true}']
+
+    client = MoltsPay(
+        config_dir=str(tmp_path), wallet_path=str(tmp_path / "wallet.json"),
+        solana_wallet_path=str(tmp_path / "wallet-solana.json"),
+    )
+    client._alipay_client = AlipayBuyerClient(config_dir=str(tmp_path), runner=runner)
+    challenge = _needed(
+        "MPA-QUOTE", amount="1.00", service_id="API_PONG",
+        resource_id="/execute?service=pong",
+    )
+    intent = _intent(
+        skill_id="pong", service_id="API_PONG", resource_id="/execute?service=pong",
+        amount="1.00",
+    )
+
+    def fake_post(_client, url, **kwargs):
+        return httpx.Response(
+            402, headers={"Payment-Needed": challenge},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("httpx.Client.post", fake_post)
+
+    result = client._pay_alipay(
+        "https://provider.test", "pong", {}, 1.0, "CNY",
+        intent=intent,
+        business_session_id="d52e3b71-d00e-4a51-bc16-169cba465bc9",
+        poll_interval=0.01, timeout=1,
+    )
+
+    assert result.success is True
+    assert result.amount == 1.0
+    assert result.token == "CNY"
+    assert any(call[0] == "402-buyer-pay" for call in calls)

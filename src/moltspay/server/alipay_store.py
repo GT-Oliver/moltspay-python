@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import parse_qs, urlparse
 
+from .order_protection import OrderCapacityError
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -26,8 +28,12 @@ def proof_hash(payment_proof: str) -> str:
 class AlipayOrderStore:
     """SQLite-backed order store with database-level replay protection."""
 
-    def __init__(self, db_path: str = "data/alipay-a402.sqlite"):
+    def __init__(self, db_path: str = "data/alipay-a402.sqlite", *,
+                 max_outstanding_orders: int = 1000,
+                 max_outstanding_per_caller: int = 16):
         self.db_path = str(db_path)
+        self.max_outstanding_orders = max(1, int(max_outstanding_orders))
+        self.max_outstanding_per_caller = max(1, int(max_outstanding_per_caller))
         if self.db_path != ":memory:":
             Path(self.db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.db_path, isolation_level=None, check_same_thread=False)
@@ -40,6 +46,7 @@ class AlipayOrderStore:
         CREATE TABLE IF NOT EXISTS alipay_orders (
           out_trade_no TEXT PRIMARY KEY,
           request_id TEXT NOT NULL,
+          caller_id TEXT NOT NULL DEFAULT '',
           kind TEXT NOT NULL CHECK(kind = 'service'),
           skill_id TEXT NOT NULL,
           service_id TEXT,
@@ -50,6 +57,8 @@ class AlipayOrderStore:
           pay_before TEXT NOT NULL,
           trade_no TEXT UNIQUE,
           proof_hash TEXT UNIQUE,
+          challenge_header TEXT,
+          challenge_claimed_at TEXT,
           status TEXT NOT NULL,
           result_json TEXT,
           error_code TEXT,
@@ -77,6 +86,12 @@ class AlipayOrderStore:
         }
         if "skill_id" not in columns:
             self.db.execute("ALTER TABLE alipay_orders ADD COLUMN skill_id TEXT")
+        if "caller_id" not in columns:
+            self.db.execute("ALTER TABLE alipay_orders ADD COLUMN caller_id TEXT NOT NULL DEFAULT ''")
+        if "challenge_header" not in columns:
+            self.db.execute("ALTER TABLE alipay_orders ADD COLUMN challenge_header TEXT")
+        if "challenge_claimed_at" not in columns:
+            self.db.execute("ALTER TABLE alipay_orders ADD COLUMN challenge_claimed_at TEXT")
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -172,10 +187,31 @@ class AlipayOrderStore:
             "completed_at": order.get("completed_at"),
         }
 
+    def cleanup_expired_unpaid(self) -> int:
+        """Remove only unpaid, unclaimed rows whose challenge is no longer valid."""
+        now = utc_now()
+        with self._transaction():
+            result = self.db.execute(
+                """DELETE FROM alipay_orders
+                   WHERE status IN ('offered', 'expired')
+                     AND trade_no IS NULL
+                     AND (pay_before = '' OR pay_before <= ?)""",
+                (now,),
+            )
+            return int(result.rowcount)
+
+    def outstanding_count(self, caller_id: Optional[str] = None) -> int:
+        query = "SELECT COUNT(*) FROM alipay_orders WHERE status='offered'"
+        args: tuple[str, ...] = ()
+        if caller_id is not None:
+            query += " AND caller_id=?"
+            args = (caller_id,)
+        return int(self.db.execute(query, args).fetchone()[0])
+
     def create_order(self, *, request_id: str, kind: str, amount_fen: int, resource_id: str, goods_name: str,
                      pay_before: str, skill_id: str, service_id: str,
                      out_trade_no: Optional[str] = None,
-                     currency: str = "CNY") -> Dict[str, Any]:
+                     currency: str = "CNY", caller_id: Optional[str] = None) -> Dict[str, Any]:
         if (
             kind != "service"
             or amount_fen <= 0
@@ -187,27 +223,86 @@ class AlipayOrderStore:
             raise ValueError("invalid Alipay order")
         skill_id = skill_id.strip()
         service_id = service_id.strip()
-        existing = self.get_by_request(request_id, kind, resource_id)
-        if existing:
-            immutable = {
-                "skill_id": skill_id,
-                "service_id": service_id,
-                "amount_fen": amount_fen,
-                "currency": currency,
-            }
-            if any(existing.get(key) != value for key, value in immutable.items()):
-                raise ValueError("Alipay idempotency key conflicts with the existing order")
-            return existing
         trade = out_trade_no or "MPA" + uuid.uuid4().hex[:26].upper()
         now = utc_now()
         with self._transaction():
             self.db.execute(
-                """INSERT INTO alipay_orders
-                (out_trade_no,request_id,kind,skill_id,service_id,amount_fen,currency,resource_id,goods_name,pay_before,status,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (trade, request_id, kind, skill_id, service_id, amount_fen, currency, resource_id, goods_name, pay_before, "offered", now, now),
+                """DELETE FROM alipay_orders
+                   WHERE status IN ('offered', 'expired') AND trade_no IS NULL
+                     AND pay_before <> '' AND pay_before <= ?""", (now,)
             )
+            existing = self.db.execute(
+                "SELECT * FROM alipay_orders WHERE request_id=? AND kind=? AND resource_id=?",
+                (request_id, kind, resource_id),
+            ).fetchone()
+            if existing:
+                existing = self._row(existing)
+                immutable = {
+                    "skill_id": skill_id, "service_id": service_id,
+                    "amount_fen": amount_fen, "currency": currency,
+                }
+                if any(existing.get(key) != value for key, value in immutable.items()):
+                    raise ValueError("Alipay idempotency key conflicts with the existing order")
+                return existing
+            if self.outstanding_count() >= self.max_outstanding_orders:
+                raise OrderCapacityError("alipay_outstanding_limit", "Alipay unpaid order limit reached", 5)
+            effective_caller = str(caller_id or "")
+            if effective_caller and self.outstanding_count(effective_caller) >= self.max_outstanding_per_caller:
+                raise OrderCapacityError("alipay_caller_outstanding_limit", "Alipay caller unpaid order limit reached", 5)
+            try:
+                self.db.execute(
+                    """INSERT INTO alipay_orders
+                    (out_trade_no,request_id,caller_id,kind,skill_id,service_id,amount_fen,currency,resource_id,goods_name,pay_before,status,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (trade, request_id, effective_caller, kind, skill_id, service_id, amount_fen, currency, resource_id, goods_name, pay_before, "offered", now, now),
+                )
+            except sqlite3.IntegrityError:
+                existing = self._row(self.db.execute(
+                    "SELECT * FROM alipay_orders WHERE request_id=? AND kind=? AND resource_id=?",
+                    (request_id, kind, resource_id),
+                ).fetchone())
+                if existing:
+                    return existing
+                raise
         return self.get(trade) or {}
+
+    def claim_challenge(self, out_trade_no: str) -> Dict[str, Any]:
+        """Atomically elect one process to produce a missing signed challenge."""
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat(timespec="seconds")
+        with self._transaction():
+            row = self.db.execute("SELECT * FROM alipay_orders WHERE out_trade_no=?", (out_trade_no,)).fetchone()
+            if row is None:
+                return {"state": "not_found"}
+            current = self._row(row)
+            if current.get("challenge_header"):
+                return {"state": "ready", "order": current}
+            claimed_at = current.get("challenge_claimed_at")
+            if claimed_at:
+                try:
+                    age = (now - datetime.fromisoformat(claimed_at.replace("Z", "+00:00"))).total_seconds()
+                except ValueError:
+                    age = 0
+                if age < 60:
+                    return {"state": "in_progress", "order": current}
+            self.db.execute(
+                "UPDATE alipay_orders SET challenge_claimed_at=?,updated_at=? WHERE out_trade_no=?",
+                (now_text, now_text, out_trade_no),
+            )
+            return {"state": "claimed", "order": self.get(out_trade_no)}
+
+    def set_challenge(self, out_trade_no: str, header: str, pay_before: str) -> Dict[str, Any]:
+        if not isinstance(header, str) or not header or not isinstance(pay_before, str) or not pay_before:
+            raise ValueError("invalid Alipay challenge")
+        with self._transaction():
+            self.db.execute(
+                """UPDATE alipay_orders
+                   SET challenge_header=COALESCE(challenge_header,?), pay_before=?,
+                       challenge_claimed_at=NULL, updated_at=?
+                   WHERE out_trade_no=?""",
+                (header, pay_before, utc_now(), out_trade_no),
+            )
+        return self.get(out_trade_no) or {}
 
     def claim_execution(
         self,
@@ -218,9 +313,11 @@ class AlipayOrderStore:
         resource_id: str,
         skill_id: str,
         service_id: str,
+        expected_resource_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Bind proof/trade and atomically acquire the one execution slot."""
         now = utc_now()
+        authorized_resource_id = expected_resource_id or resource_id
         with self._transaction():
             row = self.db.execute("SELECT * FROM alipay_orders WHERE out_trade_no=?", (out_trade_no,)).fetchone()
             if row is None:
@@ -229,7 +326,7 @@ class AlipayOrderStore:
                 return {"state": "skill_mismatch", "order": dict(row)}
             if row["service_id"] != service_id:
                 return {"state": "service_mismatch", "order": dict(row)}
-            if row["resource_id"] != resource_id:
+            if row["resource_id"] != authorized_resource_id or resource_id != authorized_resource_id:
                 return {"state": "resource_mismatch", "order": dict(row)}
             if row["trade_no"] and row["trade_no"] != trade_no:
                 return {"state": "replay", "reason": "trade_mismatch", "order": dict(row)}

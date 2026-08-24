@@ -2,7 +2,7 @@
 
 > 状态：Implemented
 >
-> 最后更新：2026-08-18
+> 最后更新：2026-08-24
 >
 > 范围：使用支付宝 AI 按量付费（A402）购买 Provider 服务
 
@@ -66,13 +66,21 @@ MoltsPay.pay(rail="alipay")
   "paymentRails": {
     "alipay": {
       "amount": "1.00",
-      "currency": "CNY"
+      "currency": "CNY",
+      "serviceId": "ALIPAY_SERVICE_ID",
+      "resourceId": "/execute?service=service-id",
+      "maxTimeoutSeconds": 1800
     }
   }
 }
 ```
 
-客户端不能用 USDC 服务价格推导人民币金额。没有 Alipay 报价时，`rail="alipay"` 返回 unsupported rail。
+客户端不能用 USDC 服务价格推导人民币金额。没有完整 Alipay 报价时，`rail="alipay"` 返回 unsupported rail。
+
+SDK 将发现结果固化为不可变的 `AlipayPaymentIntent`，内容包括 Provider origin、
+MoltsPay `skill_id`、支付宝 `service_id`、`resource_id`、金额、币种和最大有效期。
+后续收到的 `Payment-Needed` 必须逐项匹配该意图；商户订单号由 Provider 在创建挑战时生成，
+因此不在发现阶段预先指定，但必须是合法格式并保存到同一个本地会话中。
 
 Provider 为服务请求创建 `kind="service"` 的 A402 订单，并将下列字段绑定到签名挑战：
 
@@ -91,7 +99,11 @@ Provider 为服务请求创建 `kind="service"` 的 A402 订单，并将下列�
 
 ## 4. 买方会话
 
-`AlipayBuyerClient.start_402()` 只接收真实的 A402 服务挑战。它需要当前 runtime 的业务 session ID，并通过官方 `alipay-bot` 发起付款。
+`AlipayBuyerClient.start_402()` 只接收真实的 A402 服务挑战，并强制要求完整的
+`AlipayPaymentIntent`。它在启动官方 `alipay-bot` 前检查 Provider origin、金额、币种、
+支付宝 `service_id`、`resource_id`、商户订单号格式及带时区的 `pay_before`；账单必须尚未
+过期，且不得超过发现时公布的最大有效期。公开的 `MoltsPay.start_alipay_payment()` 在未传入
+意图时会先执行服务发现并创建意图。它还需要当前 runtime 的业务 session ID。
 
 本地 A402 会话只保存恢复所需的安全元数据，例如本地 payment session ID、商户订单号、查询单号、状态、媒体路径和时间戳。不得保存：
 
@@ -171,6 +183,9 @@ MCP 查询分为两组：
 ## 9. 验收标准
 
 - `pay(..., rail="alipay")` 仍读取服务的 CNY 报价并进入 `_pay_alipay()`；
+- 服务发现公开 Alipay `serviceId`、`resourceId` 和 `maxTimeoutSeconds`；
+- `AlipayPaymentIntent` 不可变，低层 `start_402()` 和 `pay_402()` 缺少意图时拒绝执行；
+- 被替换的金额、币种、服务、资源、Provider origin，以及过期或超长有效期挑战均在调用钱包前被拒绝；
 - A402 start、resume、proof verification、幂等服务执行和履约确认无回归；
 - `AlipayOrderStore` 只接受 `kind="service"`；
 - 源码和配置中不存在 `/balance/topup/alipay` 或 `balance_topup_service_id`；

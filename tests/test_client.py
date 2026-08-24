@@ -12,6 +12,15 @@ from moltspay.models import Service, PaymentResult
 from moltspay.exceptions import PaymentError, LimitExceeded, InsufficientFunds
 
 
+@pytest.fixture(autouse=True)
+def mock_provider_dns(monkeypatch):
+    """Provider HTTP is mocked; do not consult the host resolver in tests."""
+    monkeypatch.setattr(
+        "moltspay.provider_origin._default_resolver",
+        lambda host, port: ["93.184.216.34"],
+    )
+
+
 class TestMoltsPayInit:
     """Test MoltsPay initialization."""
     

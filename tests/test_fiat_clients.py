@@ -25,7 +25,7 @@ def response(status: int, body):
     return httpx.Response(status, json=body, request=httpx.Request("POST", "https://provider/execute"))
 
 
-def test_wechat_session_persists_and_completes(tmp_path):
+def test_wechat_http_session_persists_queries_and_completes(tmp_path):
     fake = FakeHttp([
         response(200, {"status": "pending"}),
         response(200, {"status": "paid"}),
@@ -33,7 +33,7 @@ def test_wechat_session_persists_and_completes(tmp_path):
     ])
     client = WechatClient(config_dir=str(tmp_path), http_client=fake)
     session = client.start_402(
-        "https://provider/execute",
+        "http://127.0.0.1:8402/execute",
         {"scheme": "wechatpay-native", "network": "wechat", "extra": {"code_url": "weixin://pay", "out_trade_no": "WX1"}},
         data=json.dumps({"service": "demo", "params": {}}),
     )
@@ -41,10 +41,11 @@ def test_wechat_session_persists_and_completes(tmp_path):
     paid = client.status("WX1")
     assert paid.status == "paid"
     assert fake.calls[0][0][0] == "GET"
-    assert "/payments/wechat/WX1" in fake.calls[0][0][1]
+    assert fake.calls[0][0][1] == "http://127.0.0.1:8402/payments/wechat/WX1"
     completed = client.fulfill("WX1")
     assert completed.status == "completed"
     assert fake.calls[-1][0][0] == "POST"
+    assert fake.calls[-1][0][1] == "http://127.0.0.1:8402/execute"
     assert "X-Payment" in fake.calls[-1][1]["headers"]
     assert json.loads(completed.result_body)["result"]["ok"] is True
     assert WechatClient(config_dir=str(tmp_path), http_client=FakeHttp([])).list_sessions()[0].out_trade_no == "WX1"

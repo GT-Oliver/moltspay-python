@@ -47,7 +47,7 @@ from .invoice import PaymentAgent
 from .permit_wallet import PermitWallet, AllowanceWallet, generate_permit_instructions
 from .balance import BalanceClient, BalanceLedger, to_sat, from_sat
 from .wechat import WechatClient, WechatPaymentSession
-from .alipay import AlipayBuyerClient, AlipayClient, AlipayPaymentSession
+from .alipay import AlipayBuyerClient, AlipayClient, AlipayPaymentIntent, AlipayPaymentSession
 from .mcp import MoltsPayMCP, create_mcp_server
 from .chains import get_chain, get_chain_by_id, list_chains, get_chain_family, is_evm_chain, is_solana_chain
 
@@ -115,6 +115,7 @@ __all__ = [
     "WechatPaymentSession",
     "AlipayBuyerClient",
     "AlipayClient",
+    "AlipayPaymentIntent",
     "AlipayPaymentSession",
     "get_chain",
     "get_chain_by_id",

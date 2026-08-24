@@ -12,9 +12,14 @@ import httpx
 
 from .wallet import Wallet
 from .x402 import X402Client, AsyncX402Client
+from .provider_origin import ProviderOrigin
 from .models import Service, Balance, Limits, PaymentResult, TokenSymbol, FundingResult, FaucetResult, TransferResult, ServicesResponse, BalanceTopupSession
 from .exceptions import InsufficientFunds, LimitExceeded, PaymentError, UnsupportedRail, AlipayPaymentRejected, AlipayPaymentTimeout, AlipayPaymentStateUnknown
-from .alipay import AlipayBuyerClient, AlipayPaymentSession, decode_a402_json
+from .alipay import (
+    AlipayBuyerClient,
+    AlipayPaymentIntent,
+    AlipayPaymentSession,
+)
 from .chains import CHAINS, get_protocol
 
 # ERC20 ABI for balanceOf and allowance
@@ -111,6 +116,7 @@ class MoltsPay:
             chain=chain,
         )
         self._x402 = X402Client(timeout=timeout)
+        self._provider_origins: Dict[str, ProviderOrigin] = {}
         self._chain = chain
         self._timeout = timeout
         self._config_dir = Path(config_dir).expanduser() if config_dir else self._wallet._wallet_path.parent
@@ -184,11 +190,22 @@ class MoltsPay:
         Returns:
             List of available services
         """
-        return self._x402.discover_services(service_url)
+        origin = self._x402.provider_origin(service_url)
+        services = self._x402.discover_services(service_url, origin=origin)
+        self._provider_origins[origin.base_url] = origin
+        return services
 
     def get_services(self, service_url: str) -> ServicesResponse:
         """Node-compatible service discovery response."""
-        return self._x402.get_services(service_url)
+        origin = self._x402.provider_origin(service_url)
+        services = self._x402.get_services(service_url, origin=origin)
+        self._provider_origins[origin.base_url] = origin
+        return services
+
+    def _provider_origin(self, service_url: str) -> ProviderOrigin:
+        """Reuse the exact origin validated by the immediately preceding discovery."""
+        candidate = self._x402.provider_origin(service_url)
+        return self._provider_origins.get(candidate.base_url, candidate)
 
     def _load_config(self) -> Dict[str, Any]:
         try:
@@ -357,7 +374,10 @@ class MoltsPay:
     def _get_wechat_client(self):
         if self._wechat_client is None:
             from .wechat import WechatClient
-            self._wechat_client = WechatClient(config_dir=str(self._config_dir), timeout=self._timeout)
+            self._wechat_client = WechatClient(
+                config_dir=str(self._config_dir), timeout=self._timeout,
+                http_client=self._x402.http_client,
+            )
         return self._wechat_client
 
     def _get_alipay_client(self) -> AlipayBuyerClient:
@@ -367,12 +387,16 @@ class MoltsPay:
             )
         return self._alipay_client
 
-    def _rail_challenge(self, service_url: str, service_id: str, params: Dict[str, Any], rail: str):
+    def _rail_challenge(
+        self, service_url: str, service_id: str, params: Dict[str, Any], rail: str,
+        origin: Optional[ProviderOrigin] = None,
+    ):
         from .x402 import parse_402_response
         url = f"{service_url.rstrip('/')}/execute"
         body = {"service": service_id, "params": params, "rail": rail}
-        response = httpx.post(
-            url, json=body, headers={"Accept-Payment-Rail": rail},
+        response = self._x402.request(
+            "POST", url, origin=origin or self._provider_origin(service_url),
+            json=body, headers={"Accept-Payment-Rail": rail},
             timeout=self._timeout,
         )
         if response.status_code != 402:
@@ -391,9 +415,13 @@ class MoltsPay:
         service_url: str,
         service_id: str,
         params: Optional[Dict[str, Any]] = None,
+        origin: Optional[ProviderOrigin] = None,
         **options: Any,
     ):
-        url, body, requirement, response = self._rail_challenge(service_url, service_id, params or {}, "wechat")
+        origin = origin or self._provider_origin(service_url)
+        url, body, requirement, response = self._rail_challenge(
+            service_url, service_id, params or {}, "wechat", origin=origin,
+        )
         if requirement is None:
             raise PaymentError("Service completed without requiring a WeChat payment")
         return self._get_wechat_client().start_402(
@@ -416,10 +444,38 @@ class MoltsPay:
     def check_alipay_wallet(self):
         return self._get_alipay_client().check_wallet()
 
+    @staticmethod
+    def _alipay_payment_intent(
+        service: Service, provider_origin: ProviderOrigin,
+    ) -> AlipayPaymentIntent:
+        quote = service.payment_rails.get("alipay", {})
+        required = ("amount", "currency", "serviceId", "resourceId", "maxTimeoutSeconds")
+        if not isinstance(quote, dict) or any(quote.get(field) in (None, "") for field in required):
+            raise UnsupportedRail(
+                "Service discovery does not include a complete Alipay payment authorization"
+            )
+        try:
+            max_expiry_seconds = int(quote["maxTimeoutSeconds"])
+            if isinstance(quote["maxTimeoutSeconds"], bool):
+                raise ValueError
+            return AlipayPaymentIntent(
+                provider_origin=provider_origin,
+                skill_id=service.id,
+                service_id=str(quote["serviceId"]),
+                resource_id=str(quote["resourceId"]),
+                amount=str(quote["amount"]),
+                currency=str(quote["currency"]),
+                max_expiry_seconds=max_expiry_seconds,
+            )
+        except (TypeError, ValueError) as exc:
+            raise UnsupportedRail("Service discovery contains an invalid Alipay payment authorization") from exc
+
     def start_alipay_payment(
         self, service_url: str, service_id: str, params: Optional[Dict[str, Any]] = None,
         intent_summary: Optional[str] = None, timeout: Optional[float] = None,
         request_id: Optional[str] = None, business_session_id: Optional[str] = None,
+        intent: Optional[AlipayPaymentIntent] = None,
+        origin: Optional[ProviderOrigin] = None,
         **options: Any,
     ) -> AlipayPaymentSession:
         """Start a recoverable A402 session from the provider's real 402 response."""
@@ -428,11 +484,26 @@ class MoltsPay:
         # offered order. This prevents orphaned A402 bills when the caller did
         # not propagate its real framework session.
         business_session_id = alipay_client._business_session_id(business_session_id)
+        if "expected_amount" in options or "expected_currency" in options:
+            raise TypeError("Use an AlipayPaymentIntent instead of scalar quote expectations")
+        if intent is None:
+            services = self.discover(service_url)
+            service = next((item for item in services if item.id == service_id), None)
+            if service is None:
+                raise PaymentError(f"Service not found: {service_id}")
+            origin = self._provider_origin(service_url)
+            intent = self._alipay_payment_intent(service, origin)
+        elif not isinstance(intent, AlipayPaymentIntent):
+            raise TypeError("intent must be an AlipayPaymentIntent")
         body = {"service": service_id, "params": params or {}, "rail": "alipay"}
         url = f"{service_url.rstrip('/')}/execute"
+        origin = origin or self._provider_origin(service_url)
+        if intent.skill_id != service_id or intent.provider_origin.base_url != origin.base_url:
+            raise PaymentError("Alipay payment intent does not authorize this provider service")
         request_id = request_id or str(options.pop("idempotency_key", "")) or f"req_{uuid.uuid4().hex}"
-        response = httpx.post(
-            url, json=body,
+        response = self._x402.request(
+            "POST", url, origin=origin,
+            json=body,
             headers={"Accept-Payment-Rail": "alipay", "Idempotency-Key": request_id},
             timeout=self._timeout,
         )
@@ -443,21 +514,18 @@ class MoltsPay:
         payment_needed = response.headers.get("Payment-Needed")
         if not payment_needed:
             raise PaymentError("alipay_payment_needed_missing")
-        # Validate encoding before invoking an external payment process.
-        needed = decode_a402_json(payment_needed, name="Payment-Needed")
-        protocol = needed.get("protocol") if isinstance(needed.get("protocol"), dict) else {}
-        amount = protocol.get("amount")
-        currency = protocol.get("currency")
         summary = intent_summary or f"原始请求：购买 {service_id} 服务"
-        if amount is not None and currency:
-            summary = f"{summary}；支付宝账单：{amount} {currency}"
+        summary = f"{summary}；支付宝账单：{intent.amount} {intent.currency}"
         return alipay_client.start_402(
             url, payment_needed, request_id=request_id, method="POST",
             request_body=json.dumps(body, ensure_ascii=False, separators=(",", ":")),
             headers={"Content-Type": "application/json", "Accept-Payment-Rail": "alipay", "Idempotency-Key": request_id},
             business_session_id=business_session_id, intent_summary=summary,
             timeout=float(timeout or self._timeout or 1800),
-            context={"server_url": service_url, "service_id": service_id, "params": params or {}},
+            context={
+                "server_url": service_url, "service_id": service_id, "params": params or {},
+            },
+            intent=intent,
         )
 
     def get_alipay_payment_status(self, identifier: str) -> AlipayPaymentSession:
@@ -473,8 +541,9 @@ class MoltsPay:
         """Query and reconcile one authoritative provider-side Alipay order."""
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", out_trade_no or ""):
             raise ValueError("Invalid Alipay merchant order number")
-        response = httpx.get(
-            f"{server_url.rstrip('/')}/payments/alipay/{out_trade_no}",
+        origin = self._provider_origin(server_url)
+        response = self._x402.request(
+            "GET", f"{server_url.rstrip('/')}/payments/alipay/{out_trade_no}", origin=origin,
             headers={"Accept": "application/json"},
             timeout=self._timeout,
         )
@@ -548,13 +617,17 @@ class MoltsPay:
 
     def _pay_alipay(
         self, service_url: str, service_id: str, params: Dict[str, Any],
-        amount: float, currency: str = "CNY", **options: Any,
+        amount: float, currency: str = "CNY", origin: Optional[ProviderOrigin] = None,
+        intent: Optional[AlipayPaymentIntent] = None, **options: Any,
     ) -> PaymentResult:
+        if intent is None:
+            raise PaymentError("An immutable Alipay payment intent is required")
         session = self.start_alipay_payment(
             service_url, service_id, params,
             intent_summary=options.get("intent_summary"), timeout=options.get("timeout"),
             request_id=options.get("request_id"),
             business_session_id=options.get("business_session_id"),
+            intent=intent, origin=origin,
         )
         deadline = time.monotonic() + float(options.get("timeout") or self._timeout or 1800)
         while time.monotonic() < deadline:
@@ -580,8 +653,11 @@ class MoltsPay:
             time.sleep(max(0.05, float(options.get("poll_interval", 3.0))))
         raise AlipayPaymentTimeout("Alipay payment timed out", details={"paymentSessionId": session.payment_session_id, "tradeNo": session.trade_no})
 
-    def _pay_wechat(self, service_url: str, service_id: str, params: Dict[str, Any], amount: float, **options: Any) -> PaymentResult:
-        session = self.start_wechat_payment(service_url, service_id, params, **{k: v for k, v in options.items() if k in {"timeout", "on_payment_pending"}})
+    def _pay_wechat(self, service_url: str, service_id: str, params: Dict[str, Any], amount: float, origin: Optional[ProviderOrigin] = None, **options: Any) -> PaymentResult:
+        session = self.start_wechat_payment(
+            service_url, service_id, params, origin=origin,
+            **{k: v for k, v in options.items() if k in {"timeout", "on_payment_pending"}},
+        )
         observed = self._get_wechat_client().poll_session(
             session.payment_session_id,
             poll_interval=float(options.get("poll_interval", 3.0)),
@@ -1107,6 +1183,7 @@ class MoltsPay:
         
         # Discover service to get price
         services = self.discover(service_url)
+        provider_origin = self._provider_origin(service_url)
         service = next((s for s in services if s.id == service_id), None)
         
         if not service:
@@ -1157,17 +1234,17 @@ class MoltsPay:
                         rail=options.get("topup_rail", "wechat"),
                     )
         if selected_rail == "wechat":
-            return self._pay_wechat(service_url, service_id, params, service.price, **(rail_options or {}))
+            return self._pay_wechat(
+                service_url, service_id, params, service.price,
+                origin=provider_origin, **(rail_options or {}),
+            )
         if selected_rail == "alipay":
-            quote = service.payment_rails.get("alipay", {})
-            if not isinstance(quote, dict) or quote.get("amount") is None:
-                raise UnsupportedRail(
-                    "Service discovery does not include an Alipay-specific quote"
-                )
-            amount = float(quote["amount"])
-            currency = str(quote.get("currency") or "CNY")
+            intent = self._alipay_payment_intent(service, provider_origin)
+            amount = float(intent.amount)
+            currency = intent.currency
             return self._pay_alipay(
-                service_url, service_id, params, amount, currency, **(rail_options or {})
+                service_url, service_id, params, amount, currency,
+                origin=provider_origin, intent=intent, **(rail_options or {}),
             )
         if selected_rail and selected_rail not in CHAINS:
             raise UnsupportedRail(f"Unsupported payment rail: {selected_rail}")
@@ -1188,9 +1265,15 @@ class MoltsPay:
         try:
             # Route to appropriate facilitator based on chain
             if self._is_solana_chain(chain):
-                result = self._pay_solana(service_url, service_id, service.price, token, chain, params)
+                result = self._pay_solana(
+                    service_url, service_id, service.price, token, chain, params,
+                    origin=provider_origin,
+                )
             else:
-                result = self._pay_evm(service_url, service_id, service.price, token, chain, params)
+                result = self._pay_evm(
+                    service_url, service_id, service.price, token, chain, params,
+                    origin=provider_origin,
+                )
             
             # Record spend on success
             if result.success:
@@ -1217,6 +1300,7 @@ class MoltsPay:
         token: str,
         chain: str,
         params: dict,
+        origin: Optional[ProviderOrigin] = None,
     ) -> PaymentResult:
         """Execute payment on EVM chains (Base, Polygon, etc.)."""
         payment_response = self._x402.pay_and_call(
@@ -1226,6 +1310,7 @@ class MoltsPay:
             self._wallet._account,
             token=token,
             chain=chain,
+            origin=origin,
         )
         
         # Build explorer URL only for real on-chain tx_hash
@@ -1253,6 +1338,7 @@ class MoltsPay:
         token: str,
         chain: str,
         params: dict,
+        origin: Optional[ProviderOrigin] = None,
     ) -> PaymentResult:
         """Execute payment on Solana chains."""
         import base64
@@ -1263,52 +1349,44 @@ class MoltsPay:
         keypair = solana_wallet.keypair
         
         # Make request to get 402 response with payment requirements
-        with httpx.Client(timeout=self._timeout) as client:
-            response = client.post(
-                f"{service_url}/execute",
-                json={"service": service_id, "params": params, "chain": chain},
-            )
+        response = self._x402.request(
+            "POST", f"{service_url.rstrip('/')}/execute",
+            origin=origin or self._provider_origin(service_url),
+            json={"service": service_id, "params": params, "chain": chain},
+        )
             
-            if response.status_code != 402:
-                if response.is_success:
-                    return PaymentResult(
-                        success=True,
-                        amount=price,
-                        token=token,
-                        service_id=service_id,
-                        result=response.json().get("result"),
-                    )
-                raise PaymentError(f"Unexpected response: {response.status_code}")
-            
-            # Parse X-Payment-Required header (base64 encoded JSON)
-            payment_header = response.headers.get("x-payment-required")
-            if not payment_header:
-                raise PaymentError("Missing x-payment-required header in 402 response")
-            
-            try:
-                decoded = base64.b64decode(payment_header).decode("utf-8")
-                parsed = json_lib.loads(decoded)
-                
-                # Handle both v1 (array) and v2 (object with accepts) formats
-                if isinstance(parsed, list):
-                    requirements = parsed
-                elif isinstance(parsed, dict) and "accepts" in parsed:
-                    requirements = parsed["accepts"]
-                else:
-                    requirements = [parsed]
-            except Exception as e:
-                raise PaymentError(f"Invalid x-payment-required header: {e}")
-            
-            # Find Solana requirement
-            network = "solana:mainnet" if chain == "solana" else "solana:devnet"
-            payment_details = None
-            for req in requirements:
-                if req.get("network") == network:
-                    payment_details = req
-                    break
-            
-            if not payment_details:
-                raise PaymentError(f"No payment requirement found for {chain}")
+        if response.status_code != 402:
+            if response.is_success:
+                return PaymentResult(
+                    success=True,
+                    amount=price,
+                    token=token,
+                    service_id=service_id,
+                    result=response.json().get("result"),
+                )
+            raise PaymentError(f"Unexpected response: {response.status_code}")
+
+        # Parse X-Payment-Required header (base64 encoded JSON)
+        payment_header = response.headers.get("x-payment-required")
+        if not payment_header:
+            raise PaymentError("Missing x-payment-required header in 402 response")
+
+        try:
+            decoded = base64.b64decode(payment_header).decode("utf-8")
+            parsed = json_lib.loads(decoded)
+            if isinstance(parsed, list):
+                requirements = parsed
+            elif isinstance(parsed, dict) and "accepts" in parsed:
+                requirements = parsed["accepts"]
+            else:
+                requirements = [parsed]
+        except Exception as e:
+            raise PaymentError(f"Invalid x-payment-required header: {e}")
+
+        network = "solana:mainnet" if chain == "solana" else "solana:devnet"
+        payment_details = next((req for req in requirements if req.get("network") == network), None)
+        if not payment_details:
+            raise PaymentError(f"No payment requirement found for {chain}")
         
         # Execute Solana payment
         solana_mod = _get_solana_facilitator()
@@ -1389,6 +1467,7 @@ class AsyncMoltsPay:
             chain=chain,
         )
         self._x402 = AsyncX402Client(timeout=timeout)
+        self._provider_origins: Dict[str, ProviderOrigin] = {}
         self._chain = chain
         self._timeout = timeout
         self._config_dir = config_dir
@@ -1412,7 +1491,10 @@ class AsyncMoltsPay:
     
     async def discover(self, service_url: str) -> List[Service]:
         """Discover available services."""
-        return await self._x402.discover_services(service_url)
+        origin = self._x402.provider_origin(service_url)
+        services = await self._x402.discover_services(service_url, origin=origin)
+        self._provider_origins[origin.base_url] = origin
+        return services
     
     def balance(self) -> Balance:
         """Get wallet balance using the same RPC-backed implementation as sync client."""
@@ -1488,6 +1570,9 @@ class AsyncMoltsPay:
             warnings.warn("USDT requires gas (~$0.01). USDC is gasless and recommended.", UserWarning)
         
         services = await self.discover(service_url)
+        provider_origin = self._provider_origins.get(
+            self._x402.provider_origin(service_url).base_url,
+        )
         service = next((s for s in services if s.id == service_id), None)
         
         if not service:
@@ -1513,6 +1598,7 @@ class AsyncMoltsPay:
                 self._wallet._account,
                 token=token,
                 chain=chain or self._chain,
+                origin=provider_origin,
             )
             
             self._wallet.record_spend(service.price)

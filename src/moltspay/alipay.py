@@ -15,11 +15,15 @@ import subprocess
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from .provider_origin import ProviderOrigin, ProviderURLPolicyError
 
 from .exceptions import (
     AlipayCliFailed,
@@ -40,6 +44,7 @@ MAX_HEADER_BYTES = 16 * 1024
 MAX_OUTPUT_BYTES = 256 * 1024
 SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TRADE_NO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+DECIMAL_AMOUNT_RE = re.compile(r"^(?:0|[1-9][0-9]{0,31})(?:\.[0-9]{1,2})?$")
 # 8282 is the documented query-number family; alipay-bot 0.4.0 emits the
 # successor 8283 family. Both retain the same 32-digit recovery contract.
 OUT_SHAKE_NO_RE = re.compile(r"^\d{10}828[23]\d{18}$")
@@ -59,6 +64,7 @@ A402_PROVIDER_STATUS = {
 SENSITIVE_REPLAY_HEADERS = {
     "authorization", "proxy-authorization", "payment-proof", "cookie", "set-cookie",
 }
+ALIPAY_EXPIRY_CLOCK_SKEW_SECONDS = 5
 
 
 def _iso(timestamp: float) -> str:
@@ -128,6 +134,132 @@ def _bill_metadata(protocol: Dict[str, Any]) -> Dict[str, str]:
         if value is not None:
             metadata[field] = value
     return metadata
+
+
+@dataclass(frozen=True)
+class AlipayPaymentIntent:
+    """Immutable buyer authorization derived from service discovery."""
+
+    provider_origin: ProviderOrigin
+    skill_id: str
+    service_id: str
+    resource_id: str
+    amount: str
+    currency: str
+    max_expiry_seconds: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.provider_origin, ProviderOrigin):
+            raise TypeError("provider_origin must be a validated ProviderOrigin")
+        skill_id = _bounded_protocol_text(self.skill_id, "MoltsPay skill ID", 256)
+        service_id = _bounded_protocol_text(self.service_id, "Alipay service_id", 256)
+        resource_id = _bounded_protocol_text(self.resource_id, "Alipay resource_id", 1024)
+        amount_text = str(self.amount)
+        try:
+            if not DECIMAL_AMOUNT_RE.fullmatch(amount_text):
+                raise ValueError
+            amount = Decimal(amount_text)
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("Alipay intent amount must be a positive decimal") from exc
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError("Alipay intent amount must be a positive decimal")
+        currency = str(self.currency).strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", currency):
+            raise ValueError("Alipay intent currency must be a three-letter code")
+        if isinstance(self.max_expiry_seconds, bool) or not isinstance(self.max_expiry_seconds, int):
+            raise TypeError("Alipay intent max_expiry_seconds must be an integer")
+        if self.max_expiry_seconds <= 0:
+            raise ValueError("Alipay intent max_expiry_seconds must be positive")
+        object.__setattr__(self, "skill_id", skill_id)
+        object.__setattr__(self, "service_id", service_id)
+        object.__setattr__(self, "resource_id", resource_id)
+        object.__setattr__(self, "amount", str(amount))
+        object.__setattr__(self, "currency", currency)
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Return a JSON-safe authorization record for session recovery/audit."""
+        return {
+            "provider_origin": self.provider_origin.base_url,
+            "skill_id": self.skill_id,
+            "service_id": self.service_id,
+            "resource_id": self.resource_id,
+            "amount": self.amount,
+            "currency": self.currency,
+            "max_expiry_seconds": self.max_expiry_seconds,
+        }
+
+
+def validate_alipay_quote(
+    protocol: Dict[str, Any], *, intent: AlipayPaymentIntent,
+) -> None:
+    """Require a Payment-Needed bill to match the buyer's full authorization.
+
+    The discovery record is the buyer's authorization boundary. Amounts are
+    compared as decimals so ``1``, ``1.0`` and ``1.00`` are equivalent.
+    """
+    if not isinstance(intent, AlipayPaymentIntent):
+        raise AlipayProtocolError("An immutable Alipay payment intent is required")
+    if not isinstance(protocol, dict):
+        raise AlipayProtocolError("Alipay Payment-Needed protocol is missing")
+
+    actual_amount = protocol.get("amount")
+    actual_amount_text = str(actual_amount)
+    try:
+        expected = Decimal(intent.amount)
+        if not DECIMAL_AMOUNT_RE.fullmatch(actual_amount_text):
+            raise ValueError
+        actual = Decimal(actual_amount_text)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise AlipayProtocolError(
+            "Alipay Payment-Needed amount does not match the discovered quote",
+            details={"expected_amount": intent.amount, "actual_amount": actual_amount},
+        ) from exc
+    if not actual.is_finite() or actual <= 0 or expected != actual:
+        raise AlipayProtocolError(
+            "Alipay Payment-Needed amount does not match the discovered quote",
+            details={"expected_amount": intent.amount, "actual_amount": actual_amount},
+        )
+
+    actual_currency = protocol.get("currency")
+    actual_currency = str(actual_currency).strip().upper() if actual_currency is not None else ""
+    if actual_currency != intent.currency:
+        raise AlipayProtocolError(
+            "Alipay Payment-Needed currency does not match the discovered quote",
+            details={"expected_currency": intent.currency, "actual_currency": actual_currency or None},
+        )
+
+    for field, expected_value in (
+        ("service_id", intent.service_id),
+        ("resource_id", intent.resource_id),
+    ):
+        actual_value = protocol.get(field)
+        if not isinstance(actual_value, str) or actual_value != expected_value:
+            raise AlipayProtocolError(
+                f"Alipay Payment-Needed {field} does not match the discovered quote",
+                details={f"expected_{field}": expected_value, f"actual_{field}": actual_value},
+            )
+
+    out_trade_no = protocol.get("out_trade_no") or protocol.get("outTradeNo")
+    if not isinstance(out_trade_no, str) or not TRADE_NO_RE.fullmatch(out_trade_no):
+        raise AlipayProtocolError("Invalid Alipay merchant order number")
+
+    pay_before = protocol.get("pay_before")
+    if not isinstance(pay_before, str) or not pay_before:
+        raise AlipayProtocolError("Alipay Payment-Needed pay_before is missing")
+    try:
+        expires_at = datetime.fromisoformat(pay_before.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise AlipayProtocolError("Alipay Payment-Needed pay_before is invalid") from exc
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        raise AlipayProtocolError("Alipay Payment-Needed pay_before must include a timezone")
+    now = datetime.now(timezone.utc)
+    expires_at = expires_at.astimezone(timezone.utc)
+    if expires_at <= now:
+        raise AlipayProtocolError("Alipay Payment-Needed has expired")
+    if (expires_at - now).total_seconds() > (
+        intent.max_expiry_seconds + ALIPAY_EXPIRY_CLOCK_SKEW_SECONDS
+    ):
+        raise AlipayProtocolError("Alipay Payment-Needed expiry exceeds the discovered limit")
 
 
 def _safe_replay_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
@@ -805,6 +937,7 @@ class AlipayBuyerClient:
         resource_url: str,
         payment_needed: Any = None,
         *,
+        intent: AlipayPaymentIntent,
         requirement: Optional[Dict[str, Any]] = None,
         data: Optional[str] = None,
         request_id: Optional[str] = None,
@@ -824,6 +957,11 @@ class AlipayBuyerClient:
             raise AlipayProtocolError("Payment-Needed is missing or too large")
         requirement_data = decode_a402_json(payment_needed, name="Payment-Needed")
         protocol = requirement_data.get("protocol") if isinstance(requirement_data.get("protocol"), dict) else {}
+        validate_alipay_quote(protocol, intent=intent)
+        try:
+            intent.provider_origin.validate_request_url(resource_url)
+        except ProviderURLPolicyError as exc:
+            raise AlipayProtocolError("Alipay resource URL does not match the authorized provider") from exc
         amount = str(protocol.get("amount")) if protocol.get("amount") is not None else None
         currency = str(protocol.get("currency")) if protocol.get("currency") is not None else None
         bill_metadata = _bill_metadata(protocol)
@@ -831,13 +969,15 @@ class AlipayBuyerClient:
         request_id = request_id or f"req_{uuid.uuid4().hex}"
         _safe_identifier(request_id, "request ID")
         now = time.time()
+        session_context = dict(context or {})
+        session_context["alipay_intent"] = intent.snapshot()
         session = AlipayPaymentSession(
             payment_session_id=f"mpay_alipay_{uuid.uuid4().hex}",
             business_session_id=business_session_id, amount=amount, currency=currency,
             status="pending",
             request_id=request_id, resource_url=resource_url, method=method.upper(),
             request_body=request_body, data=request_body, request_headers=_safe_replay_headers(headers), intent_summary=intent_summary,
-            context=context or {}, created_at=_iso(now), updated_at=_iso(now), expires_at=_iso(now + timeout),
+            context=session_context, created_at=_iso(now), updated_at=_iso(now), expires_at=_iso(now + timeout),
             **bill_metadata,
         )
         self._save(session)
@@ -924,8 +1064,11 @@ class AlipayBuyerClient:
     def fulfill(self, identifier: str) -> AlipayPaymentSession:
         return self.resume(identifier)
 
-    def pay_402(self, resource_url: str, requirement: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
-        session = self.start_402(resource_url, requirement=requirement, **kwargs)
+    def pay_402(
+        self, resource_url: str, requirement: Dict[str, Any], *,
+        intent: AlipayPaymentIntent, **kwargs: Any,
+    ) -> Dict[str, Any]:
+        session = self.start_402(resource_url, requirement=requirement, intent=intent, **kwargs)
         deadline = time.monotonic() + float(kwargs.get("timeout") or requirement.get("maxTimeoutSeconds", 1800))
         while time.monotonic() < deadline:
             session = self.resume(session.payment_session_id)
@@ -965,6 +1108,7 @@ AlipayClient = AlipayBuyerClient
 
 __all__ = [
     "ALIPAY_NETWORK", "ALIPAY_SCHEME", "AlipayBuyerClient", "AlipayClient",
-    "AlipayPaymentSession", "decode_a402_json", "encode_a402_json",
+    "AlipayPaymentIntent", "AlipayPaymentSession", "decode_a402_json", "encode_a402_json",
     "parse_alipay_cli_output", "parse_trade_no", "parse_payment_url", "parse_status",
+    "validate_alipay_quote",
 ]

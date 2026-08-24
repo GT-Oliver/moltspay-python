@@ -26,7 +26,7 @@ HttpUrl = Annotated[
     Field(
         pattern=r"^https?://[^\s]+$",
         max_length=2048,
-        description="Provider base URL using http or https; maximum 2048 characters.",
+        description="Provider base URL using HTTP or HTTPS; maximum 2048 characters.",
     ),
 ]
 BuyerId = Annotated[

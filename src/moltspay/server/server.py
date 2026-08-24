@@ -13,6 +13,7 @@ Or programmatically:
 
 import asyncio
 import base64
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -43,7 +44,9 @@ from .types import (
 from .facilitators import FacilitatorRegistry
 from .facilitators.cdp import load_env_file
 from .facilitators.balance import BalanceFacilitator
-from .facilitators.wechat import WechatFacilitator
+from .facilitators.wechat import WechatFacilitator, cny_to_fen
+from .wechat_store import WechatOrderStore
+from .order_protection import OrderCreationLimiter, OrderCapacityError, OrderProtectionError
 from .facilitators.alipay import AlipayFacilitator, ALIPAY_NETWORK, normalize_cny_amount
 from .alipay_store import AlipayOrderStore, proof_hash
 from ..alipay import encode_a402_json
@@ -94,6 +97,7 @@ class MoltsPayServer:
         
         # Provider info (from first manifest)
         self.provider = self.manifests[0].provider if self.manifests else None
+        self._order_limiters: Dict[str, OrderCreationLimiter] = {}
 
         if self.provider and self.provider.balance:
             balance_config = self.provider.balance
@@ -105,12 +109,26 @@ class MoltsPayServer:
                 auth_mode=balance_config.get("auth_mode", "off"),
             ))
         if self.provider and self.provider.wechat:
-            self.registry.register("wechat", WechatFacilitator(self.provider.wechat))
+            wechat_limits = self._order_protection_config("wechat")
+            wechat = WechatFacilitator(self.provider.wechat)
+            self.registry.register("wechat", wechat)
+            self.wechat_store = WechatOrderStore(
+                self.provider.wechat.get("order_db_path", "data/wechat-x402.sqlite"),
+                max_outstanding_orders=self._positive_int(wechat_limits, "max_outstanding_orders", 1000),
+                max_outstanding_per_caller=self._positive_int(wechat_limits, "max_outstanding_orders_per_caller", 16),
+            )
+        else:
+            self.wechat_store = None
         self.alipay = None
         self.alipay_store = None
         if self.provider and self.provider.alipay:
+            alipay_limits = self._order_protection_config("alipay")
             self.alipay = AlipayFacilitator(self.provider.alipay)
-            self.alipay_store = AlipayOrderStore(self.provider.alipay.get("order_db_path", "data/alipay-a402.sqlite"))
+            self.alipay_store = AlipayOrderStore(
+                self.provider.alipay.get("order_db_path", "data/alipay-a402.sqlite"),
+                max_outstanding_orders=self._positive_int(alipay_limits, "max_outstanding_orders", 1000),
+                max_outstanding_per_caller=self._positive_int(alipay_limits, "max_outstanding_orders_per_caller", 16),
+            )
             self.registry.register("alipay", self.alipay)
         
         # Get configured chains
@@ -129,6 +147,53 @@ class MoltsPayServer:
         print(f"[MoltsPay] Facilitators: {', '.join(self.registry.list_facilitators())}")
         print(f"[MoltsPay] Supported networks: {', '.join(self.registry.list_supported_networks())}")
         print(f"[MoltsPay] Protocol: x402 + MPP")
+
+    @staticmethod
+    def _positive_int(config: Dict[str, Any], key: str, default: int) -> int:
+        try:
+            value = int(config.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return value if value > 0 else default
+
+    def _order_protection_config(self, rail: str) -> Dict[str, Any]:
+        """Read rail-local protection settings without exposing them to clients."""
+        provider = getattr(self, "provider", None)
+        rail_config = dict(getattr(provider, rail, None) or {}) if provider else {}
+        nested = rail_config.get("order_protection")
+        config = dict(nested) if isinstance(nested, dict) else {}
+        for key, value in rail_config.items():
+            if key.startswith(("order_", "max_order", "max_concurrent_order", "max_outstanding", "caller_", "per_caller_", "max_tracked")):
+                config.setdefault(key, value)
+        return config
+
+    def _order_limiter(self, rail: str) -> OrderCreationLimiter:
+        if not hasattr(self, "_order_limiters"):
+            self._order_limiters = {}
+        limiter = self._order_limiters.get(rail)
+        if limiter is None:
+            limiter = OrderCreationLimiter(self._order_protection_config(rail))
+            self._order_limiters[rail] = limiter
+        return limiter
+
+    @staticmethod
+    def _caller_id(handler: Any) -> str:
+        address = getattr(handler, "client_address", None)
+        host = address[0] if isinstance(address, (tuple, list)) and address else "local"
+        return str(host)[:255] or "local"
+
+    @staticmethod
+    def _stable_order_request_id(raw_key: Optional[str], caller_id: str, rail: str, resource_id: str) -> str:
+        key = str(raw_key or "").strip()
+        if len(key) > 128 or any(ord(char) < 33 or ord(char) > 126 for char in key):
+            raise ValueError("Idempotency-Key must be 1-128 printable ASCII characters")
+        if key:
+            # Preserve the public idempotency identifier in durable status
+            # lookups; the caller is still rate/concurrency bounded separately.
+            return key
+        identity = "<anonymous>"
+        digest = hashlib.sha256(f"{rail}\n{caller_id}\n{resource_id}\n{identity}".encode("utf-8")).hexdigest()
+        return "req_" + digest
 
     @staticmethod
     def _balance_topup_order_is_active(
@@ -282,12 +347,28 @@ class MoltsPayServer:
             }
 
         if config.alipay is not None and self.alipay is not None:
+            service_id = config.alipay.get("service_id")
+            if not isinstance(service_id, str) or not service_id.strip():
+                raise ValueError(f"Alipay service_id is required for service '{config.id}'")
+            facilitator_config = getattr(self.alipay, "config", {})
+            timeout_seconds = int(
+                config.alipay.get("pay_timeout_seconds")
+                or facilitator_config.get("default_timeout_seconds", 1800)
+            )
+            if timeout_seconds <= 0:
+                raise ValueError("Alipay pay_timeout_seconds must be positive")
             rails["alipay"] = {
                 "available": True,
                 "interactive": True,
                 "protocol": "a402",
                 "currency": "CNY",
                 "amount": normalize_cny_amount(config.alipay["price_cny"]),
+                "serviceId": service_id.strip(),
+                "resourceId": str(
+                    config.alipay.get("resource_id")
+                    or f"/execute?service={quote(config.id, safe='')}"
+                ),
+                "maxTimeoutSeconds": timeout_seconds,
             }
 
         return rails
@@ -371,6 +452,74 @@ class MoltsPayServer:
             alipay_config.get("resource_id")
             or f"/execute?service={quote(skill.id, safe='')}"
         )
+
+    @staticmethod
+    def _wechat_resource_id(config: ServiceConfig) -> str:
+        return f"/execute?service={config.id}"
+
+    def _create_wechat_service_order(
+        self, config: ServiceConfig, request_id: Optional[str] = None,
+        caller_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create or reuse a durable WeChat order for one service resource."""
+        wechat = self.registry.get("wechat")
+        if not isinstance(wechat, WechatFacilitator) or self.wechat_store is None:
+            raise RuntimeError("WeChat order storage is not configured")
+        if not config.wechat:
+            raise ValueError("WeChat rail is not enabled for this service")
+
+        resource_id = self._wechat_resource_id(config)
+        caller_id = caller_id or "local"
+        request_id = self._stable_order_request_id(request_id, caller_id, "wechat", resource_id)
+        amount = str(config.wechat["price_cny"])
+        amount_fen = cny_to_fen(amount)
+        expires_seconds = int(config.wechat.get("pay_timeout_seconds", 300) or 300)
+        if expires_seconds <= 0:
+            raise ValueError("WeChat pay_timeout_seconds must be greater than zero")
+        initial_expiry = (datetime.now(timezone.utc) + timedelta(seconds=expires_seconds)).isoformat(timespec="seconds").replace("+00:00", "Z")
+        with self._order_limiter("wechat").slot(caller_id):
+            order = self.wechat_store.reserve_order(
+                request_id=request_id, caller_id=caller_id, skill_id=config.id,
+                service_id=config.id, resource_id=resource_id, amount_fen=amount_fen,
+                currency="CNY", appid=str(wechat.config["appid"]),
+                mchid=str(wechat.config["mchid"]), pay_before=initial_expiry,
+            )
+            if not order.get("code_url"):
+                claim = self.wechat_store.claim_creation(order["out_trade_no"])
+                if claim.get("state") == "in_progress":
+                    raise OrderProtectionError("wechat_order_creation_in_progress", "WeChat order creation is already in progress", 1)
+                if claim.get("state") == "not_found":
+                    raise RuntimeError("WeChat reservation disappeared")
+                requirement = wechat.create_payment_requirements(
+                    price_cny=amount,
+                    description=str(config.wechat["description"]),
+                    out_trade_no=order["out_trade_no"],
+                    expires_seconds=expires_seconds,
+                    attach={
+                        "service_id": config.id, "skill_id": config.id,
+                        "resource_id": resource_id, "amount": amount, "currency": "CNY",
+                    },
+                )
+                extra = requirement.get("extra") or {}
+                code_url = str(extra.get("code_url") or "")
+                expires_at = str(extra.get("expires_at") or "")
+                if not code_url or not expires_at or str(extra.get("out_trade_no") or "") != order["out_trade_no"]:
+                    raise RuntimeError("WeChat Native order is missing durable order fields")
+                order = self.wechat_store.finalize_order(order["out_trade_no"], code_url, expires_at)
+            else:
+                expires_at = str(order["pay_before"])
+                requirement = None
+            remaining = max(1, int((datetime.fromisoformat(expires_at.replace("Z", "+00:00")) - datetime.now(timezone.utc)).total_seconds()))
+        return {
+            **(requirement or {"scheme": "wechatpay-native", "network": "wechat", "asset": "CNY"}),
+            "amount": f"{order['amount_fen'] / 100:.2f}",
+            "payTo": order["mchid"],
+            "maxTimeoutSeconds": remaining,
+            "extra": {
+                "code_url": order["code_url"], "out_trade_no": order["out_trade_no"],
+                "expires_at": order["pay_before"],
+            },
+        }
     
     def listen(self, port: Optional[int] = None) -> None:
         """
@@ -403,7 +552,7 @@ class MoltsPayServer:
                 self.end_headers()
                 self.wfile.write(json.dumps(data, indent=2).encode())
             
-            def _send_402(self, config: ServiceConfig, client_chain: str = None):
+            def _send_402(self, config: ServiceConfig, client_chain: str = None, request_id: Optional[str] = None):
                 """Send 402 Payment Required response with all supported chains.
                 
                 Args:
@@ -411,6 +560,7 @@ class MoltsPayServer:
                     client_chain: Client's requested chain (only adds MPP header if tempo_moderato)
                 """
                 accepts = []
+                caller_id = server._caller_id(self)
                 
                 # Get BNB spender address if available
                 bnb_spender = server.registry.get_bnb_spender_address()
@@ -429,10 +579,16 @@ class MoltsPayServer:
                     if chain_config.network == "wechat":
                         wechat = server.registry.get("wechat")
                         if isinstance(wechat, WechatFacilitator) and config.wechat:
-                            accepts.append(wechat.create_payment_requirements(
-                                price_cny=str(config.wechat["price_cny"]),
-                                description=str(config.wechat["description"]),
-                            ))
+                            try:
+                                accepts.append(server._create_wechat_service_order(config, request_id, caller_id))
+                            except (OrderProtectionError, OrderCapacityError) as exc:
+                                return self._send_json(429, {
+                                    "code": exc.code, "error": str(exc), "retryable": True,
+                                }, {"Retry-After": str(exc.retry_after)})
+                            except Exception as exc:
+                                return self._send_json(500, {
+                                    "code": "wechat_order_creation_failed", "error": str(exc),
+                                })
                         continue
                     token_addresses = TOKEN_ADDRESSES.get(chain_config.network, {})
                     # Get decimals for this network (default 6, BNB uses 18)
@@ -848,6 +1004,11 @@ class MoltsPayServer:
                 alipay_config = skill.config.alipay
                 amount = str(alipay_config.get("price_cny", ""))
                 resource_id = server._alipay_resource_id(skill)
+                caller_id = server._caller_id(self)
+                try:
+                    stable_request_id = server._stable_order_request_id(request_id, caller_id, "alipay", resource_id)
+                except ValueError as exc:
+                    return self._send_json(400, {"code": "idempotency_key_invalid", "error": str(exc)})
                 alipay_service_id = alipay_config.get("service_id")
                 if not isinstance(alipay_service_id, str) or not alipay_service_id.strip():
                     return self._send_json(500, {
@@ -858,21 +1019,39 @@ class MoltsPayServer:
                 try:
                     from decimal import Decimal
                     amount_fen = int(Decimal(normalize_cny_amount(amount)) * 100)
-                    order = server.alipay_store.create_order(
-                        request_id=request_id or f"req_{secrets.token_hex(12)}", kind="service", amount_fen=amount_fen,
-                        resource_id=resource_id, goods_name=str(alipay_config.get("goods_name") or skill.config.name),
-                        pay_before="", skill_id=skill.id, service_id=alipay_service_id,
-                    )
-                    bill = server.alipay.create_payment_needed(
-                        out_trade_no=order["out_trade_no"], amount=amount,
-                        goods_name=str(alipay_config.get("goods_name") or skill.config.name),
-                        resource_id=resource_id, service_id=alipay_service_id,
-                        timeout_seconds=int(alipay_config.get("pay_timeout_seconds") or server.alipay.config.get("default_timeout_seconds", 1800)),
-                    )
+                    timeout_seconds = int(alipay_config.get("pay_timeout_seconds") or server.alipay.config.get("default_timeout_seconds", 1800))
+                    if timeout_seconds <= 0:
+                        raise ValueError("timeout_seconds must be positive")
+                    initial_expiry = (datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)).isoformat(timespec="seconds")
+                    with server._order_limiter("alipay").slot(caller_id):
+                        order = server.alipay_store.create_order(
+                            request_id=stable_request_id, caller_id=caller_id, kind="service", amount_fen=amount_fen,
+                            resource_id=resource_id, goods_name=str(alipay_config.get("goods_name") or skill.config.name),
+                            pay_before=initial_expiry, skill_id=skill.id, service_id=alipay_service_id,
+                        )
+                        claim = server.alipay_store.claim_challenge(order["out_trade_no"])
+                        if claim.get("state") == "ready":
+                            order = claim["order"]
+                            bill = {"header": order["challenge_header"], "pay_before": order["pay_before"]}
+                        elif claim.get("state") == "in_progress":
+                            raise OrderProtectionError("alipay_challenge_in_progress", "Alipay challenge creation is already in progress", 1)
+                        else:
+                            bill = server.alipay.create_payment_needed(
+                                out_trade_no=order["out_trade_no"], amount=amount,
+                                goods_name=str(alipay_config.get("goods_name") or skill.config.name),
+                                resource_id=resource_id, service_id=alipay_service_id,
+                                timeout_seconds=timeout_seconds,
+                            )
+                            order = server.alipay_store.set_challenge(
+                                order["out_trade_no"], bill["header"], bill["pay_before"],
+                            )
+                            bill = {"header": order["challenge_header"], "pay_before": order["pay_before"]}
+                except (OrderProtectionError, OrderCapacityError) as exc:
+                    return self._send_json(429, {
+                        "code": exc.code, "error": str(exc), "retryable": True,
+                    }, {"Retry-After": str(exc.retry_after)})
                 except Exception as exc:
                     return self._send_json(500, {"code": "alipay_config_invalid", "error": str(exc)})
-                # Keep the signed expiry and exact amount in the durable order.
-                server.alipay_store.db.execute("UPDATE alipay_orders SET pay_before=?,updated_at=? WHERE out_trade_no=?", (bill["pay_before"], datetime.now(timezone.utc).isoformat(), order["out_trade_no"]))
                 response = {"code": "payment_needed", "message": "Payment is required to access this resource", "resourceId": resource_id, "requestId": request_id}
                 return self._send_json(402, response, {
                     "Payment-Needed": bill["header"], "Cache-Control": "no-store",
@@ -904,16 +1083,9 @@ class MoltsPayServer:
                 if not amount_matches or str(verified.get("currency", "CNY")) != "CNY":
                     return self._send_json(409, {"code": "alipay_amount_mismatch", "error": "Alipay amount does not match the order"})
                 resource_id = str(verified.get("resource_id") or "")
-                if resource_id != order["resource_id"]:
-                    return self._send_json(403, {"code": "alipay_resource_mismatch", "error": "Alipay resource does not match the order"})
                 alipay_service_id = skill.config.alipay.get("service_id")
                 expected_resource_id = server._alipay_resource_id(skill)
-                if (
-                    not isinstance(alipay_service_id, str)
-                    or order.get("skill_id") != skill.id
-                    or order.get("service_id") != alipay_service_id.strip()
-                    or order.get("resource_id") != expected_resource_id
-                ):
+                if not isinstance(alipay_service_id, str):
                     return self._send_json(403, {
                         "code": "alipay_service_mismatch",
                         "error": "Alipay order does not authorize this service",
@@ -925,6 +1097,7 @@ class MoltsPayServer:
                     resource_id=resource_id,
                     skill_id=skill.id,
                     service_id=alipay_service_id.strip(),
+                    expected_resource_id=expected_resource_id,
                 )
                 if claimed["state"] == "completed":
                     cached = claimed["order"]
@@ -994,7 +1167,9 @@ class MoltsPayServer:
                 
                 # If no payment, return 402
                 if not payment_header:
-                    return self._send_402(skill.config, client_chain=body.get("chain"))
+                    return self._send_402(
+                        skill.config, client_chain=body.get("chain"), request_id=idempotency_key,
+                    )
                 
                 # Parse payment payload
                 try:
@@ -1108,6 +1283,80 @@ class MoltsPayServer:
                         "error": f"Payment verification failed: {verify_result.error}",
                     })
                 print(f"[MoltsPay] Payment verified")
+
+                is_wechat = network == "wechat"
+                wechat_order_no = None
+                if is_wechat:
+                    wechat = server.registry.get("wechat")
+                    if not isinstance(wechat, WechatFacilitator) or server.wechat_store is None:
+                        return self._send_json(500, {
+                            "code": "wechat_order_store_unavailable",
+                            "error": "WeChat order storage is not configured",
+                        })
+                    try:
+                        wechat_order_no = wechat._trade_no(payment_dict, requirements_dict)
+                    except (TypeError, ValueError) as exc:
+                        return self._send_json(400, {"error": str(exc)})
+                    resource_id = server._wechat_resource_id(skill.config)
+                    payment_resource = payment.resource
+                    if payment_resource is not None:
+                        if not isinstance(payment_resource, dict) or (
+                            payment_resource.get("url") and payment_resource.get("url") != resource_id
+                        ):
+                            return self._send_json(403, {
+                                "code": "wechat_resource_mismatch",
+                                "error": "WeChat order does not authorize this resource",
+                            })
+                    try:
+                        claim = server.wechat_store.claim_execution(
+                            wechat_order_no,
+                            skill_id=skill.id,
+                            service_id=skill.id,
+                            resource_id=resource_id,
+                            amount_fen=cny_to_fen(str(skill.config.wechat["price_cny"])),
+                            currency="CNY",
+                            appid=str(wechat.config["appid"]),
+                            mchid=str(wechat.config["mchid"]),
+                        )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        return self._send_json(409, {
+                            "code": "wechat_order_invalid", "error": str(exc),
+                        })
+                    state = claim.get("state")
+                    if state == "completed":
+                        cached = claim["order"]
+                        return self._send_json(200, {
+                            "success": True, "result": cached.get("result"), "replayed": True,
+                            "payment": {"status": "settled", "network": "wechat"},
+                        })
+                    if state == "executing":
+                        return self._send_json(409, {
+                            "code": "wechat_execution_in_progress",
+                            "error": "WeChat execution is already in progress",
+                            "retryable": True,
+                        })
+                    if state == "expired":
+                        return self._send_json(402, {
+                            "code": "wechat_order_expired", "error": "WeChat order has expired",
+                        })
+                    if state in {
+                        "skill_mismatch", "service_mismatch", "resource_mismatch",
+                        "amount_mismatch", "currency_mismatch", "merchant_mismatch",
+                    }:
+                        return self._send_json(403, {
+                            "code": "wechat_order_mismatch",
+                            "error": "WeChat order does not authorize this service",
+                            "reason": state,
+                        })
+                    if state == "not_found":
+                        return self._send_json(404, {
+                            "code": "wechat_order_not_found", "error": "WeChat order was not found",
+                        })
+                    if state != "claimed":
+                        return self._send_json(409, {
+                            "code": "wechat_order_unavailable",
+                            "error": "WeChat order cannot be executed again",
+                        })
                 
                 # Check if Solana - must settle BEFORE skill execution (blockhash expiry)
                 is_solana = network.startswith("solana:")
@@ -1152,6 +1401,8 @@ class MoltsPayServer:
                     print(f"[MoltsPay] Skill timeout after {timeout_seconds}s")
                     if is_balance and settlement and settlement.success:
                         server.registry.get("balance").refund(settlement.transaction, "skill timeout")
+                    if is_wechat and wechat_order_no:
+                        server.wechat_store.fail_delivery(wechat_order_no, "service_execution_failed_after_payment")
                     return self._send_json(500, {
                         "error": "Service execution failed",
                         "message": f"Timeout after {timeout_seconds}s",
@@ -1160,6 +1411,8 @@ class MoltsPayServer:
                     print(f"[MoltsPay] Skill execution failed: {e}")
                     if is_balance and settlement and settlement.success:
                         server.registry.get("balance").refund(settlement.transaction, str(e))
+                    if is_wechat and wechat_order_no:
+                        server.wechat_store.fail_delivery(wechat_order_no, "service_execution_failed_after_payment")
                     return self._send_json(500, {
                         "error": "Service execution failed",
                         "message": str(e),
@@ -1181,6 +1434,9 @@ class MoltsPayServer:
                         print(f"[MoltsPay] Payment settled: {settlement.transaction}")
                     else:
                         print(f"[MoltsPay] Settlement warning: {settlement.error}")
+
+                if is_wechat and wechat_order_no:
+                    server.wechat_store.complete(wechat_order_no, result)
                 
                 # Build response
                 extra_headers = {}

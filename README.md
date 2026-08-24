@@ -316,6 +316,15 @@ moltspay pay \
 
 The CLI also exposes `transfer`, `approve`, `config`, `balance`, `wechat`, `validate`, and `server` commands. Run `moltspay <command> --help` or read the [CLI reference](docs/CLI.md) for details.
 
+Alipay and WeChat Pay both accept HTTP provider URLs for local development:
+
+```bash
+moltspay pay http://127.0.0.1:8402 ping --rail alipay
+moltspay wechat start http://127.0.0.1:8402 ping
+```
+
+Use HTTPS for production providers.
+
 ## MCP server
 
 Install and start the stdio MCP server:
