@@ -41,6 +41,7 @@ class AlipayOrderStore:
           out_trade_no TEXT PRIMARY KEY,
           request_id TEXT NOT NULL,
           kind TEXT NOT NULL CHECK(kind = 'service'),
+          skill_id TEXT NOT NULL,
           service_id TEXT,
           amount_fen INTEGER NOT NULL,
           currency TEXT NOT NULL DEFAULT 'CNY',
@@ -70,6 +71,12 @@ class AlipayOrderStore:
         );
         CREATE INDEX IF NOT EXISTS idx_alipay_orders_request ON alipay_orders(request_id, kind, resource_id);
         """)
+        columns = {
+            str(row["name"])
+            for row in self.db.execute("PRAGMA table_info(alipay_orders)").fetchall()
+        }
+        if "skill_id" not in columns:
+            self.db.execute("ALTER TABLE alipay_orders ADD COLUMN skill_id TEXT")
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -166,14 +173,24 @@ class AlipayOrderStore:
         }
 
     def create_order(self, *, request_id: str, kind: str, amount_fen: int, resource_id: str, goods_name: str,
-                     pay_before: str, service_id: Optional[str] = None,
-                     out_trade_no: Optional[str] = None, currency: str = "CNY") -> Dict[str, Any]:
-        if kind != "service" or amount_fen <= 0 or not isinstance(service_id, str) or not service_id.strip():
+                     pay_before: str, skill_id: str, service_id: str,
+                     out_trade_no: Optional[str] = None,
+                     currency: str = "CNY") -> Dict[str, Any]:
+        if (
+            kind != "service"
+            or amount_fen <= 0
+            or not isinstance(skill_id, str)
+            or not skill_id.strip()
+            or not isinstance(service_id, str)
+            or not service_id.strip()
+        ):
             raise ValueError("invalid Alipay order")
+        skill_id = skill_id.strip()
         service_id = service_id.strip()
         existing = self.get_by_request(request_id, kind, resource_id)
         if existing:
             immutable = {
+                "skill_id": skill_id,
                 "service_id": service_id,
                 "amount_fen": amount_fen,
                 "currency": currency,
@@ -186,19 +203,32 @@ class AlipayOrderStore:
         with self._transaction():
             self.db.execute(
                 """INSERT INTO alipay_orders
-                (out_trade_no,request_id,kind,service_id,amount_fen,currency,resource_id,goods_name,pay_before,status,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (trade, request_id, kind, service_id, amount_fen, currency, resource_id, goods_name, pay_before, "offered", now, now),
+                (out_trade_no,request_id,kind,skill_id,service_id,amount_fen,currency,resource_id,goods_name,pay_before,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (trade, request_id, kind, skill_id, service_id, amount_fen, currency, resource_id, goods_name, pay_before, "offered", now, now),
             )
         return self.get(trade) or {}
 
-    def claim_execution(self, out_trade_no: str, *, trade_no: str, digest: str, resource_id: str) -> Dict[str, Any]:
+    def claim_execution(
+        self,
+        out_trade_no: str,
+        *,
+        trade_no: str,
+        digest: str,
+        resource_id: str,
+        skill_id: str,
+        service_id: str,
+    ) -> Dict[str, Any]:
         """Bind proof/trade and atomically acquire the one execution slot."""
         now = utc_now()
         with self._transaction():
             row = self.db.execute("SELECT * FROM alipay_orders WHERE out_trade_no=?", (out_trade_no,)).fetchone()
             if row is None:
                 return {"state": "not_found"}
+            if row["skill_id"] != skill_id:
+                return {"state": "skill_mismatch", "order": dict(row)}
+            if row["service_id"] != service_id:
+                return {"state": "service_mismatch", "order": dict(row)}
             if row["resource_id"] != resource_id:
                 return {"state": "resource_mismatch", "order": dict(row)}
             if row["trade_no"] and row["trade_no"] != trade_no:

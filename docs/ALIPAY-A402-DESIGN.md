@@ -83,6 +83,10 @@ Provider 为服务请求创建 `kind="service"` 的 A402 订单，并将下列�
 - `goods_name`；
 - `pay_before`。
 
+其中 `service_id` 是支付宝侧服务标识，不是 MoltsPay 用于选择 handler 的
+`ServiceConfig.id`。Provider 必须在本地订单中额外保存后者作为 `skill_id`；
+`skill_id` 不进入支付宝协议，但它将支付订单绑定到唯一的本地执行目标。
+
 金额使用规范的两位小数字符串，禁止浮点计算和指数表示。
 
 ## 4. 买方会话
@@ -111,8 +115,10 @@ Provider 为服务请求创建 `kind="service"` 的 A402 订单，并将下列�
 6. 金额与币种；
 7. 有效期；
 8. `trade_no` 和 proof hash 未绑定其他订单。
+9. 本地订单的 `skill_id`、支付宝 `service_id` 和 `resource_id` 均与当前准备执行的 skill 一致。
 
 `service_id` 在创建订单时保存并受本地幂等约束保护，但官方验付响应契约不保证返回该字段，因此不得用响应中的 `service_id` 拒绝已经通过订单号、资源、金额及防重放校验的付款。
+执行授权校验使用本地订单中保存的支付宝 `service_id` 与 `skill_id`，不得使用请求体中的 `service` 代替订单绑定。
 
 验证成功后，`AlipayOrderStore.claim_execution()` 原子取得一次履约权。服务完成后保存结果，并通过 fulfillment outbox 调用支付宝履约确认。重复请求返回原结果，不重复执行服务。
 

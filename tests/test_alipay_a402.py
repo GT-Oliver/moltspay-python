@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sqlite3
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -21,6 +22,8 @@ from moltspay.exceptions import (
 )
 from moltspay.server.alipay_store import AlipayOrderStore
 from moltspay.server.facilitators.alipay import AlipayFacilitator, normalize_cny_amount
+from moltspay.server.server import MoltsPayServer
+from moltspay.server.types import RegisteredSkill, ServiceConfig
 from moltspay.x402 import _service_from_dict
 
 
@@ -30,6 +33,191 @@ def _keys():
         private.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode(),
         private.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode(),
     )
+
+
+def _alipay_execution_handler(monkeypatch, *, target_alipay, target_input=None):
+    calls = []
+    server = object.__new__(MoltsPayServer)
+    server.host = "127.0.0.1"
+    server.port = 8402
+    server.alipay_store = AlipayOrderStore(":memory:")
+
+    class FakeAlipay:
+        config = {}
+
+        def __init__(self):
+            self.order = None
+            self.verify_calls = 0
+
+        def parse_payment_proof(self, _payment_proof):
+            return {"trade_no": "trade-cheap"}
+
+        def verify_payment(self, proof):
+            self.verify_calls += 1
+            return {
+                "code": "10000",
+                "active": True,
+                "amount": "0.01",
+                "currency": "CNY",
+                "trade_no": proof["trade_no"],
+                "out_trade_no": self.order["out_trade_no"],
+                "resource_id": self.order["resource_id"],
+            }
+
+        def create_payment_needed(self, **kwargs):
+            return {
+                "header": "payment-needed",
+                "pay_before": "2099-01-01T00:00:00+00:00",
+                **kwargs,
+            }
+
+        def confirm_fulfillment(self, _trade_no):
+            return {"success": True}
+
+    server.alipay = FakeAlipay()
+
+    def cheap_handler(_params):
+        calls.append("cheap")
+        return {"service": "cheap"}
+
+    def target_handler(_params):
+        calls.append("target")
+        return {"service": "target"}
+
+    cheap_config = ServiceConfig(
+        id="cheap", name="Cheap", price=0.01, function="cheap_handler",
+        alipay={
+            "service_id": "API_CHEAP",
+            "price_cny": "0.01",
+            "resource_id": "/execute?service=cheap",
+        },
+    )
+    target_config = ServiceConfig(
+        id="target", name="Target", price=100, function="target_handler",
+        input=target_input or {}, alipay=target_alipay,
+    )
+    server.skills = {
+        "cheap": RegisteredSkill(id="cheap", config=cheap_config, handler=cheap_handler),
+        "target": RegisteredSkill(id="target", config=target_config, handler=target_handler),
+    }
+    captured = {}
+
+    class FakeHTTPServer:
+        def __init__(self, _address, handler):
+            captured["handler"] = handler
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr("moltspay.server.server.HTTPServer", FakeHTTPServer)
+    server.listen()
+
+    handler = object.__new__(captured["handler"])
+    handler.headers = {}
+    responses = []
+    handler._send_json = lambda status, data, headers=None: responses.append((status, data, headers))
+    handler._send_alipay_402(server.skills["cheap"], "req-cheap")
+    assert responses[-1][0] == 402
+    server.alipay.order = server.alipay_store.get_by_request(
+        "req-cheap", "service", "/execute?service=cheap",
+    )
+    assert server.alipay.order["skill_id"] == "cheap"
+    responses.clear()
+    return server, handler, calls, responses
+
+
+def test_alipay_proof_cannot_be_redeemed_for_another_service(monkeypatch):
+    server, handler, calls, responses = _alipay_execution_handler(
+        monkeypatch,
+        target_alipay={
+            "service_id": "API_TARGET",
+            "price_cny": "100.00",
+            "resource_id": "/execute?service=target",
+        },
+    )
+
+    handler._handle_execute(
+        {"service": "target", "params": {}}, None, "proof-cheap",
+    )
+
+    assert responses[-1][0] == 403
+    assert responses[-1][1]["code"] == "alipay_service_mismatch"
+    assert calls == []
+    assert server.alipay_store.get(server.alipay.order["out_trade_no"])["status"] == "offered"
+
+    handler._handle_execute(
+        {"service": "cheap", "params": {}}, None, "proof-cheap",
+    )
+
+    assert responses[-1][0] == 200
+    assert responses[-1][1]["result"] == {"service": "cheap"}
+    assert calls == ["cheap"]
+
+    handler._handle_execute(
+        {"service": "target", "params": {}}, None, "proof-cheap",
+    )
+
+    assert responses[-1][0] == 403
+    assert responses[-1][1]["code"] == "alipay_service_mismatch"
+    assert calls == ["cheap"]
+
+
+def test_alipay_skill_binding_does_not_rely_on_unique_alipay_fields(monkeypatch):
+    server, handler, calls, responses = _alipay_execution_handler(
+        monkeypatch,
+        target_alipay={
+            "service_id": "API_CHEAP",
+            "price_cny": "0.01",
+            "resource_id": "/execute?service=cheap",
+        },
+    )
+
+    handler._handle_execute(
+        {"service": "target", "params": {}}, None, "proof-cheap",
+    )
+
+    assert responses[-1][0] == 403
+    assert responses[-1][1]["code"] == "alipay_service_mismatch"
+    assert calls == []
+    assert server.alipay_store.get(server.alipay.order["out_trade_no"])["status"] == "offered"
+
+
+def test_alipay_proof_cannot_select_service_without_alipay(monkeypatch):
+    server, handler, calls, responses = _alipay_execution_handler(
+        monkeypatch,
+        target_alipay=None,
+    )
+
+    handler._handle_execute(
+        {"service": "target", "params": {}}, None, "proof-cheap",
+    )
+
+    assert responses[-1][0] == 400
+    assert responses[-1][1]["code"] == "alipay_not_configured"
+    assert server.alipay.verify_calls == 0
+    assert calls == []
+    assert server.alipay_store.get(server.alipay.order["out_trade_no"])["status"] == "offered"
+
+
+def test_alipay_proof_does_not_bypass_required_service_params(monkeypatch):
+    server, handler, calls, responses = _alipay_execution_handler(
+        monkeypatch,
+        target_alipay={
+            "service_id": "API_TARGET",
+            "price_cny": "100.00",
+            "resource_id": "/execute?service=target",
+        },
+        target_input={"prompt": {"type": "string", "required": True}},
+    )
+
+    handler._handle_execute(
+        {"service": "target", "params": {}}, None, "proof-cheap",
+    )
+
+    assert responses[-1] == (400, {"error": "Missing required param: prompt"}, None)
+    assert server.alipay.verify_calls == 0
+    assert calls == []
+    assert server.alipay_store.get(server.alipay.order["out_trade_no"])["status"] == "offered"
 
 
 def test_cny_and_payment_needed_are_canonical():
@@ -61,24 +249,108 @@ def test_order_store_claim_and_replay_are_idempotent():
     store = AlipayOrderStore(":memory:")
     order = store.create_order(
         request_id="req-1", kind="service", amount_fen=10,
-        resource_id="/execute?service=svc", goods_name="AI", pay_before="", service_id="API_SVC",
+        resource_id="/execute?service=svc", goods_name="AI", pay_before="",
+        skill_id="svc", service_id="API_SVC",
     )
-    assert store.claim_execution(order["out_trade_no"], trade_no="trade-1", digest="hash-1", resource_id=order["resource_id"])["state"] == "claimed"
+    claim = {"resource_id": order["resource_id"], "skill_id": "svc", "service_id": "API_SVC"}
+    assert store.claim_execution(order["out_trade_no"], trade_no="trade-1", digest="hash-1", **claim)["state"] == "claimed"
     store.complete(order["out_trade_no"], {"result": "ok"})
-    replay = store.claim_execution(order["out_trade_no"], trade_no="trade-1", digest="hash-1", resource_id=order["resource_id"])
+    replay = store.claim_execution(order["out_trade_no"], trade_no="trade-1", digest="hash-1", **claim)
     assert replay["state"] == "completed"
     assert replay["order"]["result"] == {"result": "ok"}
     rotated_proof = store.claim_execution(
         order["out_trade_no"], trade_no="trade-1", digest="hash-2",
-        resource_id=order["resource_id"],
+        **claim,
     )
     assert rotated_proof["state"] == "completed"
     wrong_trade = store.claim_execution(
         order["out_trade_no"], trade_no="trade-2", digest="hash-2",
-        resource_id=order["resource_id"],
+        **claim,
     )
     assert wrong_trade["state"] == "replay"
     assert wrong_trade["reason"] == "trade_mismatch"
+
+
+def test_order_store_claim_enforces_skill_binding_before_consuming_order():
+    store = AlipayOrderStore(":memory:")
+    order = store.create_order(
+        request_id="req-bound", kind="service", amount_fen=10,
+        resource_id="/execute?service=svc", goods_name="AI", pay_before="",
+        skill_id="svc", service_id="API_SVC",
+    )
+
+    rejected = store.claim_execution(
+        order["out_trade_no"], trade_no="trade-bound", digest="hash-bound",
+        resource_id=order["resource_id"], skill_id="other",
+        service_id="API_SVC",
+    )
+
+    assert rejected["state"] == "skill_mismatch"
+    assert store.get(order["out_trade_no"])["status"] == "offered"
+
+    claimed = store.claim_execution(
+        order["out_trade_no"], trade_no="trade-bound", digest="hash-bound",
+        resource_id=order["resource_id"], skill_id="svc",
+        service_id="API_SVC",
+    )
+    assert claimed["state"] == "claimed"
+
+
+def test_order_store_migrates_legacy_schema_and_fails_closed(tmp_path):
+    db_path = tmp_path / "legacy-alipay.sqlite"
+    db = sqlite3.connect(db_path)
+    db.executescript("""
+        CREATE TABLE alipay_orders (
+          out_trade_no TEXT PRIMARY KEY,
+          request_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK(kind = 'service'),
+          service_id TEXT,
+          amount_fen INTEGER NOT NULL,
+          currency TEXT NOT NULL DEFAULT 'CNY',
+          resource_id TEXT NOT NULL,
+          goods_name TEXT NOT NULL,
+          pay_before TEXT NOT NULL,
+          trade_no TEXT UNIQUE,
+          proof_hash TEXT UNIQUE,
+          status TEXT NOT NULL,
+          result_json TEXT,
+          error_code TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT,
+          UNIQUE(request_id, kind, resource_id)
+        );
+        CREATE TABLE alipay_fulfillment_outbox (
+          trade_no TEXT PRIMARY KEY,
+          out_trade_no TEXT NOT NULL REFERENCES alipay_orders(out_trade_no),
+          status TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at TEXT NOT NULL,
+          last_error_code TEXT,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO alipay_orders (
+          out_trade_no, request_id, kind, service_id, amount_fen, currency,
+          resource_id, goods_name, pay_before, status, created_at, updated_at
+        ) VALUES (
+          'MPALEGACY', 'req-legacy', 'service', 'API_LEGACY', 1, 'CNY',
+          '/execute?service=legacy', 'Legacy', '', 'offered', 'now', 'now'
+        );
+    """)
+    db.close()
+
+    store = AlipayOrderStore(str(db_path))
+
+    assert store.get("MPALEGACY")["skill_id"] is None
+    rejected = store.claim_execution(
+        "MPALEGACY", trade_no="trade-legacy", digest="hash-legacy",
+        resource_id="/execute?service=legacy", skill_id="legacy",
+        service_id="API_LEGACY",
+    )
+    assert rejected["state"] == "skill_mismatch"
+    assert store.get("MPALEGACY")["status"] == "offered"
 
 
 def test_order_store_public_status_exposes_completion_without_proof_material():
@@ -86,11 +358,11 @@ def test_order_store_public_status_exposes_completion_without_proof_material():
     order = store.create_order(
         request_id="req-public", kind="service", amount_fen=1,
         resource_id="/execute?service=ping", goods_name="Ping", pay_before="",
-        service_id="API_PING",
+        skill_id="ping", service_id="API_PING",
     )
     store.claim_execution(
         order["out_trade_no"], trade_no="trade-public", digest="secret-proof-hash",
-        resource_id=order["resource_id"],
+        resource_id=order["resource_id"], skill_id="ping", service_id="API_PING",
     )
     store.complete(order["out_trade_no"], {"ok": True})
     store.mark_outbox("trade-public", "confirmed")
@@ -121,12 +393,14 @@ def test_order_store_rejects_service_change_for_same_idempotency_key():
     store = AlipayOrderStore(":memory:")
     store.create_order(
         request_id="req-1", kind="service", amount_fen=10,
-        resource_id="/execute?service=svc", goods_name="AI", pay_before="", service_id="API_ONE",
+        resource_id="/execute?service=svc", goods_name="AI", pay_before="",
+        skill_id="svc", service_id="API_ONE",
     )
     try:
         store.create_order(
             request_id="req-1", kind="service", amount_fen=10,
-            resource_id="/execute?service=svc", goods_name="AI", pay_before="", service_id="API_TWO",
+            resource_id="/execute?service=svc", goods_name="AI", pay_before="",
+            skill_id="svc", service_id="API_TWO",
         )
     except ValueError as exc:
         assert "idempotency key conflicts" in str(exc)
@@ -145,6 +419,7 @@ def test_a402_order_store_rejects_balance_topup_orders():
             resource_id="/balance/topup/alipay",
             goods_name="Balance top-up",
             pay_before="",
+            skill_id="balance-topup",
             service_id="API_TOPUP",
         )
 

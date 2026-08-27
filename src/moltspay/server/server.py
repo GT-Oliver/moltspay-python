@@ -363,6 +363,14 @@ class MoltsPayServer:
             # Run sync handler in thread pool
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, handler, params)
+
+    @staticmethod
+    def _alipay_resource_id(skill: RegisteredSkill) -> str:
+        alipay_config = skill.config.alipay or {}
+        return str(
+            alipay_config.get("resource_id")
+            or f"/execute?service={quote(skill.id, safe='')}"
+        )
     
     def listen(self, port: Optional[int] = None) -> None:
         """
@@ -839,26 +847,26 @@ class MoltsPayServer:
                     return self._send_json(400, {"code": "alipay_not_configured", "error": "Alipay rail is not configured for this service"})
                 alipay_config = skill.config.alipay
                 amount = str(alipay_config.get("price_cny", ""))
-                resource_id = str(alipay_config.get("resource_id") or f"/execute?service={quote(skill.id, safe='')}")
-                service_id = alipay_config.get("service_id")
-                if not isinstance(service_id, str) or not service_id.strip():
+                resource_id = server._alipay_resource_id(skill)
+                alipay_service_id = alipay_config.get("service_id")
+                if not isinstance(alipay_service_id, str) or not alipay_service_id.strip():
                     return self._send_json(500, {
                         "code": "alipay_config_invalid",
                         "error": f"Alipay service_id is required for service '{skill.id}'",
                     })
-                service_id = service_id.strip()
+                alipay_service_id = alipay_service_id.strip()
                 try:
                     from decimal import Decimal
                     amount_fen = int(Decimal(normalize_cny_amount(amount)) * 100)
                     order = server.alipay_store.create_order(
                         request_id=request_id or f"req_{secrets.token_hex(12)}", kind="service", amount_fen=amount_fen,
                         resource_id=resource_id, goods_name=str(alipay_config.get("goods_name") or skill.config.name),
-                        pay_before="", service_id=service_id,
+                        pay_before="", skill_id=skill.id, service_id=alipay_service_id,
                     )
                     bill = server.alipay.create_payment_needed(
                         out_trade_no=order["out_trade_no"], amount=amount,
                         goods_name=str(alipay_config.get("goods_name") or skill.config.name),
-                        resource_id=resource_id, service_id=service_id,
+                        resource_id=resource_id, service_id=alipay_service_id,
                         timeout_seconds=int(alipay_config.get("pay_timeout_seconds") or server.alipay.config.get("default_timeout_seconds", 1800)),
                     )
                 except Exception as exc:
@@ -871,8 +879,8 @@ class MoltsPayServer:
                 })
 
             def _handle_alipay_execute(self, skill: RegisteredSkill, body: Dict[str, Any], payment_proof: str):
-                if not server.alipay or not server.alipay_store:
-                    return self._send_json(400, {"code": "alipay_not_configured", "error": "Alipay rail is not configured"})
+                if not server.alipay or not server.alipay_store or not skill.config.alipay:
+                    return self._send_json(400, {"code": "alipay_not_configured", "error": "Alipay rail is not configured for this service"})
                 try:
                     proof = server.alipay.parse_payment_proof(payment_proof)
                 except Exception:
@@ -898,7 +906,26 @@ class MoltsPayServer:
                 resource_id = str(verified.get("resource_id") or "")
                 if resource_id != order["resource_id"]:
                     return self._send_json(403, {"code": "alipay_resource_mismatch", "error": "Alipay resource does not match the order"})
-                claimed = server.alipay_store.claim_execution(out_trade_no, trade_no=str(verified.get("trade_no") or proof["trade_no"]), digest=proof_hash(payment_proof), resource_id=resource_id)
+                alipay_service_id = skill.config.alipay.get("service_id")
+                expected_resource_id = server._alipay_resource_id(skill)
+                if (
+                    not isinstance(alipay_service_id, str)
+                    or order.get("skill_id") != skill.id
+                    or order.get("service_id") != alipay_service_id.strip()
+                    or order.get("resource_id") != expected_resource_id
+                ):
+                    return self._send_json(403, {
+                        "code": "alipay_service_mismatch",
+                        "error": "Alipay order does not authorize this service",
+                    })
+                claimed = server.alipay_store.claim_execution(
+                    out_trade_no,
+                    trade_no=str(verified.get("trade_no") or proof["trade_no"]),
+                    digest=proof_hash(payment_proof),
+                    resource_id=resource_id,
+                    skill_id=skill.id,
+                    service_id=alipay_service_id.strip(),
+                )
                 if claimed["state"] == "completed":
                     cached = claimed["order"]
                     return self._send_json(200, {"success": True, "result": cached.get("result"), "replayed": True}, {"Payment-Validation": encode_a402_json({"trade_no": cached.get("trade_no"), "out_trade_no": out_trade_no, "validated": True, "resource_id": resource_id})})
@@ -915,6 +942,11 @@ class MoltsPayServer:
                         "code": code,
                         "error": "Alipay payment evidence conflicts with the durable order",
                         "reason": reason,
+                    })
+                if claimed["state"] in {"skill_mismatch", "service_mismatch"}:
+                    return self._send_json(403, {
+                        "code": "alipay_service_mismatch",
+                        "error": "Alipay order does not authorize this service",
                     })
                 if claimed["state"] != "claimed":
                     return self._send_json(403, {"code": "alipay_resource_mismatch", "error": "Alipay order cannot be used for this resource"})
@@ -938,26 +970,27 @@ class MoltsPayServer:
 
             def _handle_execute(self, body: Dict[str, Any], payment_header: Optional[str], payment_proof: Optional[str] = None, idempotency_key: Optional[str] = None):
                 """POST /execute - Execute service with x402 payment."""
-                service_id = body.get("service")
+                requested_skill_id = body.get("service")
                 params = body.get("params", {})
                 
-                if not service_id:
+                if not requested_skill_id:
                     return self._send_json(400, {"error": "Missing service"})
                 
-                skill = server.skills.get(service_id)
+                skill = server.skills.get(requested_skill_id)
                 if not skill:
-                    return self._send_json(404, {"error": f"Service '{service_id}' not found"})
+                    return self._send_json(404, {"error": f"Service '{requested_skill_id}' not found"})
+
+                # Validate required params before selecting a payment rail so a
+                # Payment-Proof cannot bypass the service input contract.
+                for key, field in skill.config.input.items():
+                    if field.required and key not in params:
+                        return self._send_json(400, {"error": f"Missing required param: {key}"})
 
                 requested_rail = (self.headers.get("Accept-Payment-Rail") or body.get("rail") or "").lower()
                 if requested_rail == "alipay" or payment_proof:
                     if payment_proof:
                         return self._handle_alipay_execute(skill, body, payment_proof)
                     return self._send_alipay_402(skill, idempotency_key)
-                
-                # Validate required params
-                for key, field in skill.config.input.items():
-                    if field.required and key not in params:
-                        return self._send_json(400, {"error": f"Missing required param: {key}"})
                 
                 # If no payment, return 402
                 if not payment_header:
@@ -1100,7 +1133,7 @@ class MoltsPayServer:
                 
                 # Execute skill
                 timeout_seconds = int(os.environ.get("SKILL_TIMEOUT_SECONDS", "1200"))
-                print(f"[MoltsPay] Executing skill: {service_id} (timeout: {timeout_seconds}s)")
+                print(f"[MoltsPay] Executing skill: {requested_skill_id} (timeout: {timeout_seconds}s)")
                 
                 try:
                     # Run async handler
